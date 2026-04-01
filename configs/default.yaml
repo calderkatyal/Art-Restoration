@@ -1,0 +1,61 @@
+model:
+  flux_repo: "black-forest-labs/FLUX.1-schnell"
+  vae_repo: "black-forest-labs/FLUX.1-schnell"
+  latent_channels: 16
+  mask_channels: 5
+  in_channels: 37  # 16 (z_t) + 16 (z_y) + 5 (mask)
+  guidance_scale: 1.0
+  null_emb_path: "null_text_emb.pt"
+
+train:
+  # --- stage: "warmup" trains only img_in, "full" trains all layers ---
+  stage: "warmup"
+  data_dir: "./data/wikiart"
+  val_dir: "./data/wikiart_val"
+  output_dir: "./checkpoints"
+  resolution: 512
+  batch_size: 4
+  num_epochs: 50
+  seed: 42
+  save_every: 1000
+  log_every: 100
+  resume_from: null  # path to checkpoint to resume from
+
+  # --- optimizer ---
+  optimizer:
+    name: "adamw"
+    lr: 1e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  # --- scheduler ---
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+    min_lr: 1e-6
+
+  # --- warmup stage: only train img_in ---
+  warmup:
+    epochs: 5
+    lr: 1e-4
+
+  # --- full stage: fine-tune entire backbone ---
+  full:
+    backbone_lr: 1e-5
+    img_in_lr: 1e-4
+
+  # --- curriculum: gradually introduce multi-degradation ---
+  curriculum:
+    enabled: true
+    warmup_epochs: 5  # single degradation only for this many epochs
+
+degradation:
+  damage_types:
+    - "crack"
+    - "paint_loss"
+    - "stain"
+    - "blur"
+    - "color_shift"
+  num_channels: 5
+  severity_range: [0.2, 0.8]
+  max_simultaneous: 3
