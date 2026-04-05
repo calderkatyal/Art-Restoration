@@ -141,53 +141,24 @@ degradation:
 
 ## Inference
 
-```python
-from PIL import Image
-import torch
-import torchvision.transforms.functional as TF
-from src.config import load_config
-from src.vae import FluxVAE
-from src.model import RestorationDiT
-from src.null_emb import load_or_compute_null_embedding
-from src.inference import sample
-
-cfg    = load_config("configs/default.yaml")
-device = "cuda"
-
-# Load models
-vae      = FluxVAE(cfg.model.flux_model_name, device=device)
-model    = RestorationDiT(cfg.model).to(device)
-model.load_state_dict(torch.load("checkpoints/final.pt", map_location=device)["model_state_dict"])
-model.eval()
-null_emb = load_or_compute_null_embedding(cfg.model.null_emb_path, cfg.model.flux_model_name, device)
-
-# Prepare inputs
-# H and W must be divisible by 16 (VAE spatial compression)
-corrupted = TF.to_tensor(Image.open("damaged.png").convert("RGB")).unsqueeze(0).to(device)
-
-# mask: (B, K, H, W) — one channel per damage type, 1 = damaged
-# K = cfg.model.mask_channels = 5  →  [crack, paint_loss, stain, blur, color_shift]
-K = cfg.model.mask_channels
-mask = torch.zeros(1, K, corrupted.shape[2], corrupted.shape[3], device=device)
-mask[:, 0] = 1   # mark "crack" channel as damaged over the full image
-# (set multiple channels if multiple damage types are present)
-
-# Restore
-restored = sample(model, vae, corrupted, mask, null_emb,
-                  num_steps=cfg.model.num_steps, device=device)
-# restored: (B, 3, H, W) float32 in [0, 1]
-TF.to_pil_image(restored[0].cpu()).save("restored.png")
+```bash
+python -m src.inference \
+    --config     configs/default.yaml \
+    --checkpoint checkpoints/final.pt \
+    --input      damaged.png \
+    --output     restored.png \
+    --damage     crack paint_loss
 ```
 
-Mask channel order matches `degradation.damage_types` in `configs/default.yaml`:
-
-| Channel | Damage type  |
-|---------|--------------|
-| 0       | crack        |
-| 1       | paint_loss   |
-| 2       | stain        |
-| 3       | blur         |
-| 4       | color_shift  |
+| Argument | Description |
+|----------|-------------|
+| `--config` | Path to YAML config (default: `configs/default.yaml`) |
+| `--checkpoint` | Path to trained model `.pt` file |
+| `--input` | Path to damaged input image |
+| `--output` | Path to save restored image |
+| `--damage` | Space-separated damage types present in the image.<br>Options: `crack`, `paint_loss`, `stain`, `blur`, `color_shift`.<br>Omit to mark all channels as damaged. |
+| `--steps` | Number of ODE integration steps (default: `model.num_steps` from config) |
+| `--device` | Device to run on (default: `cuda`) |
 
 ---
 
