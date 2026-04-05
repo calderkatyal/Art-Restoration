@@ -49,7 +49,8 @@ from .vae import FluxVAE
 from .corruption import downsample_mask
 from .null_emb import load_or_compute_null_embedding
 from .dataset import ArtRestorationDataset
-from .inference import compute_psnr, sample
+from .inference import sample
+from .evaluations import compute_psnr
 
 
 def train(cfg: Config) -> None:
