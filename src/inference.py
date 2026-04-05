@@ -9,6 +9,41 @@ At each integration step:
 
 Timestep schedule: FLUX.2 empirical SNR-shifted schedule from
 flux2/sampling.py get_schedule(num_steps, image_seq_len).
+
+--- Quickstart ---
+
+    from PIL import Image
+    import torch, torchvision.transforms.functional as TF
+    from src.config import load_config
+    from src.vae import FluxVAE
+    from src.model import RestorationDiT
+    from src.null_emb import load_or_compute_null_embedding
+    from src.inference import sample
+
+    cfg = load_config("configs/default.yaml")
+    device = "cuda"
+
+    # Load models
+    vae   = FluxVAE(cfg.model.flux_model_name, device=device)
+    model = RestorationDiT(cfg.model).to(device)
+    model.load_state_dict(torch.load("checkpoints/final.pt", map_location=device)["model_state_dict"])
+    model.eval()
+    null_emb = load_or_compute_null_embedding(cfg.model.null_emb_path, cfg.model.flux_model_name, device)
+
+    # Prepare inputs
+    # corrupted: (B, 3, H, W) float32 in [0,1], H and W divisible by 16
+    # mask:      (B, K, H, W) float32 binary at pixel resolution
+    #            K = cfg.model.mask_channels = 5 (one per damage type)
+    #            Set channels to 1 for damage types present in the image.
+    corrupted = TF.to_tensor(Image.open("damaged.png").convert("RGB")).unsqueeze(0).to(device)
+    mask = torch.zeros(1, cfg.model.mask_channels, corrupted.shape[2], corrupted.shape[3], device=device)
+    mask[:, 0] = 1  # mark channel 0 ("crack") as damaged over entire image
+
+    # Restore
+    restored = sample(model, vae, corrupted, mask, null_emb,
+                      num_steps=cfg.model.num_steps, device=device)
+    # restored: (B, 3, H, W) float32 in [0, 1]
+    TF.to_pil_image(restored[0].cpu()).save("restored.png")
 """
 
 import torch
