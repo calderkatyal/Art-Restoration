@@ -236,13 +236,28 @@ def validate(
 
 
 if __name__ == "__main__":
-    """CLI entry point.
+    """Run training.
 
     Usage:
-        python -m src.train --config configs/default.yaml [overrides]
+        python -m src.train [--config configs/default.yaml] [--device cuda] [overrides...]
+
+    Arguments:
+        --config   Path to YAML config (default: configs/default.yaml).
+        --device   Device to train on (default: cuda).
+        overrides  Any number of dot-notation config overrides, e.g.:
+                       train.stage=full
+                       train.batch_size=8
+                       train.resume_from=checkpoints/warmup_final.pt
+                       degradation.max_simultaneous=1
 
     Examples:
-        python -m src.train --config configs/default.yaml train.stage=full
-        python -m src.train --config configs/default.yaml train.batch_size=8 train.resume_from=./checkpoints/warmup_final.pt
+        # Stage 1 — warmup (img_in only):
+        python -m src.train train.stage=warmup
+
+        # Stage 2 — full fine-tune, resuming from warmup checkpoint:
+        python -m src.train train.stage=full train.resume_from=checkpoints/warmup_final.pt
+
+        # Override any config field:
+        python -m src.train train.batch_size=8 train.optimizer.lr=5e-5
     """
     ...

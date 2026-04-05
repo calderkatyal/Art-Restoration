@@ -59,9 +59,18 @@ def load_or_compute_null_embedding(
 
 
 if __name__ == "__main__":
-    """Precompute and save null embedding.
+    """Precompute and save the null text embedding to disk.
 
     Usage:
-        python -m src.null_emb --config configs/default.yaml [--device cuda]
+        python -m src.null_emb [--config configs/default.yaml] [--device cuda]
+
+    Arguments:
+        --config   Path to YAML config (default: configs/default.yaml).
+                   Reads model.flux_model_name and model.null_emb_path.
+        --device   Device to run the text encoder on (default: cuda).
+
+    Output:
+        Saves (1, 512, 7680) bfloat16 tensor to model.null_emb_path.
+        No-op if the file already exists.
     """
     ...
