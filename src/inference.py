@@ -1,4 +1,4 @@
-"""Inference: Euler ODE integration with hard data-consistency projection.
+"""Inference via Euler ODE integration with hard data-consistency projection.
 
 At each integration step:
     1. Predict velocity:  vel = v_θ(z_t, t | z_y, M')

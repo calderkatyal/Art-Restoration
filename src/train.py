@@ -1,12 +1,5 @@
 """Training loop for conditional latent rectified flow art restoration.
 
-Entry point:
-    python -m src.train --config configs/default.yaml [dot.notation=overrides]
-
-Training stages (cfg.train.stage):
-    "warmup": backbone frozen, only img_in trained at cfg.train.warmup.lr.
-    "full":   all layers trained; backbone at backbone_lr, img_in at img_in_lr.
-
 Rectified flow objective per iteration:
     1. Sample clean x; apply C(x) → (y, M).
     2. z_1 = E(x),  z_y = E(y)  (frozen VAE, no grad).
@@ -17,6 +10,10 @@ Rectified flow objective per iteration:
     7. loss = || vel - (z_1 - z_0) ||²   (MSE).
     8. Backward + optimizer + scheduler step.
 
+Training stages (cfg.train.stage):
+    "warmup": backbone frozen, only img_in trained at cfg.train.warmup.lr.
+    "full":   all layers trained; backbone at backbone_lr, img_in at img_in_lr.
+
 Curriculum (cfg.train.curriculum.enabled):
     For the first curriculum_warmup_epochs, max_simultaneous=1 is passed
     to the DataLoader so only single-degradation images are used.
@@ -24,6 +21,18 @@ Curriculum (cfg.train.curriculum.enabled):
 Validation:
     Full-image PSNR and masked-region PSNR on held-out WikiArt images
     with synthetic corruption using the same CorruptionModule.
+
+Usage:
+    python -m src.train [--config configs/default.yaml] [--device cuda] [overrides...]
+
+Arguments:
+    --config   Path to YAML config (default: configs/default.yaml).
+    --device   Device to train on (default: cuda).
+    overrides  Dot-notation config overrides, e.g.:
+                   train.stage=full
+                   train.batch_size=8
+                   train.resume_from=checkpoints/warmup_final.pt
+                   degradation.max_simultaneous=1
 """
 
 import os
