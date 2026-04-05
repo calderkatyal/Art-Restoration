@@ -1,0 +1,46 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Data
+data/
+*.tar
+*.zip
+
+# Checkpoints & weights
+checkpoints/
+*.pt
+*.pth
+*.safetensors
+*.ckpt
+*.bin
+
+# Null embedding cache
+null_text_emb.pt
+
+# Logs
+logs/
+runs/
+wandb/
+*.log
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/

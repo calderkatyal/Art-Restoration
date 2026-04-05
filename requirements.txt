@@ -1,0 +1,10 @@
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.36.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+huggingface_hub>=0.20.0
+einops>=0.7.0
+Pillow>=10.0.0
+tqdm>=4.65.0
+omegaconf>=2.3.0

@@ -1,0 +1,68 @@
+model:
+  # FLUX.2 [klein] base 4B — non-distilled, no guidance embedding
+  flux_model_name: "flux.2-klein-base-4b"
+  # VAE is loaded from black-forest-labs/FLUX.2-dev (shared AE for all klein models)
+  latent_channels: 128       # VAE z_channels=32, patchified 2x2 → 32*4=128
+  spatial_compression: 16    # 8x (encoder) * 2x (patchify) = 16x total
+  mask_channels: 5           # K damage-type channels
+  in_channels: 261           # 128 (z_t) + 128 (z_y) + 5 (mask)
+  hidden_size: 3072          # Klein4BParams.hidden_size
+  context_in_dim: 7680       # 3 Qwen3-4B layers × 2560 hidden dim
+  text_encoder_variant: "4B" # Qwen3 variant used by Klein 4B
+  num_steps: 50              # ODE integration steps at inference
+  guidance: 4.0              # CFG guidance scale (use_guidance_embed=False for Klein)
+  null_emb_path: "null_text_emb.pt"
+
+train:
+  # stage: "warmup" trains only img_in (backbone frozen)
+  #        "full"   fine-tunes all layers
+  stage: "warmup"
+  data_dir: "./data/wikiart"
+  val_dir: "./data/wikiart_val"
+  output_dir: "./checkpoints"
+  resolution: 512
+  batch_size: 4
+  num_epochs: 50
+  seed: 42
+  save_every: 1000
+  log_every: 100
+  resume_from: null  # path to checkpoint to resume from
+
+  # optimizer
+  optimizer:
+    name: "adamw"
+    lr: 1e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  # lr scheduler
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+    min_lr: 1e-6
+
+  # warmup stage: only img_in is trainable
+  warmup:
+    epochs: 5
+    lr: 1e-4
+
+  # full stage: separate lr per param group
+  full:
+    backbone_lr: 1e-5
+    img_in_lr: 1e-4
+
+  # curriculum: start with single degradation, then add multi-degradation
+  curriculum:
+    enabled: true
+    warmup_epochs: 5
+
+degradation:
+  damage_types:
+    - "crack"
+    - "paint_loss"
+    - "stain"
+    - "blur"
+    - "color_shift"
+  num_channels: 5
+  severity_range: [0.2, 0.8]
+  max_simultaneous: 3
