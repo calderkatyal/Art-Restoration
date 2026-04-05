@@ -1,0 +1,64 @@
+model:
+  flux_model_name: "flux.2-klein-base-4b"
+  latent_channels: 128       # VAE z_channels=32 × 2×2 patchify
+  spatial_compression: 16    # 8× encoder × 2× patchify
+  mask_channels: 5
+  in_channels: 261           # 128 (z_t) + 128 (z_y) + 5 (mask)
+  hidden_size: 3072
+  context_in_dim: 7680       # 3 Qwen3-4B layers × 2560
+  text_encoder_variant: "4B"
+  null_emb_path: "null_text_emb.pt"
+
+train:
+  # stage: "warmup" trains only img_in (backbone frozen)
+  #        "full"   trains all layers
+  stage: "warmup"
+  data_dir: "./data/wikiart"
+  val_dir: "./data/wikiart_val"
+  output_dir: "./checkpoints"
+  resolution: 512
+  batch_size: 4
+  num_epochs: 50
+  seed: 42
+  save_every: 1000
+  log_every: 100
+  resume_from: null
+
+  optimizer:
+    name: "adamw"
+    lr: 1e-4
+    weight_decay: 0.01
+    betas: [0.9, 0.999]
+
+  scheduler:
+    name: "cosine"
+    warmup_steps: 500
+    min_lr: 1e-6
+
+  warmup:
+    epochs: 5
+    lr: 1e-4
+
+  full:
+    backbone_lr: 1e-5
+    img_in_lr: 1e-4
+
+  curriculum:
+    enabled: true
+    warmup_epochs: 5
+
+degradation:
+  damage_types:
+    - "crack"
+    - "paint_loss"
+    - "stain"
+    - "blur"
+    - "color_shift"
+  num_channels: 5
+  severity_range: [0.2, 0.8]
+  max_simultaneous: 3
+
+# Inference settings used for periodic validation sampling during training
+inference:
+  num_steps: 50
+  guidance: 4.0
