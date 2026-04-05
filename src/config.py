@@ -124,6 +124,28 @@ class FullStageConfig:
 
 
 @dataclass
+class WandbConfig:
+    """Weights & Biases logging configuration.
+
+    Attributes:
+        enabled:          Whether to log to wandb at all.
+        project:          Wandb project name.
+        entity:           Wandb username or team. None = wandb default.
+        run_name:         Display name for the run. None = auto-generated.
+        tags:             List of string tags attached to the run.
+        log_images:       Whether to log image grids (clean / corrupted / restored).
+        log_images_every: Log an image grid every N optimizer steps.
+    """
+    enabled: bool = True
+    project: str = "art-restoration"
+    entity: Optional[str] = None
+    run_name: Optional[str] = None
+    tags: List[str] = field(default_factory=list)
+    log_images: bool = True
+    log_images_every: int = 500
+
+
+@dataclass
 class CurriculumConfig:
     """Curriculum: train on single degradation before introducing multi-degradation.
 
@@ -157,6 +179,7 @@ class TrainConfig:
         warmup:       WarmupStageConfig.
         full:         FullStageConfig.
         curriculum:   CurriculumConfig.
+        wandb:        WandbConfig.
     """
     stage: str = "warmup"
     data_dir: str = "./data/wikiart"
@@ -174,6 +197,7 @@ class TrainConfig:
     warmup: WarmupStageConfig = field(default_factory=WarmupStageConfig)
     full: FullStageConfig = field(default_factory=FullStageConfig)
     curriculum: CurriculumConfig = field(default_factory=CurriculumConfig)
+    wandb: WandbConfig = field(default_factory=WandbConfig)
 
 
 @dataclass
