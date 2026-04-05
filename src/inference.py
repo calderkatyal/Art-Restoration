@@ -11,19 +11,20 @@ Timestep schedule: FLUX.2 empirical SNR-shifted schedule from
 flux2/sampling.py get_schedule(num_steps, image_seq_len).
 
 Usage:
-    python -m src.inference \
-        --config    configs/default.yaml \
-        --checkpoint checkpoints/final.pt \
-        --input     damaged.png \
-        --output    restored.png \
-        --damage    crack paint_loss \
-        [--steps    50] \
-        [--device   cuda]
+    python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
+        [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
 
-    --damage: one or more damage types present in the image, from:
-              crack | paint_loss | stain | blur | color_shift
-              A full-image mask of ones is created for each specified type.
-              Omit to mark all channels as damaged.
+Arguments:
+    --checkpoint  Path to trained model .pt file (required).
+    --input       Path to damaged input image (required).
+    --output      Path to save restored image (required).
+    --config      Path to YAML config (default: configs/default.yaml).
+    --damage      One or more damage types present in the image:
+                      crack | paint_loss | stain | blur | color_shift
+                  A full-image mask of ones is set for each named type.
+                  Omit to mark all channels as damaged.
+    --steps       Number of ODE Euler steps (default: model.num_steps from config).
+    --device      Device to run on (default: cuda).
 """
 
 import torch
@@ -125,16 +126,10 @@ def compute_psnr(
 
 
 if __name__ == "__main__":
-    """CLI entry point.
+    """Restore a damaged image using a trained checkpoint.
 
     Usage:
-        python -m src.inference \
-            --config     configs/default.yaml \
-            --checkpoint checkpoints/final.pt \
-            --input      damaged.png \
-            --output     restored.png \
-            --damage     crack paint_loss \
-            [--steps     50] \
-            [--device    cuda]
+        python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
+            [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
     """
     ...

@@ -44,7 +44,7 @@ z_t ← m_intact ⊙ z_y + (1 - m_intact) ⊙ z_t
 ## Project Structure
 
 ```
-art_restoration/
+src/
 ├── config.py         # OmegaConf structured configs
 ├── corruption.py     # Stochastic damage pipeline C(x) -> (y, M)
 ├── dataset.py        # ArtRestorationDataset + RealDamageDataset
@@ -52,7 +52,8 @@ art_restoration/
 ├── vae.py            # Frozen FLUX.2 VAE encode/decode
 ├── null_emb.py       # Precompute and cache null text embedding
 ├── inference.py      # ODE sampling + data consistency + PSNR
-└── train.py          # Training loop (warmup + full stage)
+├── train.py          # Training loop (warmup + full stage)
+└── flux2/            # Verbatim source from black-forest-labs/flux2
 
 configs/
 └── default.yaml      # All hyperparameters and stage settings
@@ -74,7 +75,7 @@ Download datasets and place them at the paths set in `configs/default.yaml`:
 Precompute the null text embedding once before training:
 
 ```bash
-python -m art_restoration.null_emb
+python -m src.null_emb [--config configs/default.yaml] [--device cuda]
 ```
 
 ---
@@ -91,24 +92,19 @@ Training has two stages controlled by `train.stage` in the config:
 **Stage 1 — warmup (img_in only):**
 
 ```bash
-python -m art_restoration.train --config configs/default.yaml train.stage=warmup
+python -m src.train train.stage=warmup
 ```
 
 **Stage 2 — full fine-tune:**
 
 ```bash
-python -m art_restoration.train --config configs/default.yaml \
-    train.stage=full \
-    train.resume_from=./checkpoints/warmup_final.pt
+python -m src.train train.stage=full train.resume_from=checkpoints/warmup_final.pt
 ```
 
-Any config field can be overridden via dot-notation on the CLI:
+Any config field can be overridden via dot-notation:
 
 ```bash
-python -m art_restoration.train --config configs/default.yaml \
-    train.batch_size=8 \
-    train.optimizer.lr=5e-5 \
-    degradation.max_simultaneous=1
+python -m src.train train.batch_size=8 train.optimizer.lr=5e-5 degradation.max_simultaneous=1
 ```
 
 ---
@@ -127,9 +123,12 @@ train:
     warmup_epochs: 5       # single degradation only for N epochs
 
 model:
-  flux_repo: "black-forest-labs/FLUX.1-schnell"
-  mask_channels: 5
-  guidance_scale: 1.0
+  flux_model_name: "flux.2-klein-base-4b"
+  latent_channels: 128     # VAE z_channels=32 × 2×2 patchify
+  spatial_compression: 16  # 8× encoder × 2× patchify
+  in_channels: 261         # 128 (z_t) + 128 (z_y) + 5 (mask)
+  num_steps: 50
+  guidance: 4.0
 
 degradation:
   damage_types: [crack, paint_loss, stain, blur, color_shift]
@@ -142,22 +141,18 @@ degradation:
 ## Inference
 
 ```bash
-python -m src.inference \
-    --config     configs/default.yaml \
-    --checkpoint checkpoints/final.pt \
-    --input      damaged.png \
-    --output     restored.png \
-    --damage     crack paint_loss
+python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
+    [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
 ```
 
 | Argument | Description |
 |----------|-------------|
+| `--checkpoint` | Path to trained model `.pt` file (required) |
+| `--input` | Path to damaged input image (required) |
+| `--output` | Path to save restored image (required) |
 | `--config` | Path to YAML config (default: `configs/default.yaml`) |
-| `--checkpoint` | Path to trained model `.pt` file |
-| `--input` | Path to damaged input image |
-| `--output` | Path to save restored image |
 | `--damage` | Space-separated damage types present in the image.<br>Options: `crack`, `paint_loss`, `stain`, `blur`, `color_shift`.<br>Omit to mark all channels as damaged. |
-| `--steps` | Number of ODE integration steps (default: `model.num_steps` from config) |
+| `--steps` | Number of ODE Euler steps (default: `model.num_steps` from config) |
 | `--device` | Device to run on (default: `cuda`) |
 
 ---
