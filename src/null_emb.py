@@ -1,4 +1,4 @@
-"""Precompute and cache the null text embedding for classifier-free guidance.
+"""Precompute and cache the null text embedding
 
 For FLUX.2 [klein] 4B base, the text encoder is Qwen3-4B.
 The null embedding is obtained by running the encoder on an empty string [""].
