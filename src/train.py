@@ -43,7 +43,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .config import Config, load_config
+from .config import Config, WandbConfig, load_config
 from .model import RestorationDiT
 from .vae import FluxVAE
 from .corruption import downsample_mask
@@ -51,6 +51,35 @@ from .null_emb import load_or_compute_null_embedding
 from .dataset import ArtRestorationDataset
 from .inference import sample
 from .evaluations import compute_psnr
+
+
+def wandb_init(cfg: WandbConfig, train_cfg: Config) -> None:
+    """Initialize a wandb run if cfg.enabled is True.
+
+    Calls wandb.init() with project, entity, name, tags from cfg.
+    Logs the full train config as wandb.config.
+
+    Args:
+        cfg:       WandbConfig controlling project, entity, run_name, tags.
+        train_cfg: Full Config — logged to wandb.config for reproducibility.
+    """
+    ...
+
+
+def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
+    """Log scalar metrics and optional image grids to wandb.
+
+    Should be a no-op if wandb was not initialized (i.e. cfg.wandb.enabled=False).
+
+    Args:
+        metrics: Dict of scalar metric names → float values, e.g.:
+                     {"train/loss": 0.042, "val/psnr_full": 28.3}
+        step:    Current optimizer step.
+        images:  Optional dict of label → (B, 3, H, W) float32 tensor in [0,1],
+                 e.g. {"clean": x, "corrupted": y, "restored": x_hat}.
+                 Logged as a wandb.Image grid.
+    """
+    ...
 
 
 def train(cfg: Config) -> None:
