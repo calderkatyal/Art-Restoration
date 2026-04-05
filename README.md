@@ -51,7 +51,8 @@ src/
 ├── model.py          # FLUX.2 DiT wrapper with re-initialized img_in
 ├── vae.py            # Frozen FLUX.2 VAE encode/decode
 ├── null_emb.py       # Precompute and cache null text embedding
-├── inference.py      # ODE sampling + data consistency + PSNR
+├── inference.py      # ODE sampling + data consistency
+├── evaluations.py    # PSNR and stratified per-damage-type metrics
 ├── train.py          # Training loop (warmup + full stage)
 └── flux2/            # Verbatim source from black-forest-labs/flux2
 
