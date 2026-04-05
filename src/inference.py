@@ -28,7 +28,6 @@ Arguments:
 """
 
 import torch
-from typing import Optional
 
 from .model import RestorationDiT
 from .vae import FluxVAE
@@ -96,33 +95,6 @@ def data_consistency_step(
     """
     ...
 
-
-def compute_psnr(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    mask: Optional[torch.Tensor] = None,
-) -> float:
-    """Compute PSNR (dB) between prediction and target.
-
-    Full-image mode (mask=None):
-        MSE = mean over all B×C×H×W elements.
-
-    Masked mode (mask provided):
-        MSE = sum of squared errors at damaged pixels
-              / (number of damaged pixels × C)
-        where damaged pixels are those where max_k(mask_k) == 1.
-
-    Args:
-        prediction: (B, C, H, W) float32 in [0, 1].
-        target:     (B, C, H, W) float32 in [0, 1].
-        mask:       Optional (B, K, H, W) or (B, 1, H, W) binary float32.
-                    If None, full-image PSNR is computed.
-
-    Returns:
-        PSNR in dB averaged over batch. float('inf') if MSE == 0.
-        float('nan') if mask provided but no damaged pixels found.
-    """
-    ...
 
 
 if __name__ == "__main__":

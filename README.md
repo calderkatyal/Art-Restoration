@@ -51,12 +51,23 @@ src/
 ├── model.py          # FLUX.2 DiT wrapper with re-initialized img_in
 ├── vae.py            # Frozen FLUX.2 VAE encode/decode
 ├── null_emb.py       # Precompute and cache null text embedding
-├── inference.py      # ODE sampling + data consistency + PSNR
+├── inference.py      # ODE sampling + data consistency
+├── evaluations.py    # PSNR and stratified per-damage-type metrics
 ├── train.py          # Training loop (warmup + full stage)
 └── flux2/            # Verbatim source from black-forest-labs/flux2
 
-configs/
-└── default.yaml      # All hyperparameters and stage settings
+train/
+├── configs/
+│   └── train.yaml    # Training + inference hyperparameters
+└── scripts/
+    ├── warmup.sh     # SLURM: stage 1 (img_in only)
+    └── full.sh       # SLURM: stage 2 (all layers)
+
+inference/
+├── configs/
+│   └── inference.yaml  # Inference hyperparameters
+└── scripts/
+    └── run.sh          # SLURM: run inference on a test set
 ```
 
 ---
@@ -67,93 +78,32 @@ configs/
 pip install -r requirements.txt
 ```
 
-Download datasets and place them at the paths set in `configs/default.yaml`:
+Download datasets and place them at the paths set in `train/configs/train.yaml`:
 
 - **Training**: [WikiArt](https://www.kaggle.com/datasets/steubk/wikiart) → `./data/wikiart/`
 - **Evaluation**: [MuralDH](https://github.com/...) → `./data/muraldh/`
-
-Precompute the null text embedding once before training:
-
-```bash
-python -m src.null_emb [--config configs/default.yaml] [--device cuda]
-```
 
 ---
 
 ## Training
 
-Training has two stages controlled by `train.stage` in the config:
+Training has two stages controlled by `train.stage` in `train/configs/train.yaml`:
 
 | Stage | What trains | LR key |
 |-------|-------------|--------|
 | `warmup` | `img_in` only (backbone frozen) | `train.warmup.lr` |
 | `full` | All layers | `train.full.backbone_lr` / `train.full.img_in_lr` |
 
-**Stage 1 — warmup (img_in only):**
-
-```bash
-python -m src.train train.stage=warmup
-```
-
-**Stage 2 — full fine-tune:**
-
-```bash
-python -m src.train train.stage=full train.resume_from=checkpoints/warmup_final.pt
-```
-
-Any config field can be overridden via dot-notation:
-
-```bash
-python -m src.train train.batch_size=8 train.optimizer.lr=5e-5 degradation.max_simultaneous=1
-```
+See `train/scripts/warmup.sh` and `train/scripts/full.sh`.
 
 ---
 
 ## Configuration
 
-All settings live in `configs/default.yaml`. Key fields:
+Settings are split by task:
 
-```yaml
-train:
-  stage: "warmup"          # "warmup" or "full"
-  batch_size: 4
-  num_epochs: 50
-  curriculum:
-    enabled: true
-    warmup_epochs: 5       # single degradation only for N epochs
-
-model:
-  flux_model_name: "flux.2-klein-base-4b"
-  latent_channels: 128     # VAE z_channels=32 × 2×2 patchify
-  spatial_compression: 16  # 8× encoder × 2× patchify
-  in_channels: 261         # 128 (z_t) + 128 (z_y) + 5 (mask)
-  num_steps: 50
-  guidance: 4.0
-
-degradation:
-  damage_types: [crack, paint_loss, stain, blur, color_shift]
-  severity_range: [0.2, 0.8]
-  max_simultaneous: 3
-```
-
----
-
-## Inference
-
-```bash
-python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
-    [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
-```
-
-| Argument | Description |
-|----------|-------------|
-| `--checkpoint` | Path to trained model `.pt` file (required) |
-| `--input` | Path to damaged input image (required) |
-| `--output` | Path to save restored image (required) |
-| `--config` | Path to YAML config (default: `configs/default.yaml`) |
-| `--damage` | Space-separated damage types present in the image.<br>Options: `crack`, `paint_loss`, `stain`, `blur`, `color_shift`.<br>Omit to mark all channels as damaged. |
-| `--steps` | Number of ODE Euler steps (default: `model.num_steps` from config) |
-| `--device` | Device to run on (default: `cuda`) |
+- **`train/configs/train.yaml`** — model, training, degradation, and inference-during-training settings
+- **`inference/configs/inference.yaml`** — model and inference settings for standalone runs
 
 ---
 
