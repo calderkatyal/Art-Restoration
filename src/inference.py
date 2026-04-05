@@ -1,7 +1,14 @@
-"""Inference: ODE integration with data-consistency projection.
+"""Inference: Euler ODE integration with hard data-consistency projection.
 
-Integrates the learned velocity field from t=0 to t=1, applying hard
-data-consistency constraints at each step to preserve intact regions.
+At each integration step:
+    1. Predict velocity:  vel = v_θ(z_t, t | z_y, M')
+    2. Euler step:        z_t ← z_t + (t_prev - t_curr) * vel
+    3. Data consistency:  z_t ← m_intact ⊙ z_y  +  m_dam ⊙ z_t
+       where  m_dam    = max_k(M'_k)   (any damaged channel → 1)
+              m_intact = 1 - m_dam
+
+Timestep schedule: FLUX.2 empirical SNR-shifted schedule from
+flux2/sampling.py get_schedule(num_steps, image_seq_len).
 """
 
 import torch
@@ -9,8 +16,11 @@ from typing import Optional
 
 from .model import RestorationDiT
 from .vae import FluxVAE
+from .corruption import downsample_mask
+from .flux2.sampling import get_schedule
 
 
+@torch.no_grad()
 def sample(
     model: RestorationDiT,
     vae: FluxVAE,
@@ -18,27 +28,32 @@ def sample(
     mask: torch.Tensor,
     null_emb: torch.Tensor,
     num_steps: int = 50,
-    guidance_scale: float = 1.0,
     device: str = "cuda",
 ) -> torch.Tensor:
-    """Restore a corrupted image via ODE integration.
+    """Restore a corrupted image via Euler ODE integration.
 
-    Encodes the corrupted image, samples z_0 ~ N(0,I), and integrates
-    the velocity field from t=0 to t=1 using Euler method with
-    data-consistency projection at each step.
+    Steps:
+        1. z_y = vae.encode(corrupted_image)       → (B, 128, H/16, W/16)
+        2. M'  = downsample_mask(mask, factor=16)  → (B, K, H/16, W/16)
+        3. z_t ~ N(0, I), same shape as z_y.
+        4. timesteps = get_schedule(num_steps, H'*W')  — SNR-shifted schedule.
+        5. For each (t_curr, t_prev) in timesteps:
+               vel  = model(z_t, t_curr, z_y, M', null_emb)
+               z_t ← z_t + (t_prev - t_curr) * vel
+               z_t ← data_consistency_step(z_t, z_y, M')
+        6. return vae.decode(z_t)                  → (B, 3, H, W) in [0, 1]
 
     Args:
-        model: Trained RestorationDiT.
-        vae: Frozen FluxVAE for encode/decode.
-        corrupted_image: Degraded image tensor (B, 3, H, W) in [0, 1].
-        mask: Multi-channel damage mask (B, K, H, W), binary, pixel resolution.
-        null_emb: Precomputed null text embedding.
-        num_steps: Number of Euler integration steps.
-        guidance_scale: CFG scale (1.0 = no guidance).
-        device: Device.
+        model:           Trained RestorationDiT in eval mode.
+        vae:             Frozen FluxVAE.
+        corrupted_image: (B, 3, H, W) float32 in [0, 1]. H, W divisible by 16.
+        mask:            (B, K, H, W) float32 binary at pixel resolution.
+        null_emb:        (1, 512, 7680) precomputed null text embedding.
+        num_steps:       Number of Euler steps.
+        device:          Device string.
 
     Returns:
-        Restored image tensor (B, 3, H, W) in [0, 1].
+        (B, 3, H, W) float32 in [0, 1] — restored image.
     """
     ...
 
@@ -48,21 +63,20 @@ def data_consistency_step(
     z_y: torch.Tensor,
     mask_latent: torch.Tensor,
 ) -> torch.Tensor:
-    """Apply hard data-consistency projection in latent space.
+    """Hard data-consistency projection in latent space.
 
-    Replaces intact (non-damaged) latent regions with the corrupted
-    image's latent, preserving unmasked content:
-        z_t <- m_intact * z_y + (1 - m_intact) * z_t
-
-    where m_intact = 1 - max_k(M'_k).
+    Preserves intact (non-damaged) latent regions from z_y:
+        m_dam    = max_k(M'_k)          (B, 1, H', W')
+        m_intact = 1 - m_dam
+        z_t     ← m_intact ⊙ z_y  +  m_dam ⊙ z_t
 
     Args:
-        z_t: Current latent state, shape (B, C, H', W').
-        z_y: Corrupted image latent, shape (B, C, H', W').
-        mask_latent: Downsampled mask, shape (B, K, H', W').
+        z_t:          Current latent (B, 128, H', W').
+        z_y:          Corrupted image latent (B, 128, H', W').
+        mask_latent:  Downsampled mask (B, K, H', W') values in {0, 1}.
 
     Returns:
-        Projected latent, shape (B, C, H', W').
+        Projected latent (B, 128, H', W').
     """
     ...
 
@@ -72,15 +86,24 @@ def compute_psnr(
     target: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> float:
-    """Compute PSNR between prediction and target, optionally masked.
+    """Compute PSNR (dB) between prediction and target.
+
+    Full-image mode (mask=None):
+        MSE = mean over all B×C×H×W elements.
+
+    Masked mode (mask provided):
+        MSE = sum of squared errors at damaged pixels
+              / (number of damaged pixels × C)
+        where damaged pixels are those where max_k(mask_k) == 1.
 
     Args:
-        prediction: Predicted image (B, C, H, W) in [0, 1].
-        target: Ground truth image (B, C, H, W) in [0, 1].
-        mask: If provided, binary mask (B, 1, H, W) to compute PSNR
-              only over damaged pixels. None = full image PSNR.
+        prediction: (B, C, H, W) float32 in [0, 1].
+        target:     (B, C, H, W) float32 in [0, 1].
+        mask:       Optional (B, K, H, W) or (B, 1, H, W) binary float32.
+                    If None, full-image PSNR is computed.
 
     Returns:
-        PSNR value in dB (averaged over batch).
+        PSNR in dB averaged over batch. float('inf') if MSE == 0.
+        float('nan') if mask provided but no damaged pixels found.
     """
     ...

@@ -1,93 +1,126 @@
-"""Training loop for the conditional latent rectified flow restoration model."""
+"""Training loop for conditional latent rectified flow art restoration.
+
+Entry point:
+    python -m src.train --config configs/default.yaml [dot.notation=overrides]
+
+Training stages (cfg.train.stage):
+    "warmup": backbone frozen, only img_in trained at cfg.train.warmup.lr.
+    "full":   all layers trained; backbone at backbone_lr, img_in at img_in_lr.
+
+Rectified flow objective per iteration:
+    1. Sample clean x; apply C(x) → (y, M).
+    2. z_1 = E(x),  z_y = E(y)  (frozen VAE, no grad).
+    3. M' = downsample_mask(M, factor=16).
+    4. z_0 ~ N(0, I),  t ~ U(0, 1).
+    5. z_t = (1 - t) * z_0 + t * z_1.
+    6. vel = v_θ(z_t, t | z_y, M', null_emb).
+    7. loss = || vel - (z_1 - z_0) ||²   (MSE).
+    8. Backward + optimizer + scheduler step.
+
+Curriculum (cfg.train.curriculum.enabled):
+    For the first curriculum_warmup_epochs, max_simultaneous=1 is passed
+    to the DataLoader so only single-degradation images are used.
+
+Validation:
+    Full-image PSNR and masked-region PSNR on held-out WikiArt images
+    with synthetic corruption using the same CorruptionModule.
+"""
+
+import os
+import argparse
 
 import torch
-from typing import Optional
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 from .config import Config, load_config
+from .model import RestorationDiT
+from .vae import FluxVAE
+from .corruption import downsample_mask
+from .null_emb import load_or_compute_null_embedding
+from .dataset import ArtRestorationDataset
+from .inference import compute_psnr, sample
 
 
-def train(cfg: Config):
+def train(cfg: Config) -> None:
     """Main training entry point.
 
-    Behavior depends on cfg.train.stage:
-        - "warmup": Freeze entire backbone, only train img_in.
-                    Uses cfg.train.warmup.lr for img_in parameters.
-        - "full":   Unfreeze all layers. Uses cfg.train.full.backbone_lr
-                    for pretrained params and cfg.train.full.img_in_lr for img_in.
-
-    Handles curriculum learning: during warmup epochs, limits corruption
-    to a single degradation type per image before introducing multi-degradation.
-
-    Steps per iteration:
-        1. Load clean image x, apply corruption -> (y, M).
-        2. Encode: z_1 = E(x), z_y = E(y). Downsample mask: M'.
-        3. Sample z_0 ~ N(0,I), t ~ U(0,1).
-        4. Compute z_t = (1-t)*z_0 + t*z_1.
-        5. Predict v = model(z_t, t, z_y, M', null_emb).
-        6. Loss = ||v - (z_1 - z_0)||^2.
-        7. Backprop and step optimizer.
+    Sets up model, VAE, null embedding, optimizer, scheduler, and dataloaders,
+    then runs the epoch loop with optional curriculum and periodic validation.
 
     Args:
-        cfg: Full Config object loaded from YAML.
+        cfg: Full Config loaded from YAML + CLI overrides.
     """
     ...
 
 
 def setup_model(cfg: Config, device: str = "cuda"):
-    """Initialize RestorationDiT and FluxVAE, load null embedding.
+    """Initialize RestorationDiT, FluxVAE, and null embedding.
 
-    Freezes/unfreezes parameters based on cfg.train.stage:
-        - "warmup": only img_in parameters are trainable.
-        - "full": all parameters in DiT are trainable.
+    Calls model.set_stage(cfg.train.stage) to freeze/unfreeze parameters.
 
     Args:
-        cfg: Full config.
-        device: Device to load models on.
+        cfg:    Full config.
+        device: Device string.
 
     Returns:
-        Tuple of (model, vae, null_emb).
+        Tuple (model, vae, null_emb).
+            model:    RestorationDiT on device.
+            vae:      FluxVAE on device, fully frozen.
+            null_emb: (1, 512, 7680) on device.
     """
     ...
 
 
-def build_optimizer(model: torch.nn.Module, cfg: Config):
-    """Build optimizer with per-parameter-group learning rates.
+def build_optimizer(model: RestorationDiT, cfg: Config) -> torch.optim.Optimizer:
+    """Build AdamW with per-param-group LRs based on training stage.
 
-    In "warmup" stage: single param group (img_in only).
-    In "full" stage: two param groups (backbone at backbone_lr, img_in at img_in_lr).
+    Warmup stage → one active group:
+        img_in params at cfg.train.warmup.lr.
+    Full stage → two groups:
+        backbone params at cfg.train.full.backbone_lr.
+        img_in params at cfg.train.full.img_in_lr.
+
+    Uses cfg.train.optimizer for weight_decay and betas.
 
     Args:
-        model: RestorationDiT with .get_trainable_params() support.
-        cfg: Full config.
+        model: RestorationDiT (calls model.get_trainable_params()).
+        cfg:   Full config.
 
     Returns:
-        torch.optim.Optimizer.
+        torch.optim.AdamW.
     """
     ...
 
 
-def build_scheduler(optimizer, cfg: Config):
-    """Build learning rate scheduler from config.
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: Config):
+    """Build cosine LR scheduler with linear warmup.
+
+    Warmup: linear ramp over cfg.train.scheduler.warmup_steps steps.
+    Decay:  cosine from base LR down to cfg.train.scheduler.min_lr.
 
     Args:
         optimizer: The optimizer.
-        cfg: Full config (reads cfg.train.scheduler).
+        cfg:       Full config.
 
     Returns:
-        LR scheduler instance.
+        torch.optim.lr_scheduler.LambdaLR.
     """
     ...
 
 
 def setup_dataloader(
     cfg: Config,
-    max_simultaneous: Optional[int] = None,
-):
-    """Create training DataLoader with optional curriculum constraint.
+    max_simultaneous: int | None = None,
+    split: str = "train",
+) -> DataLoader:
+    """Create a DataLoader for the train or val split.
 
     Args:
-        cfg: Full config.
-        max_simultaneous: Curriculum override (e.g. 1 during warmup).
+        cfg:              Full config.
+        max_simultaneous: Curriculum override passed to ArtRestorationDataset.
+        split:            "train" (shuffle=True) or "val" (shuffle=False).
 
     Returns:
         DataLoader yielding dicts with 'clean', 'corrupted', 'mask'.
@@ -96,66 +129,120 @@ def setup_dataloader(
 
 
 def compute_flow_loss(
-    model: torch.nn.Module,
-    vae: torch.nn.Module,
+    model: RestorationDiT,
+    vae: FluxVAE,
     batch: dict,
     null_emb: torch.Tensor,
     device: str = "cuda",
 ) -> torch.Tensor:
-    """Compute the rectified flow MSE loss for a single batch.
+    """Compute rectified flow MSE loss for a single batch.
 
-    Encodes clean and corrupted images, samples noise and timestep,
-    constructs z_t, predicts velocity, and returns MSE against target.
+    Inputs (from batch dict):
+        clean:     (B, 3, H, W) in [0, 1]
+        corrupted: (B, 3, H, W) in [0, 1]
+        mask:      (B, K, H, W) binary
+
+    Steps:
+        z_1, z_y = vae.encode(clean), vae.encode(corrupted)  — no grad
+        M' = downsample_mask(mask, factor=vae.spatial_compression)
+        z_0 ~ N(0, I),  t ~ U(0, 1)  shape (B,)
+        z_t = (1-t) * z_0 + t * z_1   with t broadcast to (B,1,1,1)
+        vel = model(z_t, t, z_y, M', null_emb)
+        return F.mse_loss(vel, z_1 - z_0)
 
     Args:
-        model: RestorationDiT.
-        vae: Frozen FluxVAE.
-        batch: Dict with 'clean', 'corrupted', 'mask' tensors.
-        null_emb: Precomputed null text embedding.
-        device: Device.
+        model:    RestorationDiT.
+        vae:      Frozen FluxVAE.
+        batch:    Dict with 'clean', 'corrupted', 'mask'.
+        null_emb: (1, 512, 7680).
+        device:   Device string.
 
     Returns:
-        Scalar loss tensor.
+        Scalar MSE loss tensor.
     """
     ...
 
 
-def save_checkpoint(model, optimizer, scheduler, step: int, cfg: Config, path: str) -> None:
-    """Save model, optimizer, scheduler state and config to disk.
+def save_checkpoint(
+    model: RestorationDiT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    step: int,
+    cfg: Config,
+    path: str,
+) -> None:
+    """Save model state_dict, optimizer, scheduler, step, and serialized config.
 
     Args:
-        model: The RestorationDiT model.
-        optimizer: The optimizer.
-        scheduler: The LR scheduler.
-        step: Current training step.
-        cfg: Config (saved alongside for reproducibility).
-        path: File path for the checkpoint.
+        model:     RestorationDiT.
+        optimizer: Optimizer.
+        scheduler: LR scheduler.
+        step:      Current training step.
+        cfg:       Config (serialized via OmegaConf.to_yaml for reproducibility).
+        path:      Output .pt file path.
     """
     ...
 
 
-def validate(model, vae, val_loader, null_emb, device: str = "cuda") -> dict:
-    """Run validation: compute PSNR on held-out synthetically corrupted images.
-
-    Reports full-image PSNR and masked-region-only PSNR.
+def load_checkpoint(
+    model: RestorationDiT,
+    optimizer: torch.optim.Optimizer,
+    scheduler,
+    path: str,
+    device: str,
+) -> int:
+    """Load checkpoint into model/optimizer/scheduler and return the step.
 
     Args:
-        model: RestorationDiT.
-        vae: Frozen FluxVAE.
+        model:     RestorationDiT.
+        optimizer: Optimizer to restore.
+        scheduler: Scheduler to restore.
+        path:      Path to .pt checkpoint file.
+        device:    Device to map tensors onto.
+
+    Returns:
+        Step number to resume from.
+    """
+    ...
+
+
+@torch.no_grad()
+def validate(
+    model: RestorationDiT,
+    vae: FluxVAE,
+    val_loader: DataLoader,
+    null_emb: torch.Tensor,
+    cfg: Config,
+    device: str = "cuda",
+) -> dict:
+    """Compute validation PSNR on held-out synthetically corrupted images.
+
+    Runs sample() for each batch and accumulates:
+        psnr_full:   PSNR over entire image.
+        psnr_masked: PSNR over damaged (masked) pixels only.
+
+    Args:
+        model:      RestorationDiT in eval mode.
+        vae:        Frozen FluxVAE.
         val_loader: Validation DataLoader.
-        null_emb: Null text embedding.
-        device: Device.
+        null_emb:   (1, 512, 7680).
+        cfg:        Full config (for cfg.model.num_steps).
+        device:     Device string.
 
     Returns:
-        Dict with 'psnr_full' and 'psnr_masked' values.
+        Dict with keys 'psnr_full' and 'psnr_masked' (floats, batch-averaged).
     """
     ...
 
 
 if __name__ == "__main__":
-    """CLI entry point: python -m art_restoration.train --config configs/default.yaml [overrides].
+    """CLI entry point.
 
-    Supports dot-notation overrides, e.g.:
-        python -m art_restoration.train --config configs/default.yaml train.stage=full train.batch_size=8
+    Usage:
+        python -m src.train --config configs/default.yaml [overrides]
+
+    Examples:
+        python -m src.train --config configs/default.yaml train.stage=full
+        python -m src.train --config configs/default.yaml train.batch_size=8 train.resume_from=./checkpoints/warmup_final.pt
     """
     ...
