@@ -1,42 +1,67 @@
-"""Precompute and cache the null text embedding for CFG.
+"""Precompute and cache the null text embedding for classifier-free guidance.
 
-Run once before training. The null embedding is the text encoder's output
-for an empty string, used as the unconditional conditioning signal.
+For FLUX.2 [klein] 4B base, the text encoder is Qwen3-4B.
+The null embedding is obtained by running the encoder on an empty string [""].
+
+Output shape: (1, 512, 7680)
+    batch=1, max_length=512 tokens, 3 Qwen3-4B hidden layers × 2560 dim
+
+Run once before training:
+    python -m src.null_emb --config configs/default.yaml
+
+The result is saved to cfg.model.null_emb_path and reloaded on subsequent runs.
 """
 
 import torch
 from pathlib import Path
 
+from .flux2.util import load_text_encoder
 
-def compute_null_embedding(model_repo: str, device: str = "cuda") -> torch.Tensor:
-    """Run the FLUX.2 text encoder on an empty string to get the null embedding.
+
+def compute_null_embedding(
+    flux_model_name: str = "flux.2-klein-base-4b",
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Run the Qwen3-4B text encoder on an empty string.
+
+    Loads the text encoder via load_text_encoder(), calls it with [""],
+    and returns the result cast to bfloat16.
 
     Args:
-        model_repo: HuggingFace repo ID for FLUX.2 (to load the text encoder).
-        device: Device to run the text encoder on.
+        flux_model_name: Key in FLUX2_MODEL_INFO to select the right encoder.
+        device: Device to run on.
 
     Returns:
-        Null text embedding tensor, shape (1, seq_len, hidden_dim).
+        Null embedding (1, 512, 7680) bfloat16.
     """
     ...
 
 
 def load_or_compute_null_embedding(
-    cache_path: str, model_repo: str, device: str = "cuda"
+    cache_path: str,
+    flux_model_name: str = "flux.2-klein-base-4b",
+    device: str = "cuda",
 ) -> torch.Tensor:
     """Load cached null embedding from disk, or compute and save it.
 
+    If cache_path exists, loads and returns it.
+    Otherwise calls compute_null_embedding(), saves to cache_path, and returns.
+
     Args:
-        cache_path: Path to the cached .pt file.
-        model_repo: HuggingFace repo ID (used only if cache doesn't exist).
-        device: Device to load/compute on.
+        cache_path: Path to .pt file.
+        flux_model_name: Used only when cache doesn't exist.
+        device: Device.
 
     Returns:
-        Null text embedding tensor, shape (1, seq_len, hidden_dim).
+        Null embedding (1, 512, 7680).
     """
     ...
 
 
 if __name__ == "__main__":
-    """CLI entry point: precompute and save the null text embedding."""
+    """Precompute and save null embedding.
+
+    Usage:
+        python -m src.null_emb --config configs/default.yaml [--device cuda]
+    """
     ...

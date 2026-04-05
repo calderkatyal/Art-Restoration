@@ -1,12 +1,20 @@
-"""Synthetic corruption module C(x) -> (y, M).
+"""Synthetic corruption module  C(x) -> (y, M).
 
-Generates spatially localized, severity-controlled damage within randomly
-sampled masked regions. Each degradation type has its own binary mask channel.
+Given a clean image x, produces a degraded image y and a multi-channel
+binary damage mask M ∈ {0,1}^{K×H×W}.
+
+Each of the K channels corresponds to one damage type; a pixel is 1 if
+that damage type was applied there.  Multiple channels can be active at
+the same spatial location.
+
+downsample_mask() converts M from pixel resolution to latent resolution
+using max-pooling (kernel = stride = spatial_compression = 16), so any
+damaged pixel within a 16×16 block survives in M'.
 """
 
 import torch
-import torch.nn as nn
-from typing import Tuple, List, Optional
+import torch.nn.functional as F
+from typing import Tuple, Optional
 
 from .config import DegradationConfig
 
@@ -14,129 +22,142 @@ from .config import DegradationConfig
 class CorruptionModule:
     """Non-learned stochastic corruption pipeline.
 
-    Given a clean image x, produces a corrupted image y and a multi-channel
-    binary mask M in {0,1}^{K x H x W} indicating which pixels were damaged
-    and by which degradation type.
+    Dispatches to per-damage-type methods based on config.damage_types order.
+    Each method applies localized degradation within a randomly sampled region.
     """
 
     def __init__(self, config: DegradationConfig):
-        """Initialize corruption module with degradation config."""
+        """Initialize with degradation config.
+
+        Args:
+            config: DegradationConfig specifying damage types, severity range,
+                    and max simultaneous degradations.
+        """
         ...
 
     def __call__(
-        self, image: torch.Tensor, max_simultaneous: Optional[int] = None
+        self,
+        image: torch.Tensor,
+        max_simultaneous: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply random degradations to a clean image.
+        """Apply random subset of degradations to a clean image.
+
+        Randomly selects n ∈ [1, max_simultaneous] damage types without
+        replacement and applies each to a randomly sampled region.
 
         Args:
-            image: Clean image tensor, shape (C, H, W), values in [0, 1].
-            max_simultaneous: Override max number of simultaneous degradations.
+            image: (C, H, W) float32 in [0, 1].
+            max_simultaneous: Override for curriculum learning. Defaults to
+                              config.max_simultaneous.
 
         Returns:
-            corrupted: Degraded image tensor, same shape as input.
-            mask: Multi-channel damage mask, shape (K, H, W), binary.
+            corrupted: (C, H, W) float32 in [0, 1] — degraded image.
+            mask:      (K, H, W) float32 binary    — per-channel damage mask.
         """
         ...
 
     def _sample_region_mask(self, h: int, w: int) -> torch.Tensor:
-        """Sample a random spatial region for a single degradation.
+        """Sample a random rectangular region covering 10–60% of each dimension.
 
         Args:
             h: Image height.
             w: Image width.
 
         Returns:
-            Binary mask of shape (H, W) indicating the damaged region.
+            (H, W) float32 binary mask — 1 inside the sampled box, 0 outside.
         """
         ...
 
     def _apply_crack(
         self, image: torch.Tensor, region: torch.Tensor, severity: float
     ) -> torch.Tensor:
-        """Apply synthetic crack degradation to masked region.
+        """Darken thin Gaussian-noise structures to simulate cracks.
 
         Args:
-            image: Current image tensor (C, H, W).
-            region: Binary spatial mask (H, W).
-            severity: Degradation strength in [0, 1].
+            image:    (C, H, W) in [0, 1].
+            region:   (H, W) binary — spatial region to corrupt.
+            severity: Float in severity_range, controls darkness and density.
 
         Returns:
-            Modified image with crack artifacts in the masked region.
+            (C, H, W) image with crack artifacts inside region.
         """
         ...
 
     def _apply_paint_loss(
         self, image: torch.Tensor, region: torch.Tensor, severity: float
     ) -> torch.Tensor:
-        """Apply synthetic paint loss / flaking to masked region.
+        """Replace random pixels with a noisy neutral underlayer to simulate flaking.
 
         Args:
-            image: Current image tensor (C, H, W).
-            region: Binary spatial mask (H, W).
-            severity: Degradation strength in [0, 1].
+            image:    (C, H, W) in [0, 1].
+            region:   (H, W) binary.
+            severity: Controls fraction of pixels lost.
 
         Returns:
-            Modified image with paint loss in the masked region.
+            (C, H, W) image with paint-loss patches inside region.
         """
         ...
 
     def _apply_stain(
         self, image: torch.Tensor, region: torch.Tensor, severity: float
     ) -> torch.Tensor:
-        """Apply synthetic stain (water/smoke damage) to masked region.
+        """Blend a brownish tint into the region to simulate water/smoke damage.
 
         Args:
-            image: Current image tensor (C, H, W).
-            region: Binary spatial mask (H, W).
-            severity: Degradation strength in [0, 1].
+            image:    (C, H, W) in [0, 1].
+            region:   (H, W) binary.
+            severity: Controls tint strength.
 
         Returns:
-            Modified image with stain artifacts in the masked region.
+            (C, H, W) image with stain inside region.
         """
         ...
 
     def _apply_blur(
         self, image: torch.Tensor, region: torch.Tensor, severity: float
     ) -> torch.Tensor:
-        """Apply localized blur degradation to masked region.
+        """Apply separable Gaussian blur within the region.
+
+        Kernel size and sigma scale with severity.
 
         Args:
-            image: Current image tensor (C, H, W).
-            region: Binary spatial mask (H, W).
-            severity: Degradation strength in [0, 1].
+            image:    (C, H, W) in [0, 1].
+            region:   (H, W) binary.
+            severity: Controls kernel size (3–15) and sigma (1–5).
 
         Returns:
-            Modified image with blur in the masked region.
+            (C, H, W) image with blur inside region.
         """
         ...
 
     def _apply_color_shift(
         self, image: torch.Tensor, region: torch.Tensor, severity: float
     ) -> torch.Tensor:
-        """Apply localized color shift / discoloration to masked region.
+        """Randomly scale each color channel within the region.
 
         Args:
-            image: Current image tensor (C, H, W).
-            region: Binary spatial mask (H, W).
-            severity: Degradation strength in [0, 1].
+            image:    (C, H, W) in [0, 1].
+            region:   (H, W) binary.
+            severity: Controls per-channel scale deviation from 1.0.
 
         Returns:
-            Modified image with color shift in the masked region.
+            (C, H, W) image with color-shifted region.
         """
         ...
 
 
-def downsample_mask(mask: torch.Tensor, factor: int) -> torch.Tensor:
+def downsample_mask(mask: torch.Tensor, factor: int = 16) -> torch.Tensor:
     """Downsample pixel-resolution mask to latent resolution via max pooling.
 
-    Ensures damaged pixels within a spatial block are preserved in the
-    downsampled mask M'.
+    A damaged pixel in any position within a (factor × factor) block
+    propagates a 1 to the corresponding latent-resolution cell.
 
     Args:
-        mask: Binary mask of shape (K, H, W) or (B, K, H, W).
-        factor: Spatial compression factor of the VAE (e.g. 8).
+        mask:   Binary mask (K, H, W) or (B, K, H, W). float32.
+        factor: Spatial compression factor (16 for FLUX.2 VAE).
 
     Returns:
-        Downsampled binary mask of shape (K, H', W') or (B, K, H', W').
+        Downsampled binary mask (K, H//factor, W//factor)
+        or (B, K, H//factor, W//factor).
     """
     ...
