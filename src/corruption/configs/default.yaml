@@ -7,7 +7,8 @@ damage_types:
   - fading
   - bloom
   - deposits
-num_channels: 7
+  - scratches
+num_channels: 8
 
 # Preset selection
 individual_prob: 0.4  # prob of individual vs multi
@@ -21,6 +22,7 @@ individual_presets:
   fading: 1.0
   bloom: 1.0
   deposits: 1.0
+  scratches: 1.0
 
 # Which multi presets are enabled + relative weights (uniform by default)
 multi_presets:
@@ -44,3 +46,4 @@ severity_scale:
   fading: 1.0
   bloom: 1.0
   deposits: 1.0
+  scratches: 1.0
