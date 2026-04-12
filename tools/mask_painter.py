@@ -1124,12 +1124,21 @@ def main():
     server = HTTPServer(("0.0.0.0", port), MaskPainterHandler)
     STATE.server = server
 
+    # Detect hostname and user for SSH instructions
+    hostname = socket.getfqdn()
+    username = os.environ.get("USER", os.environ.get("USERNAME", "user"))
+
     print(f"\n{'='*60}")
     print(f"  Mask Painter running on port {port}")
-    print(f"  Open http://localhost:{port} in your browser")
     print(f"")
-    print(f"  If running over SSH, set up port forwarding first:")
-    print(f"    ssh -L {port}:localhost:{port} <user>@<host>")
+    print(f"  If running locally, open:")
+    print(f"    http://localhost:{port}")
+    print(f"")
+    print(f"  If running on a remote machine, run this in a")
+    print(f"  NEW local terminal first, then open the URL above:")
+    print(f"")
+    print(f"    ssh -L {port}:localhost:{port} {username}@{hostname}")
+    print(f"")
     print(f"{'='*60}")
     print(f"Press Ctrl+C to abort.\n")
 
