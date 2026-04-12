@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 import torch
 from torch.utils.data import Dataset
 
-from .config import DegradationConfig
+from .config import CorruptionConfig
 from .corruption import CorruptionModule
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -35,7 +35,7 @@ class ArtRestorationDataset(Dataset):
         self,
         data_dir: str,
         resolution: int,
-        degradation_config: DegradationConfig,
+        corruption_config: CorruptionConfig,
         max_simultaneous: Optional[int] = None,
     ):
         """Scan data_dir recursively for images and initialize corruption module.
