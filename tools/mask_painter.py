@@ -1125,22 +1125,39 @@ def main():
     STATE.server = server
 
     # Detect hostname and user for SSH instructions
-    hostname = socket.getfqdn()
+    compute_host = socket.gethostname()
+    fqdn = socket.getfqdn()
     username = os.environ.get("USER", os.environ.get("USERNAME", "user"))
+
+    # Detect login/jump host from SSH_CONNECTION env var (set by sshd)
+    ssh_connection = os.environ.get("SSH_CONNECTION", "")
+    login_node = os.environ.get("SLURM_SUBMIT_HOST", "")
 
     print(f"\n{'='*60}")
     print(f"  Mask Painter running on port {port}")
+    print(f"  Host: {compute_host}")
     print(f"")
     print(f"  If running locally, open:")
     print(f"    http://localhost:{port}")
     print(f"")
-    print(f"  If running on a remote machine, run this in a")
-    print(f"  NEW local terminal first, then open the URL above:")
+    print(f"  If running on a remote machine, run this command")
+    print(f"  in a NEW local terminal, then open the URL above:")
     print(f"")
-    print(f"    ssh -L {port}:localhost:{port} {username}@{hostname}")
+    if login_node and login_node != compute_host:
+        # HPC: compute node behind a login node — need jump host
+        print(f"    ssh -L {port}:{compute_host}:{port} {username}@{login_node}")
+    elif ssh_connection:
+        # Direct SSH — just forward through this host
+        print(f"    ssh -L {port}:localhost:{port} {username}@{fqdn}")
+    else:
+        # Probably local
+        print(f"    ssh -L {port}:localhost:{port} {username}@{fqdn}")
     print(f"")
-    print(f"{'='*60}")
-    print(f"Press Ctrl+C to abort.\n")
+    print(f"  If that doesn't work (e.g. HPC with jump node), use:")
+    print(f"    ssh -J {username}@<LOGIN_NODE> -L {port}:localhost:{port} {username}@{compute_host}")
+    print(f"  replacing <LOGIN_NODE> with your cluster's login host.")
+    print(f"")
+    print(f"{'='*60}\n")
 
     try:
         server.serve_forever()
