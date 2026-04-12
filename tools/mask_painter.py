@@ -1027,11 +1027,11 @@ def find_free_port():
 # ---------------------------------------------------------------------------
 
 def find_images(input_dir: Path) -> List[Path]:
-    """Find all image files in the given directory."""
+    """Find all image files recursively in the given directory."""
     images = []
     if not input_dir.exists():
         return images
-    for f in sorted(input_dir.iterdir()):
+    for f in sorted(input_dir.rglob("*")):
         if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
             images.append(f)
     return images
@@ -1086,18 +1086,21 @@ def main():
         inference_cfg = config.get("inference", {})
         input_dir = Path(inference_cfg.get("input_dir", "./data/test"))
 
-        # Resolve relative to config file location
+        # Resolve relative paths to CWD (not config file location)
         if not input_dir.is_absolute():
-            input_dir = config_path.parent.parent.parent / input_dir
+            input_dir = Path.cwd() / input_dir
+        input_dir = input_dir.resolve()
 
+        print(f"Looking for images in: {input_dir}")
         image_paths = find_images(input_dir)
         if not image_paths:
             print(f"Error: No images found in {input_dir}")
+            print(f"  (searched recursively for {', '.join(IMAGE_EXTENSIONS)})")
             sys.exit(1)
 
-        # Output dir relative to project root
+        # Output dir relative to CWD
         if not output_dir.is_absolute():
-            output_dir = config_path.parent.parent.parent / output_dir
+            output_dir = Path.cwd() / output_dir
 
     elif args.images:
         image_paths = [Path(p).resolve() for p in args.images]
@@ -1121,8 +1124,14 @@ def main():
     server = HTTPServer(("0.0.0.0", port), MaskPainterHandler)
     STATE.server = server
 
-    print(f"\nOpen http://localhost:{port} in your browser")
-    print("Press Ctrl+C to abort.\n")
+    print(f"\n{'='*60}")
+    print(f"  Mask Painter running on port {port}")
+    print(f"  Open http://localhost:{port} in your browser")
+    print(f"")
+    print(f"  If running over SSH, set up port forwarding first:")
+    print(f"    ssh -L {port}:localhost:{port} <user>@<host>")
+    print(f"{'='*60}")
+    print(f"Press Ctrl+C to abort.\n")
 
     try:
         server.serve_forever()
