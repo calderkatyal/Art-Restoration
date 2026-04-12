@@ -17,8 +17,8 @@ class CorruptionConfig:
     severity scaling, giving fine-grained control for curriculum learning.
 
     Attributes:
-        damage_types:        Names of K=7 degradation channels, in channel order.
-        num_channels:        K — must equal len(damage_types).
+        damage_types:        Names of K=8 degradation channels, in channel order.
+        num_channels:        K -- must equal len(damage_types).
         individual_prob:     Probability of using an individual (single-type) preset
                              vs a multi-degradation preset. 0.0 = always multi,
                              1.0 = always individual.
@@ -30,13 +30,14 @@ class CorruptionConfig:
                              e.g. start with 0.5 and increase to 1.0.
     """
     damage_types: List[str] = field(default_factory=lambda: [
-        "cracks", "paint_loss", "yellowing", "stains", "fading", "bloom", "deposits"
+        "cracks", "paint_loss", "yellowing", "stains", "fading", "bloom", "deposits", "scratches"
     ])
-    num_channels: int = 7
+    num_channels: int = 8
     individual_prob: float = 0.4
     individual_presets: Dict[str, float] = field(default_factory=lambda: {
         "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
         "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
+        "scratches": 1.0,
     })
     multi_presets: Dict[str, float] = field(default_factory=lambda: {
         "light_aging": 1.0, "heavy_craquelure": 1.0, "water_damage": 1.0,
@@ -47,6 +48,7 @@ class CorruptionConfig:
     severity_scale: Dict[str, float] = field(default_factory=lambda: {
         "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
         "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
+        "scratches": 1.0,
     })
 
 
@@ -60,9 +62,9 @@ class ModelConfig:
         input  (B, 3, H, W)  →  latent  (B, 128, H/16, W/16)
 
     DiT shape reference (Klein4BParams):
-        original img_in: Linear(128 → 3072)
-        re-initialized:  Linear(261 → 3072)
-          where 261 = 128 (z_t) + 128 (z_y) + 5 (mask)
+        original img_in: Linear(128 -> 3072)
+        re-initialized:  Linear(264 -> 3072)
+          where 264 = 128 (z_t) + 128 (z_y) + 8 (mask)
         context_in_dim = 3 Qwen3-4B hidden layers × 2560 = 7680
         use_guidance_embed = False  (base model, not distilled)
 
@@ -82,8 +84,8 @@ class ModelConfig:
     flux_model_name: str = "flux.2-klein-base-4b"
     latent_channels: int = 128
     spatial_compression: int = 16
-    mask_channels: int = 7
-    in_channels: int = 263          # 128 + 128 + 7
+    mask_channels: int = 8
+    in_channels: int = 264          # 128 + 128 + 8
     hidden_size: int = 3072
     context_in_dim: int = 7680
     text_encoder_variant: str = "4B"

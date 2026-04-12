@@ -2,8 +2,8 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   latent_channels: 128
   spatial_compression: 16
-  mask_channels: 5
-  in_channels: 261
+  mask_channels: 8
+  in_channels: 264
   hidden_size: 3072
   context_in_dim: 7680
   text_encoder_variant: "4B"
@@ -13,19 +13,16 @@ inference:
   checkpoint: "checkpoints/final.pt"
   input_dir: "./data/test"
   output_dir: "./results"
+  mask_dir: ""  # populated by mask_painter.py
   num_steps: 50
   guidance: 4.0
-  # damage: list of damage types present in the input images.
-  # Options: crack, paint_loss, stain, blur, color_shift
-  # Leave empty to mark all channels as damaged.
-  damage: []
   device: "cuda"
-
-degradation:
   damage_types:
-    - "crack"
-    - "paint_loss"
-    - "stain"
-    - "blur"
-    - "color_shift"
-  num_channels: 5
+    - cracks
+    - paint_loss
+    - yellowing
+    - stains
+    - fading
+    - bloom
+    - deposits
+    - scratches
