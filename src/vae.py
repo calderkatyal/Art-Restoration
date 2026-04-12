@@ -35,7 +35,10 @@ class FluxVAE(nn.Module):
             flux_model_name: Key in FLUX2_MODEL_INFO; resolves the AE repo/weights.
             device: Device to load the model onto.
         """
-        ...
+        super().__init__()
+        self.ae = load_ae(flux_model_name, device=device)
+        for p in self.ae.parameters():
+            p.requires_grad_(False)
 
     @torch.no_grad()
     def encode(self, x: Tensor) -> Tensor:
@@ -49,7 +52,7 @@ class FluxVAE(nn.Module):
         Returns:
             z: (B, 128, H/16, W/16) — BN-normalized latent.
         """
-        ...
+        return self.ae.encode(x * 2.0 - 1.0)
 
     @torch.no_grad()
     def decode(self, z: Tensor) -> Tensor:
@@ -63,14 +66,14 @@ class FluxVAE(nn.Module):
         Returns:
             (B, 3, H, W) float32 in [0, 1].
         """
-        ...
+        return (self.ae.decode(z) * 0.5 + 0.5).clamp(0.0, 1.0)
 
     @property
     def spatial_compression(self) -> int:
         """Total spatial downsampling factor (16)."""
-        ...
+        return self.SPATIAL_COMPRESSION
 
     @property
     def latent_channels(self) -> int:
         """Number of latent channels (128)."""
-        ...
+        return self.LATENT_CHANNELS
