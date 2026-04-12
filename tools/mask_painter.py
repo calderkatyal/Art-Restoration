@@ -238,8 +238,8 @@ body {
         <h3>Brush</h3>
         <div class="slider-row">
             <label>Size</label>
-            <input type="range" id="brushSize" min="5" max="150" value="40">
-            <span class="val" id="brushSizeVal">40</span>
+            <input type="range" id="brushSize" min="1" max="100" value="15">
+            <span class="val" id="brushSizeVal">15</span>
         </div>
 
         <h3 style="margin-top:10px;">Actions</h3>
@@ -300,7 +300,7 @@ let images = [];          // [{id, name, finalized}]
 let currentImageId = -1;
 let currentImg = null;    // HTMLImageElement of current image
 let activeChannel = 0;
-let brushSize = 40;
+let brushSize = 15;
 let showOverlay = true;
 let drawing = false;
 let lastX = -1, lastY = -1;
@@ -731,12 +731,21 @@ function setupEvents() {
     document.getElementById("btnNext").onclick = nextImage;
 
     // Canvas painting
+    // Convert mouse event to canvas pixel coords (handles CSS scaling)
+    function mouseToCanvas(e) {
+        const rect = canvas.getBoundingClientRect();
+        const scaleX = canvas.width / rect.width;
+        const scaleY = canvas.height / rect.height;
+        return [
+            (e.clientX - rect.left) * scaleX,
+            (e.clientY - rect.top) * scaleY,
+        ];
+    }
+
     canvas.addEventListener("mousedown", (e) => {
         if (e.button !== 0) return;
         drawing = true;
-        const rect = canvas.getBoundingClientRect();
-        const cx = e.clientX - rect.left;
-        const cy = e.clientY - rect.top;
+        const [cx, cy] = mouseToCanvas(e);
         pushUndo(activeChannel);
         paintAt(cx, cy);
         lastX = cx; lastY = cy;
@@ -744,10 +753,8 @@ function setupEvents() {
     });
 
     canvas.addEventListener("mousemove", (e) => {
-        const rect = canvas.getBoundingClientRect();
-        const cx = e.clientX - rect.left;
-        const cy = e.clientY - rect.top;
-        updateCursor(e.clientX, e.clientY);
+        const [cx, cy] = mouseToCanvas(e);
+        updateCursor(e);
         if (drawing) {
             interpolateAndPaint(lastX, lastY, cx, cy);
             lastX = cx; lastY = cy;
@@ -773,13 +780,17 @@ function setupEvents() {
     window.addEventListener("resize", () => { resizeCanvas(); renderCanvas(); });
 }
 
-function updateCursor(clientX, clientY) {
+function updateCursor(e) {
     const ring = cursorRing;
-    const displaySize = brushSize * 2 * (canvas._scale || 1);
+    const rect = canvas.getBoundingClientRect();
+    const cssScale = rect.width / canvas.width;
+    const displaySize = brushSize * 2 * (canvas._scale || 1) * cssScale;
     ring.style.width = displaySize + "px";
     ring.style.height = displaySize + "px";
-    ring.style.left = clientX + "px";
-    ring.style.top = clientY + "px";
+    // Position relative to canvas-area (the position:relative container)
+    const areaRect = canvas.parentElement.getBoundingClientRect();
+    ring.style.left = (e.clientX - areaRect.left) + "px";
+    ring.style.top = (e.clientY - areaRect.top) + "px";
     ring.style.display = "block";
 }
 
