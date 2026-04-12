@@ -2,9 +2,6 @@
 
 Each preset function takes (H, W, generator) and returns a dict mapping
 corruption channel names to (H, W) float32 masks in [0, 1].
-
-These are direct ports of the JavaScript preset system from
-corruption-experiments/index.html.
 """
 
 import math
@@ -14,10 +11,7 @@ from typing import Dict, Optional, List
 
 def _paint_blob(mask: torch.Tensor, cx: int, cy: int, radius: float,
                 strength: float, generator: torch.Generator = None):
-    """Paint a soft circular blob onto a mask (in-place, additive with clamp).
-
-    Port of JS presetPaintBlob().
-    """
+    """Paint a soft circular blob onto a mask (in-place, additive with clamp)."""
     H, W = mask.shape
     ri = int(math.ceil(radius))
     x0, x1 = max(0, cx - ri), min(W - 1, cx + ri)

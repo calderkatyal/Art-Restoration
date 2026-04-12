@@ -64,13 +64,14 @@ def tensor_to_pil(t: torch.Tensor) -> Image.Image:
     return T.ToPILImage()(t.clamp(0, 1))
 
 
-def try_get_font(size: int = 14):
+def try_get_font(size: int = 18):
     """Try to load a reasonable font, fall back to default."""
     candidates = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -127,8 +128,8 @@ def build_grid(
 
     grid = Image.new("RGB", (grid_w, grid_h), (30, 30, 30))
     draw = ImageDraw.Draw(grid)
-    font = try_get_font(14)
-    title_font = try_get_font(20)
+    font = try_get_font(18)
+    title_font = try_get_font(24)
 
     # Title
     draw.text((grid_w // 2 - 200, 8), "Corruption Pipeline Visual Test",
@@ -155,14 +156,14 @@ def build_grid(
         if preset_type == "individual":
             cfg = CorruptionConfig(
                 individual_prob=1.0,
-                individual_weights={n: (1.0 if n == preset_name else 0.0)
+                individual_presets={n: (1.0 if n == preset_name else 0.0)
                                     for n in INDIVIDUAL_PRESETS},
             )
             label = f"[Individual] {preset_name}"
         else:
             cfg = CorruptionConfig(
                 individual_prob=0.0,
-                multi_weights={n: (1.0 if n == preset_name else 0.0)
+                multi_presets={n: (1.0 if n == preset_name else 0.0)
                                for n in MULTI_PRESETS},
             )
             label = f"[Multi] {preset_name}"

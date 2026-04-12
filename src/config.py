@@ -17,28 +17,28 @@ class CorruptionConfig:
     severity scaling, giving fine-grained control for curriculum learning.
 
     Attributes:
-        damage_types:       Names of K=7 degradation channels, in channel order.
-        num_channels:       K — must equal len(damage_types).
-        individual_prob:    Probability of using an individual (single-type) preset
-                            vs a multi-degradation preset. 0.0 = always multi,
-                            1.0 = always individual.
-        individual_weights: Relative weight for each individual preset type.
-                            Higher weight = more likely to be selected.
-        multi_weights:      Relative weight for each multi-degradation preset.
-        severity_scale:     Per-channel multiplier applied to mask values after
-                            preset generation. Use for curriculum learning:
-                            e.g. start with 0.5 and increase to 1.0.
+        damage_types:        Names of K=7 degradation channels, in channel order.
+        num_channels:        K — must equal len(damage_types).
+        individual_prob:     Probability of using an individual (single-type) preset
+                             vs a multi-degradation preset. 0.0 = always multi,
+                             1.0 = always individual.
+        individual_presets:  Relative weight for each individual preset type.
+                             Higher weight = more likely to be selected.
+        multi_presets:       Relative weight for each multi-degradation preset.
+        severity_scale:      Per-channel multiplier applied to mask values after
+                             preset generation. Use for curriculum learning:
+                             e.g. start with 0.5 and increase to 1.0.
     """
     damage_types: List[str] = field(default_factory=lambda: [
         "cracks", "paint_loss", "yellowing", "stains", "fading", "bloom", "deposits"
     ])
     num_channels: int = 7
     individual_prob: float = 0.4
-    individual_weights: Dict[str, float] = field(default_factory=lambda: {
+    individual_presets: Dict[str, float] = field(default_factory=lambda: {
         "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
         "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
     })
-    multi_weights: Dict[str, float] = field(default_factory=lambda: {
+    multi_presets: Dict[str, float] = field(default_factory=lambda: {
         "light_aging": 1.0, "heavy_craquelure": 1.0, "water_damage": 1.0,
         "sun_faded": 1.0, "smoke_damage": 1.0, "neglected_storage": 1.0,
         "heat_damage": 1.0, "flood_damage": 1.0, "museum_wear": 1.0,
@@ -48,10 +48,6 @@ class CorruptionConfig:
         "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
         "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
     })
-
-
-# Keep backward compatibility alias
-DegradationConfig = CorruptionConfig
 
 
 @dataclass
@@ -228,12 +224,21 @@ class TrainConfig:
 
 
 @dataclass
+class CorruptionRefConfig:
+    """Reference to the corruption config file from train.yaml.
+
+    Attributes:
+        config_path: Path to the corruption YAML config file.
+    """
+    config_path: str = "src/corruption/configs/default.yaml"
+
+
+@dataclass
 class Config:
     """Top-level config — mirrors the structure of configs/default.yaml."""
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    corruption: CorruptionConfig = field(default_factory=CorruptionConfig)
-    degradation: CorruptionConfig = field(default_factory=CorruptionConfig)  # backward compat alias
+    corruption: CorruptionRefConfig = field(default_factory=CorruptionRefConfig)
 
 
 def load_config(yaml_path: str, overrides: Optional[List[str]] = None) -> Config:
