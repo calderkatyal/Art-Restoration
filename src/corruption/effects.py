@@ -82,8 +82,117 @@ def box_blur_float(field: torch.Tensor, radius: int) -> torch.Tensor:
 # Effect implementations
 # ---------------------------------------------------------------------------
 
+def apply_linear_cracks(image: torch.Tensor, mask: torch.Tensor,
+                        generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply linear/structural cracks common in plaster and fresco.
+
+    Generates 1-3 long jagged lines traversing large portions of the image,
+    simulating structural cracks from wall movement. Each crack is a random
+    walk across the image with slight angular wandering and varying width.
+
+    Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
+    """
+    C, H, W = image.shape
+    out = image.clone()
+    crack_mask = torch.zeros(H, W, device=image.device)
+
+    mask_sum = mask.sum().item()
+    if mask_sum < 1:
+        return out, crack_mask
+
+    num_cracks = 1 + int(torch.randint(0, 3, (1,), generator=generator).item())
+
+    for _ in range(num_cracks):
+        # Pick start point near an edge
+        edge_side = int(torch.randint(0, 4, (1,), generator=generator).item())
+        if edge_side == 0:  # top
+            sx = int(torch.randint(0, W, (1,), generator=generator).item())
+            sy = int(torch.randint(0, max(1, H // 10), (1,), generator=generator).item())
+        elif edge_side == 1:  # bottom
+            sx = int(torch.randint(0, W, (1,), generator=generator).item())
+            sy = H - 1 - int(torch.randint(0, max(1, H // 10), (1,), generator=generator).item())
+        elif edge_side == 2:  # left
+            sx = int(torch.randint(0, max(1, W // 10), (1,), generator=generator).item())
+            sy = int(torch.randint(0, H, (1,), generator=generator).item())
+        else:  # right
+            sx = W - 1 - int(torch.randint(0, max(1, W // 10), (1,), generator=generator).item())
+            sy = int(torch.randint(0, H, (1,), generator=generator).item())
+
+        # Initial angle pointing roughly toward center
+        cx_center, cy_center = W / 2.0, H / 2.0
+        angle = math.atan2(cy_center - sy, cx_center - sx)
+        # Add some randomness to initial angle
+        angle += (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.5
+
+        # Walk across image
+        px, py = float(sx), float(sy)
+        step_size = 2.0
+        max_steps = int(max(H, W) * 1.2)
+
+        for step in range(max_steps):
+            # Random angular wandering
+            angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.3
+
+            px += math.cos(angle) * step_size
+            py += math.sin(angle) * step_size
+
+            ix, iy = int(round(px)), int(round(py))
+            if ix < 0 or ix >= W or iy < 0 or iy >= H:
+                break
+
+            # Check mask
+            if mask[iy, ix].item() < 0.05:
+                continue
+
+            # Varying width (1-3 pixels)
+            width = 1 + int(torch.rand(1, generator=generator).item() * 2.5)
+            half_w = width // 2
+
+            for dy in range(-half_w, half_w + 1):
+                for dx in range(-half_w, half_w + 1):
+                    nx, ny = ix + dx, iy + dy
+                    if 0 <= nx < W and 0 <= ny < H:
+                        m_val = mask[ny, nx].item()
+                        if m_val > 0.05:
+                            # Darken along crack
+                            k = 1.0 - 0.55 * m_val
+                            out[0, ny, nx] *= k
+                            out[1, ny, nx] *= k
+                            out[2, ny, nx] *= k
+                            crack_mask[ny, nx] = 1.0
+
+    return out, crack_mask
+
+
 def apply_cracks(image: torch.Tensor, mask: torch.Tensor,
                  generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply craquelure cracks — Voronoi, linear, or mixed.
+
+    Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
+
+    ~30% chance of linear-only cracks, ~15% chance of mixed (both linear
+    and Voronoi), ~55% chance of Voronoi-only. Linear cracks simulate
+    structural damage from wall movement. Voronoi cracks simulate age
+    craquelure from paint drying/shrinkage.
+    """
+    roll = torch.rand(1, generator=generator).item()
+
+    if roll < 0.30:
+        # Linear cracks only
+        return apply_linear_cracks(image, mask, generator=generator)
+    elif roll < 0.45:
+        # Mixed: apply linear first, then Voronoi on top
+        out, crack_mask = apply_linear_cracks(image, mask, generator=generator)
+        out, voronoi_mask = _apply_voronoi_cracks(out, mask, generator=generator)
+        crack_mask = (crack_mask + voronoi_mask).clamp(max=1.0)
+        return out, crack_mask
+    else:
+        # Voronoi only (original behavior)
+        return _apply_voronoi_cracks(image, mask, generator=generator)
+
+
+def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
+                          generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply Voronoi craquelure cracks.
 
     Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
@@ -256,7 +365,8 @@ def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
     """Paint loss in user-defined regions (not crack-associated).
 
     Two noise scales for patch shapes and ragged edges, threshold
-    from mask intensity.
+    from mask intensity. ~30% chance of edge-peeling mode where paint
+    loss follows edges/corners, peeling inward from painting borders.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -265,6 +375,47 @@ def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
         return out
 
     cr, cg, cb = _sample_canvas_color(image)
+
+    # ~30% chance of edge-peeling mode
+    edge_peel = torch.rand(1, generator=generator).item() < 0.30
+    if edge_peel:
+        # Create gradient mask strongest at edges/corners
+        y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
+        x_coords = torch.arange(W, device=image.device).float().unsqueeze(0).expand(H, W)
+
+        # Distance from each border, normalized to [0, 1]
+        dist_top = y_coords / H
+        dist_bot = (H - 1 - y_coords) / H
+        dist_left = x_coords / W
+        dist_right = (W - 1 - x_coords) / W
+
+        # Minimum distance to any edge
+        edge_dist = torch.min(torch.min(dist_top, dist_bot), torch.min(dist_left, dist_right))
+
+        # Edge gradient: strong near edges, fading inward
+        # Max peel depth ~20% of image dimension
+        peel_depth = 0.15 + torch.rand(1, generator=generator).item() * 0.10
+        edge_gradient = (1.0 - (edge_dist / peel_depth).clamp(max=1.0))
+
+        # Corners get extra boost (product of two edge proximities)
+        corner_boost = (1.0 - (dist_top / peel_depth).clamp(max=1.0)) * \
+                       (1.0 - (dist_left / peel_depth).clamp(max=1.0)) + \
+                       (1.0 - (dist_top / peel_depth).clamp(max=1.0)) * \
+                       (1.0 - (dist_right / peel_depth).clamp(max=1.0)) + \
+                       (1.0 - (dist_bot / peel_depth).clamp(max=1.0)) * \
+                       (1.0 - (dist_left / peel_depth).clamp(max=1.0)) + \
+                       (1.0 - (dist_bot / peel_depth).clamp(max=1.0)) * \
+                       (1.0 - (dist_right / peel_depth).clamp(max=1.0))
+        corner_boost = corner_boost.clamp(max=1.0) * 0.4
+
+        edge_gradient = (edge_gradient + corner_boost).clamp(max=1.0)
+
+        # Use noise to make peeling boundary irregular
+        peel_noise = make_noise(H, W, 6.0, generator=generator, device=image.device)
+        edge_gradient = edge_gradient * (0.5 + 0.5 * peel_noise)
+
+        # Combine with user mask
+        mask = (mask * edge_gradient).clamp(0, 1)
 
     # Low-frequency noise (patch shapes)
     noise_low = make_noise(H, W, 10.0, generator=generator, device=image.device)
@@ -405,6 +556,50 @@ def apply_stains(image: torch.Tensor, mask: torch.Tensor,
             edge_field[y0:y1+1, x0:x1+1] + tide_line * tide_mask.float()
         ).clamp(max=1.0)
 
+    # Drip patterns: gravity-driven vertical elongation below some stains
+    drip_field = torch.zeros(H, W, device=image.device)
+    use_drips = torch.rand(1, generator=generator).item() < 0.40
+    if use_drips:
+        num_drips = max(1, num_stains // 2)
+        for _ in range(num_drips):
+            # Pick a random start point within stain regions
+            dx_start, dy_start = None, None
+            for __ in range(200):
+                x = int(torch.randint(0, W, (1,), generator=generator).item())
+                y = int(torch.randint(0, H, (1,), generator=generator).item())
+                if fill_field[y, x].item() > 0.1:
+                    dx_start, dy_start = x, y
+                    break
+            if dx_start is None:
+                continue
+
+            # Drip length: 10-40% of image height downward
+            drip_len = int(H * (0.10 + torch.rand(1, generator=generator).item() * 0.30))
+            drip_width = 2 + int(torch.rand(1, generator=generator).item() * 4)
+            drip_str = 0.3 + torch.rand(1, generator=generator).item() * 0.4
+
+            px = float(dx_start)
+            for dy_off in range(drip_len):
+                py = dy_start + dy_off
+                if py >= H:
+                    break
+                # Slight horizontal wandering
+                px += (torch.rand(1, generator=generator).item() - 0.5) * 1.5
+                ix = int(round(px))
+                ix = max(0, min(W - 1, ix))
+
+                # Fade out toward end of drip
+                fade = 1.0 - (dy_off / drip_len) ** 0.7
+                half_w = drip_width // 2
+
+                for ddx in range(-half_w, half_w + 1):
+                    nx = ix + ddx
+                    if 0 <= nx < W:
+                        dist_from_center = abs(ddx) / max(1, half_w)
+                        lateral_fade = 1.0 - dist_from_center ** 2
+                        val = drip_str * fade * lateral_fade
+                        drip_field[py, nx] = max(drip_field[py, nx].item(), val)
+
     # Stain colors (float [0,1])
     stain_r, stain_g, stain_b = 140/255, 105/255, 60/255
     tide_r, tide_g, tide_b = 90/255, 65/255, 35/255
@@ -428,6 +623,15 @@ def apply_stains(image: torch.Tensor, mask: torch.Tensor,
         out[0] = torch.where(active & (edge > 0.01), out[0] * (1 - ea) + tide_r * ea, out[0])
         out[1] = torch.where(active & (edge > 0.01), out[1] * (1 - ea) + tide_g * ea, out[1])
         out[2] = torch.where(active & (edge > 0.01), out[2] * (1 - ea) + tide_b * ea, out[2])
+
+    # Drip stains
+    drip_active = drip_field > 0.01
+    if drip_active.any():
+        drip_a = (drip_field * m * 0.6).clamp(max=0.7)
+        drip_color_r, drip_color_g, drip_color_b = 120/255, 85/255, 45/255
+        out[0] = torch.where(drip_active, out[0] * (1 - drip_a) + drip_color_r * drip_a, out[0])
+        out[1] = torch.where(drip_active, out[1] * (1 - drip_a) + drip_color_g * drip_a, out[1])
+        out[2] = torch.where(drip_active, out[2] * (1 - drip_a) + drip_color_b * drip_a, out[2])
 
     return out.clamp(0, 1)
 
@@ -543,6 +747,40 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
     if field.max() < 0.01:
         return out
 
+    # Corner/edge recess deposits: grime accumulates more near borders
+    use_corner_deposits = torch.rand(1, generator=generator).item() < 0.40
+    if use_corner_deposits:
+        y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
+        x_coords = torch.arange(W, device=image.device).float().unsqueeze(0).expand(H, W)
+
+        dist_top = y_coords / H
+        dist_bot = (H - 1 - y_coords) / H
+        dist_left = x_coords / W
+        dist_right = (W - 1 - x_coords) / W
+
+        edge_dist = torch.min(torch.min(dist_top, dist_bot), torch.min(dist_left, dist_right))
+
+        # Stronger deposits within ~15% of edges
+        edge_boost = (1.0 - (edge_dist / 0.15).clamp(max=1.0)) * 0.4
+
+        # Extra boost in corners
+        corner_proximity = torch.min(
+            torch.min(dist_top, dist_bot),
+            torch.min(dist_left, dist_right)
+        )
+        # Corners: where two edges are both close
+        corner_mask = (1.0 - (dist_top / 0.15).clamp(max=1.0)) * \
+                      (1.0 - (dist_left / 0.15).clamp(max=1.0)) + \
+                      (1.0 - (dist_top / 0.15).clamp(max=1.0)) * \
+                      (1.0 - (dist_right / 0.15).clamp(max=1.0)) + \
+                      (1.0 - (dist_bot / 0.15).clamp(max=1.0)) * \
+                      (1.0 - (dist_left / 0.15).clamp(max=1.0)) + \
+                      (1.0 - (dist_bot / 0.15).clamp(max=1.0)) * \
+                      (1.0 - (dist_right / 0.15).clamp(max=1.0))
+        corner_mask = corner_mask.clamp(max=1.0) * 0.3
+
+        field = (field + edge_boost + corner_mask).clamp(0, 1)
+
     # Noise fields
     patch_noise = make_noise(H, W, 18.0, generator=generator, device=image.device)
     fine_noise = make_noise(H, W, 2.0, generator=generator, device=image.device)
@@ -599,6 +837,82 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
                 out[0] = torch.where(sparkle_mask, (out[0] + 40/255 * sparkle).clamp(max=1), out[0])
                 out[1] = torch.where(sparkle_mask, (out[1] + 38/255 * sparkle).clamp(max=1), out[1])
                 out[2] = torch.where(sparkle_mask, (out[2] + 35/255 * sparkle).clamp(max=1), out[2])
+
+    return out.clamp(0, 1)
+
+
+def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
+                    generator: torch.Generator = None) -> torch.Tensor:
+    """Surface scratches: thin linear marks from abrasion.
+
+    Generates 2-8 scratch lines per application. Each is a thin line (1-2px)
+    with slight curve, slightly lightening or revealing substrate.
+    Orientations are random but slightly clustered.
+    """
+    C, H, W = image.shape
+    out = image.clone()
+
+    mask_sum = mask.sum().item()
+    if mask_sum < 1:
+        return out
+
+    num_scratches = 2 + int(torch.randint(0, 7, (1,), generator=generator).item())
+
+    # Base orientation for clustering: all scratches drift toward this angle
+    base_angle = torch.rand(1, generator=generator).item() * math.pi
+
+    # Substrate color for reveal
+    cr, cg, cb = _sample_canvas_color(image)
+
+    for _ in range(num_scratches):
+        # Clustered angle: base_angle +/- up to 45 degrees
+        angle = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.5
+
+        # Start point: random within image
+        sx = int(torch.randint(0, W, (1,), generator=generator).item())
+        sy = int(torch.randint(0, H, (1,), generator=generator).item())
+
+        # Scratch length: 10-50% of max dimension
+        max_dim = max(H, W)
+        scratch_len = int(max_dim * (0.10 + torch.rand(1, generator=generator).item() * 0.40))
+
+        # Width: 1-2px
+        width = 1 + int(torch.rand(1, generator=generator).item() * 1.5)
+        half_w = width // 2
+
+        # Scratch intensity: how much to lighten
+        scratch_str = 0.15 + torch.rand(1, generator=generator).item() * 0.25
+
+        # Walk along scratch with slight curvature
+        px, py = float(sx), float(sy)
+        step_size = 1.5
+        curvature = (torch.rand(1, generator=generator).item() - 0.5) * 0.05
+
+        for step in range(scratch_len):
+            angle += curvature
+            px += math.cos(angle) * step_size
+            py += math.sin(angle) * step_size
+
+            ix, iy = int(round(px)), int(round(py))
+            if ix < 0 or ix >= W or iy < 0 or iy >= H:
+                break
+
+            m_val = mask[iy, ix].item()
+            if m_val < 0.05:
+                continue
+
+            for dy in range(-half_w, half_w + 1):
+                for dx in range(-half_w, half_w + 1):
+                    nx, ny = ix + dx, iy + dy
+                    if 0 <= nx < W and 0 <= ny < H:
+                        local_m = mask[ny, nx].item()
+                        if local_m < 0.05:
+                            continue
+                        a = scratch_str * local_m
+                        # Lighten toward substrate (reveal)
+                        out[0, ny, nx] = out[0, ny, nx] * (1 - a) + cr * a
+                        out[1, ny, nx] = out[1, ny, nx] * (1 - a) + cg * a
+                        out[2, ny, nx] = out[2, ny, nx] * (1 - a) + cb * a
 
     return out.clamp(0, 1)
 

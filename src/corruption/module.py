@@ -10,8 +10,9 @@ import torch.nn.functional as F
 from typing import Tuple, Dict, Optional, List
 
 from .effects import (
-    apply_cracks, apply_paint_loss_crack, apply_paint_loss_region,
-    apply_yellowing, apply_stains, apply_fading, apply_bloom, apply_deposits,
+    apply_cracks, apply_linear_cracks, apply_paint_loss_crack,
+    apply_paint_loss_region, apply_yellowing, apply_stains, apply_fading,
+    apply_bloom, apply_deposits, apply_scratches,
 )
 from .presets import (
     CHANNEL_NAMES, INDIVIDUAL_PRESETS, MULTI_PRESETS, _empty_masks,
@@ -28,10 +29,10 @@ class CorruptionModule:
 
     Given a clean image x (3, H, W) in [0, 1], produces:
       - corrupted (3, H, W) in [0, 1]
-      - mask (K, H, W) in [0, 1] where K=7 damage channels
+      - mask (K, H, W) in [0, 1] where K=8 damage channels
 
     Corruption pipeline order:
-      yellowing -> fading -> stains -> bloom -> deposits -> cracks -> paint_loss
+      yellowing -> fading -> stains -> bloom -> deposits -> scratches -> cracks -> paint_loss
 
     Usage:
         config = CorruptionConfig()
@@ -137,20 +138,26 @@ class CorruptionModule:
             gen.manual_seed(torch.randint(0, 2**31, (1,), generator=generator).item())
             out = apply_deposits(out, masks['deposits'], generator=gen)
 
-        # 6. Cracks + crack-associated paint loss
+        # 6. Scratches
+        if masks['scratches'].max() > 0.01:
+            gen = torch.Generator(device='cpu')
+            gen.manual_seed(torch.randint(0, 2**31, (1,), generator=generator).item())
+            out = apply_scratches(out, masks['scratches'], generator=gen)
+
+        # 7. Cracks + crack-associated paint loss
         crack_binary = torch.zeros(H, W, device=device)
         if masks['cracks'].max() > 0.01:
             gen = torch.Generator(device='cpu')
             gen.manual_seed(torch.randint(0, 2**31, (1,), generator=generator).item())
             out, crack_binary = apply_cracks(out, masks['cracks'], generator=gen)
 
-        # 7. Paint loss (crack-associated)
+        # 8. Paint loss (crack-associated)
         if masks['paint_loss'].max() > 0.01 and crack_binary.max() > 0:
             gen = torch.Generator(device='cpu')
             gen.manual_seed(torch.randint(0, 2**31, (1,), generator=generator).item())
             out = apply_paint_loss_crack(out, masks['paint_loss'], crack_binary, generator=gen)
 
-        # 8. Paint loss (region-based, for areas not covered by cracks)
+        # 9. Paint loss (region-based, for areas not covered by cracks)
         if masks['paint_loss'].max() > 0.01:
             gen = torch.Generator(device='cpu')
             gen.manual_seed(torch.randint(0, 2**31, (1,), generator=generator).item())

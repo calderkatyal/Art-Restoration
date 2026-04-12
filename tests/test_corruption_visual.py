@@ -7,7 +7,7 @@ Usage (on remote machine):
 
 Produces:
     tests/corruption_results/
-        corruption_grid.png   — grid of all 17 presets (7 individual + 10 multi)
+        corruption_grid.png   -- grid of all 18 presets (8 individual + 10 multi)
         config.yaml           — the CorruptionConfig used
 """
 
@@ -172,7 +172,7 @@ def build_grid(
         corrupted, mask = module(img_tensor, seed=seed + idx)
 
         # Active channels
-        active = [CHANNEL_NAMES[i] for i in range(7) if mask[i].max() > 0.01]
+        active = [CHANNEL_NAMES[i] for i in range(len(CHANNEL_NAMES)) if mask[i].max() > 0.01]
 
         print(f"  {idx+1:2d}/{n_presets} {label:40s} active={active}")
 

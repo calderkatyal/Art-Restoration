@@ -63,7 +63,7 @@ def _correlated_damage(masks: Dict[str, torch.Tensor],
         _paint_blob(masks['paint_loss'], cx, cy, r * 0.7, loss_str, generator)
 
 
-CHANNEL_NAMES = ['cracks', 'paint_loss', 'yellowing', 'stains', 'fading', 'bloom', 'deposits']
+CHANNEL_NAMES = ['cracks', 'paint_loss', 'yellowing', 'stains', 'fading', 'bloom', 'deposits', 'scratches']
 
 
 def _empty_masks(H: int, W: int, device: torch.device = None) -> Dict[str, torch.Tensor]:
@@ -181,6 +181,22 @@ def preset_individual_deposits(H: int, W: int, generator: torch.Generator = None
     return masks
 
 
+def preset_individual_scratches(H: int, W: int, generator: torch.Generator = None,
+                                device: torch.device = None) -> Dict[str, torch.Tensor]:
+    masks = _empty_masks(H, W, device)
+    # Scratches over moderate area
+    if torch.rand(1, generator=generator).item() > 0.4:
+        _fill(masks, 'scratches', 0.15 + torch.rand(1, generator=generator).item() * 0.25)
+    count = 3 + int(torch.randint(0, 5, (1,), generator=generator).item())
+    for _ in range(count):
+        cx = int(torch.randint(0, W, (1,), generator=generator).item())
+        cy = int(torch.randint(0, H, (1,), generator=generator).item())
+        r = W * (0.06 + torch.rand(1, generator=generator).item() * 0.18)
+        _paint_blob(masks['scratches'], cx, cy, r,
+                    0.3 + torch.rand(1, generator=generator).item() * 0.5, generator)
+    return masks
+
+
 INDIVIDUAL_PRESETS = {
     'cracks': preset_individual_cracks,
     'paint_loss': preset_individual_paint_loss,
@@ -189,6 +205,7 @@ INDIVIDUAL_PRESETS = {
     'fading': preset_individual_fading,
     'bloom': preset_individual_bloom,
     'deposits': preset_individual_deposits,
+    'scratches': preset_individual_scratches,
 }
 
 
@@ -279,6 +296,9 @@ def preset_neglected_storage(H: int, W: int, generator: torch.Generator = None,
     _blobs(masks, 'deposits', 3, W * 0.08, W * 0.15, 0.3, H, W, generator)
     _blobs(masks, 'cracks', 3, W * 0.1, W * 0.2, 0.2, H, W, generator)
     _fill(masks, 'yellowing', 0.15 + torch.rand(1, generator=generator).item() * 0.15)
+    # Scratches from rough handling in storage
+    _blobs(masks, 'scratches', 3 + int(torch.randint(0, 4, (1,), generator=generator).item()),
+           W * 0.05, W * 0.12, 0.25, H, W, generator)
     return masks
 
 
@@ -298,6 +318,9 @@ def preset_heat_damage(H: int, W: int, generator: torch.Generator = None,
                     0.4 + torch.rand(1, generator=generator).item() * 0.3, generator)
     _blobs(masks, 'bloom', 2 + int(torch.randint(0, 3, (1,), generator=generator).item()),
            W * 0.08, W * 0.18, 0.25, H, W, generator)
+    # Surface scratches from thermal stress
+    _blobs(masks, 'scratches', 2 + int(torch.randint(0, 3, (1,), generator=generator).item()),
+           W * 0.04, W * 0.10, 0.2, H, W, generator)
     return masks
 
 
@@ -344,6 +367,9 @@ def preset_museum_wear(H: int, W: int, generator: torch.Generator = None,
         r = W * (0.01 + torch.rand(1, generator=generator).item() * 0.03)
         _paint_blob(masks['paint_loss'], cx, cy, r,
                     0.3 + torch.rand(1, generator=generator).item() * 0.3, generator)
+    # Light scratches from handling
+    _blobs(masks, 'scratches', 2 + int(torch.randint(0, 3, (1,), generator=generator).item()),
+           W * 0.06, W * 0.15, 0.2, H, W, generator)
     return masks
 
 
