@@ -36,16 +36,13 @@ class ArtRestorationDataset(Dataset):
         data_dir: str,
         resolution: int,
         corruption_config: CorruptionConfig,
-        max_simultaneous: Optional[int] = None,
     ):
         """Scan data_dir recursively for images and initialize corruption module.
 
         Args:
             data_dir:           Root directory of clean artwork images.
             resolution:         Square crop target (H = W = resolution).
-            degradation_config: Config for CorruptionModule.
-            max_simultaneous:   Curriculum override: max degradations per image.
-                                None → use degradation_config.max_simultaneous.
+            corruption_config:  Config for CorruptionModule.
         """
         ...
 

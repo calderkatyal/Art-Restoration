@@ -2,9 +2,6 @@
 
 All effects operate on (3, H, W) float32 tensors in [0, 1] with a
 (H, W) float32 mask in [0, 1] controlling per-pixel intensity.
-
-These are direct ports of the JavaScript implementations in
-corruption-experiments/index.html, preserving identical algorithms.
 """
 
 import torch
@@ -23,7 +20,6 @@ def gaussian_blur_2d(field: torch.Tensor, sigma: float) -> torch.Tensor:
     """Apply Gaussian blur to a 2D field (H, W) or (C, H, W).
 
     Uses separable 1D convolutions for efficiency.
-    Equivalent to the canvas ctx.filter='blur(Npx)' in the JS version.
     """
     if sigma < 0.5:
         return field
@@ -61,7 +57,7 @@ def make_noise(H: int, W: int, blur_sigma: float,
                normalize: bool = True) -> torch.Tensor:
     """Generate smoothed noise field (H, W) in [0, 1].
 
-    Equivalent to JS makeNoise(): random → Gaussian blur → normalize.
+    Random noise → Gaussian blur → normalize to [0, 1].
     """
     noise = torch.rand(H, W, generator=generator, device=device or torch.device('cpu'))
     noise = gaussian_blur_2d(noise, blur_sigma)
@@ -73,7 +69,7 @@ def make_noise(H: int, W: int, blur_sigma: float,
 
 
 def box_blur_float(field: torch.Tensor, radius: int) -> torch.Tensor:
-    """Simple box blur on (H, W) field. Used for mask smoothing (same as JS blurFloatField)."""
+    """Simple box blur on (H, W) field. Used for mask smoothing."""
     if radius < 1:
         return field
     ksize = 2 * radius + 1
@@ -92,9 +88,9 @@ def apply_cracks(image: torch.Tensor, mask: torch.Tensor,
 
     Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
 
-    Port of JS applyCracks(): Voronoi tessellation with nearest-two-site
-    distance difference for edge detection. Grid-based spatial lookup for
-    minimum site spacing. Edge width scales with cell size.
+    Voronoi tessellation with nearest-two-site distance difference for
+    edge detection. Grid-based spatial lookup for minimum site spacing.
+    Edge width scales with cell size.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -212,8 +208,8 @@ def apply_paint_loss_crack(image: torch.Tensor, mask: torch.Tensor,
                            generator: torch.Generator = None) -> torch.Tensor:
     """Crack-associated paint loss: flakes along crack edges.
 
-    Port of JS applyPaintLoss(): blur crack mask for organic falloff,
-    smooth noise for flake regions, replace with substrate color.
+    Blur crack mask for organic falloff, smooth noise for flake regions,
+    replace with substrate color.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -224,10 +220,10 @@ def apply_paint_loss_crack(image: torch.Tensor, mask: torch.Tensor,
     # Sample canvas/substrate color
     cr, cg, cb = _sample_canvas_color(image)
 
-    # Blur crack mask for organic falloff (JS: blur(3px))
+    # Blur crack mask for organic falloff
     flake_field = gaussian_blur_2d(crack_mask, 3.0)
 
-    # Smooth noise field (JS: blur(4px))
+    # Smooth noise field
     noise_field = make_noise(H, W, 4.0, generator=generator, device=image.device)
 
     for i_y in range(H):
@@ -259,8 +255,8 @@ def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
                             generator: torch.Generator = None) -> torch.Tensor:
     """Paint loss in user-defined regions (not crack-associated).
 
-    Port of JS applyPaintLossInUserRegion(): two noise scales for
-    patch shapes and ragged edges, threshold from mask intensity.
+    Two noise scales for patch shapes and ragged edges, threshold
+    from mask intensity.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -270,9 +266,9 @@ def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
 
     cr, cg, cb = _sample_canvas_color(image)
 
-    # Low-frequency noise (patch shapes) — JS: blur(10px)
+    # Low-frequency noise (patch shapes)
     noise_low = make_noise(H, W, 10.0, generator=generator, device=image.device)
-    # High-frequency noise (edge irregularity) — JS: blur(2px)
+    # High-frequency noise (edge irregularity)
     noise_hi = make_noise(H, W, 2.0, generator=generator, device=image.device, normalize=False)
 
     # Compute flake field
@@ -310,15 +306,14 @@ def apply_yellowing(image: torch.Tensor, mask: torch.Tensor,
                     generator: torch.Generator = None) -> torch.Tensor:
     """Varnish yellowing via CIELAB a/b shift.
 
-    Port of JS applyYellowing(): smooth mask, noise-modulated positive
-    offsets to a and b channels.
+    Smooth mask, noise-modulated positive offsets to a and b channels.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth the mask (JS: blurFloatField radius=25)
+    # Smooth the mask
     field = box_blur_float(mask, 25)
-    # Noise field (JS: blurFloatField radius=30)
+    # Noise field
     noise = make_noise(H, W, 30.0, generator=generator, device=image.device, normalize=False)
 
     active = field > 0.01
@@ -345,8 +340,8 @@ def apply_stains(image: torch.Tensor, mask: torch.Tensor,
                  generator: torch.Generator = None) -> torch.Tensor:
     """Water stains with tide lines.
 
-    Port of JS applyStains(): elliptical stain blobs with brown interior
-    and darker tide-line ring at evaporation edge.
+    Elliptical stain blobs with brown interior and darker tide-line ring
+    at evaporation edge.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -441,15 +436,15 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
                  generator: torch.Generator = None) -> torch.Tensor:
     """Photochemical fading: desaturation + bleaching.
 
-    Port of JS applyFading(): smooth mask, noise-modulated desaturation
-    toward luminance, contrast compression toward chalky off-white.
+    Smooth mask, noise-modulated desaturation toward luminance,
+    contrast compression toward chalky off-white.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth mask (JS: blurFloatField radius=12)
+    # Smooth mask
     field = box_blur_float(mask, 12)
-    # Noise (JS: blurFloatField radius=20)
+    # Noise
     fade_noise = make_noise(H, W, 20.0, generator=generator, device=image.device, normalize=False)
 
     active = field > 0.01
@@ -487,8 +482,8 @@ def apply_bloom(image: torch.Tensor, mask: torch.Tensor,
                 generator: torch.Generator = None) -> torch.Tensor:
     """Bloom / haze from degraded varnish.
 
-    Port of JS applyBlur(): multi-radius glow with screen blend,
-    detail softening, milky warm haze overlay.
+    Multi-radius glow with screen blend, detail softening,
+    milky warm haze overlay.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -536,19 +531,19 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
                    generator: torch.Generator = None) -> torch.Tensor:
     """Surface deposits: grime, soot, and salt efflorescence.
 
-    Port of JS applyDeposits(): contrast-reduction veil model with
-    patchy noise, vertical soot bias, and salt crystalline patches.
+    Contrast-reduction veil model with patchy noise, vertical soot bias,
+    and salt crystalline patches.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth mask (JS: blurFloatField radius=6)
+    # Smooth mask
     field = box_blur_float(mask, 6)
 
     if field.max() < 0.01:
         return out
 
-    # Noise fields (JS: makeNoise with canvas Gaussian blur)
+    # Noise fields
     patch_noise = make_noise(H, W, 18.0, generator=generator, device=image.device)
     fine_noise = make_noise(H, W, 2.0, generator=generator, device=image.device)
     med_noise = make_noise(H, W, 8.0, generator=generator, device=image.device)
@@ -611,8 +606,7 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
 def _sample_canvas_color(image: torch.Tensor) -> Tuple[float, float, float]:
     """Sample substrate/canvas color from image.
 
-    Port of JS sampleCanvasColor(): average color blended 15%/85% with
-    light canvas tone [215, 200, 175]/255.
+    Average color blended 15%/85% with light canvas tone [215, 200, 175]/255.
     """
     # Sample every 40th pixel
     flat = image.view(3, -1)[:, ::40]  # (3, N)

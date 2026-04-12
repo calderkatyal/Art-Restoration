@@ -30,8 +30,8 @@ class CorruptionModule:
       - corrupted (3, H, W) in [0, 1]
       - mask (K, H, W) in [0, 1] where K=7 damage channels
 
-    Corruption pipeline order (matches JS website exactly):
-      yellowing → fading → stains → bloom → deposits → cracks → paint_loss
+    Corruption pipeline order:
+      yellowing -> fading -> stains -> bloom -> deposits -> cracks -> paint_loss
 
     Usage:
         config = CorruptionConfig()
@@ -73,7 +73,7 @@ class CorruptionModule:
 
         if use_individual:
             # Pick one individual preset
-            weights = [cfg.individual_weights.get(name, 1.0) for name in INDIVIDUAL_PRESETS]
+            weights = [cfg.individual_presets.get(name, 1.0) for name in INDIVIDUAL_PRESETS]
             total = sum(weights)
             r = torch.rand(1, generator=generator).item() * total
             cumsum = 0
@@ -86,7 +86,7 @@ class CorruptionModule:
             masks = INDIVIDUAL_PRESETS[chosen](H, W, generator=generator, device=device)
         else:
             # Pick one multi-degradation preset
-            weights = [cfg.multi_weights.get(name, 1.0) for name in MULTI_PRESETS]
+            weights = [cfg.multi_presets.get(name, 1.0) for name in MULTI_PRESETS]
             total = sum(weights)
             r = torch.rand(1, generator=generator).item() * total
             cumsum = 0
@@ -104,7 +104,7 @@ class CorruptionModule:
                 scale = cfg.severity_scale.get(name, 1.0)
                 masks[name] = (masks[name] * scale).clamp(0, 1)
 
-        # Apply effects in correct pipeline order (matches JS exactly)
+        # Apply effects in correct pipeline order
         out = image.clone()
 
         # 1. Yellowing

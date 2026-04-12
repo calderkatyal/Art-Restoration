@@ -47,57 +47,8 @@ train:
     enabled: true
     warmup_epochs: 5
 
-# Corruption pipeline configuration
-# All hyperparams here are tunable for curriculum learning
 corruption:
-  damage_types:
-    - "cracks"
-    - "paint_loss"
-    - "yellowing"
-    - "stains"
-    - "fading"
-    - "bloom"
-    - "deposits"
-  num_channels: 7
-
-  # Probability of selecting individual (single-type) vs multi preset
-  # For curriculum: start at 1.0 (individual only) then decrease to 0.4
-  individual_prob: 0.4
-
-  # Relative selection weights for individual presets
-  # Set to 0.0 to disable a specific corruption type
-  individual_weights:
-    cracks: 1.0
-    paint_loss: 1.0
-    yellowing: 1.0
-    stains: 1.0
-    fading: 1.0
-    bloom: 1.0
-    deposits: 1.0
-
-  # Relative selection weights for multi-degradation presets
-  multi_weights:
-    light_aging: 1.0
-    heavy_craquelure: 1.0
-    water_damage: 1.0
-    sun_faded: 1.0
-    smoke_damage: 1.0
-    neglected_storage: 1.0
-    heat_damage: 1.0
-    flood_damage: 1.0
-    museum_wear: 1.0
-    salt_efflorescence: 1.0
-
-  # Per-channel severity multiplier (applied after preset mask generation)
-  # For curriculum: start low (e.g. 0.3) and anneal to 1.0
-  severity_scale:
-    cracks: 1.0
-    paint_loss: 1.0
-    yellowing: 1.0
-    stains: 1.0
-    fading: 1.0
-    bloom: 1.0
-    deposits: 1.0
+  config_path: "src/corruption/configs/default.yaml"
 
 # Inference settings used for periodic validation sampling during training
 inference:
