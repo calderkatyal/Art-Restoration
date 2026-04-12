@@ -1,0 +1,46 @@
+# Corruption types
+damage_types:
+  - cracks
+  - paint_loss
+  - yellowing
+  - stains
+  - fading
+  - bloom
+  - deposits
+num_channels: 7
+
+# Preset selection
+individual_prob: 0.4  # prob of individual vs multi
+
+# Which individual presets are enabled + relative weights (uniform by default)
+individual_presets:
+  cracks: 1.0
+  paint_loss: 1.0
+  yellowing: 1.0
+  stains: 1.0
+  fading: 1.0
+  bloom: 1.0
+  deposits: 1.0
+
+# Which multi presets are enabled + relative weights (uniform by default)
+multi_presets:
+  light_aging: 1.0
+  heavy_craquelure: 1.0
+  water_damage: 1.0
+  sun_faded: 1.0
+  smoke_damage: 1.0
+  neglected_storage: 1.0
+  heat_damage: 1.0
+  flood_damage: 1.0
+  museum_wear: 1.0
+  salt_efflorescence: 1.0
+
+# Per-channel severity multiplier (for curriculum learning)
+severity_scale:
+  cracks: 1.0
+  paint_loss: 1.0
+  yellowing: 1.0
+  stains: 1.0
+  fading: 1.0
+  bloom: 1.0
+  deposits: 1.0

@@ -2,8 +2,8 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   latent_channels: 128       # VAE z_channels=32 × 2×2 patchify
   spatial_compression: 16    # 8× encoder × 2× patchify
-  mask_channels: 5
-  in_channels: 261           # 128 (z_t) + 128 (z_y) + 5 (mask)
+  mask_channels: 7           # 7 corruption types
+  in_channels: 263           # 128 (z_t) + 128 (z_y) + 7 (mask)
   hidden_size: 3072
   context_in_dim: 7680       # 3 Qwen3-4B layers × 2560
   text_encoder_variant: "4B"
@@ -47,16 +47,8 @@ train:
     enabled: true
     warmup_epochs: 5
 
-degradation:
-  damage_types:
-    - "crack"
-    - "paint_loss"
-    - "stain"
-    - "blur"
-    - "color_shift"
-  num_channels: 5
-  severity_range: [0.2, 0.8]
-  max_simultaneous: 3
+corruption:
+  config_path: "src/corruption/configs/default.yaml"
 
 # Inference settings used for periodic validation sampling during training
 inference:

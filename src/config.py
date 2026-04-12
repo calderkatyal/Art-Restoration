@@ -5,26 +5,49 @@ Dot-notation CLI overrides are supported (e.g. train.stage=full).
 """
 
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 from omegaconf import OmegaConf
 
 
 @dataclass
-class DegradationConfig:
-    """Controls which synthetic degradations are applied and their severity.
+class CorruptionConfig:
+    """Controls the stochastic corruption pipeline.
+
+    This configures both the preset selection probabilities and per-channel
+    severity scaling, giving fine-grained control for curriculum learning.
 
     Attributes:
-        damage_types:     Names of K degradation channels, in channel order.
-        num_channels:     K — must equal len(damage_types).
-        severity_range:   [min, max] severity sampled uniformly per degradation.
-        max_simultaneous: Max number of degradation types applied to one image.
+        damage_types:        Names of K=7 degradation channels, in channel order.
+        num_channels:        K — must equal len(damage_types).
+        individual_prob:     Probability of using an individual (single-type) preset
+                             vs a multi-degradation preset. 0.0 = always multi,
+                             1.0 = always individual.
+        individual_presets:  Relative weight for each individual preset type.
+                             Higher weight = more likely to be selected.
+        multi_presets:       Relative weight for each multi-degradation preset.
+        severity_scale:      Per-channel multiplier applied to mask values after
+                             preset generation. Use for curriculum learning:
+                             e.g. start with 0.5 and increase to 1.0.
     """
     damage_types: List[str] = field(default_factory=lambda: [
-        "crack", "paint_loss", "stain", "blur", "color_shift"
+        "cracks", "paint_loss", "yellowing", "stains", "fading", "bloom", "deposits"
     ])
-    num_channels: int = 5
-    severity_range: List[float] = field(default_factory=lambda: [0.2, 0.8])
-    max_simultaneous: int = 3
+    num_channels: int = 7
+    individual_prob: float = 0.4
+    individual_presets: Dict[str, float] = field(default_factory=lambda: {
+        "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
+        "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
+    })
+    multi_presets: Dict[str, float] = field(default_factory=lambda: {
+        "light_aging": 1.0, "heavy_craquelure": 1.0, "water_damage": 1.0,
+        "sun_faded": 1.0, "smoke_damage": 1.0, "neglected_storage": 1.0,
+        "heat_damage": 1.0, "flood_damage": 1.0, "museum_wear": 1.0,
+        "salt_efflorescence": 1.0,
+    })
+    severity_scale: Dict[str, float] = field(default_factory=lambda: {
+        "cracks": 1.0, "paint_loss": 1.0, "yellowing": 1.0,
+        "stains": 1.0, "fading": 1.0, "bloom": 1.0, "deposits": 1.0,
+    })
 
 
 @dataclass
@@ -59,8 +82,8 @@ class ModelConfig:
     flux_model_name: str = "flux.2-klein-base-4b"
     latent_channels: int = 128
     spatial_compression: int = 16
-    mask_channels: int = 5
-    in_channels: int = 261          # 128 + 128 + 5
+    mask_channels: int = 7
+    in_channels: int = 263          # 128 + 128 + 7
     hidden_size: int = 3072
     context_in_dim: int = 7680
     text_encoder_variant: str = "4B"
@@ -201,11 +224,21 @@ class TrainConfig:
 
 
 @dataclass
+class CorruptionRefConfig:
+    """Reference to the corruption config file from train.yaml.
+
+    Attributes:
+        config_path: Path to the corruption YAML config file.
+    """
+    config_path: str = "src/corruption/configs/default.yaml"
+
+
+@dataclass
 class Config:
     """Top-level config — mirrors the structure of configs/default.yaml."""
     model: ModelConfig = field(default_factory=ModelConfig)
     train: TrainConfig = field(default_factory=TrainConfig)
-    degradation: DegradationConfig = field(default_factory=DegradationConfig)
+    corruption: CorruptionRefConfig = field(default_factory=CorruptionRefConfig)
 
 
 def load_config(yaml_path: str, overrides: Optional[List[str]] = None) -> Config:
