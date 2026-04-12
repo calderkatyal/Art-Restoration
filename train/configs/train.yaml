@@ -2,8 +2,8 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   latent_channels: 128       # VAE z_channels=32 × 2×2 patchify
   spatial_compression: 16    # 8× encoder × 2× patchify
-  mask_channels: 5
-  in_channels: 261           # 128 (z_t) + 128 (z_y) + 5 (mask)
+  mask_channels: 7           # 7 corruption types
+  in_channels: 263           # 128 (z_t) + 128 (z_y) + 7 (mask)
   hidden_size: 3072
   context_in_dim: 7680       # 3 Qwen3-4B layers × 2560
   text_encoder_variant: "4B"
@@ -47,16 +47,57 @@ train:
     enabled: true
     warmup_epochs: 5
 
-degradation:
+# Corruption pipeline configuration
+# All hyperparams here are tunable for curriculum learning
+corruption:
   damage_types:
-    - "crack"
+    - "cracks"
     - "paint_loss"
-    - "stain"
-    - "blur"
-    - "color_shift"
-  num_channels: 5
-  severity_range: [0.2, 0.8]
-  max_simultaneous: 3
+    - "yellowing"
+    - "stains"
+    - "fading"
+    - "bloom"
+    - "deposits"
+  num_channels: 7
+
+  # Probability of selecting individual (single-type) vs multi preset
+  # For curriculum: start at 1.0 (individual only) then decrease to 0.4
+  individual_prob: 0.4
+
+  # Relative selection weights for individual presets
+  # Set to 0.0 to disable a specific corruption type
+  individual_weights:
+    cracks: 1.0
+    paint_loss: 1.0
+    yellowing: 1.0
+    stains: 1.0
+    fading: 1.0
+    bloom: 1.0
+    deposits: 1.0
+
+  # Relative selection weights for multi-degradation presets
+  multi_weights:
+    light_aging: 1.0
+    heavy_craquelure: 1.0
+    water_damage: 1.0
+    sun_faded: 1.0
+    smoke_damage: 1.0
+    neglected_storage: 1.0
+    heat_damage: 1.0
+    flood_damage: 1.0
+    museum_wear: 1.0
+    salt_efflorescence: 1.0
+
+  # Per-channel severity multiplier (applied after preset mask generation)
+  # For curriculum: start low (e.g. 0.3) and anneal to 1.0
+  severity_scale:
+    cracks: 1.0
+    paint_loss: 1.0
+    yellowing: 1.0
+    stains: 1.0
+    fading: 1.0
+    bloom: 1.0
+    deposits: 1.0
 
 # Inference settings used for periodic validation sampling during training
 inference:
