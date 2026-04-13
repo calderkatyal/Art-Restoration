@@ -45,5 +45,5 @@ severity_scale:
   stains: 1.0
   fading: 1.0
   bloom: 1.0
-  deposits: 1.0
+  deposits: 0
   scratches: 1.0

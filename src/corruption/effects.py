@@ -735,8 +735,15 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
                    generator: torch.Generator = None) -> torch.Tensor:
     """Surface deposits: grime, soot, and salt efflorescence.
 
-    Contrast-reduction veil model with patchy noise, vertical soot bias,
-    and salt crystalline patches.
+    Real surface deposits are primarily DARKENING phenomena:
+    - Grime: warm dark brown particulate film from dust, oils, smoke residue.
+      Reduces contrast, dulls colors, makes painting look muddy and aged.
+    - Soot: cool dark gray/black carbon particles from fire/candle smoke.
+      Heavier at top (rises). Very opaque, nearly black at severe levels.
+    - Salt: rare, small discrete crystalline patches — NOT widespread white haze.
+      Only appears at high intensity as scattered crusty specks.
+
+    The dominant visual effect should be DARKENING and CONTRAST LOSS, not whitening.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -763,11 +770,6 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
         # Stronger deposits within ~15% of edges
         edge_boost = (1.0 - (edge_dist / 0.15).clamp(max=1.0)) * 0.4
 
-        # Extra boost in corners
-        corner_proximity = torch.min(
-            torch.min(dist_top, dist_bot),
-            torch.min(dist_left, dist_right)
-        )
         # Corners: where two edges are both close
         corner_mask = (1.0 - (dist_top / 0.15).clamp(max=1.0)) * \
                       (1.0 - (dist_left / 0.15).clamp(max=1.0)) + \
@@ -785,58 +787,55 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
     patch_noise = make_noise(H, W, 18.0, generator=generator, device=image.device)
     fine_noise = make_noise(H, W, 2.0, generator=generator, device=image.device)
     med_noise = make_noise(H, W, 8.0, generator=generator, device=image.device)
-    salt_noise = make_noise(H, W, 4.0, generator=generator, device=image.device)
 
-    # Vertical bias for soot (heavier at top)
+    # Vertical bias for soot (heavier at top — smoke rises)
     y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
     vert_bias = 1.0 - (y_coords / H) * 0.3
     soot_frac = med_noise * vert_bias
 
-    # Anchor colors (float [0,1])
-    anchor_r = (95 * (1 - soot_frac) + 55 * soot_frac + fine_noise * 15) / 255
-    anchor_g = (80 * (1 - soot_frac) + 50 * soot_frac + fine_noise * 10) / 255
-    anchor_b = (60 * (1 - soot_frac) + 50 * soot_frac + fine_noise * 5) / 255
+    # Anchor colors: DARK — grime is warm brown, soot is near-black
+    # Grime anchor: ~(70, 60, 45)/255, Soot anchor: ~(35, 32, 30)/255
+    anchor_r = (70 * (1 - soot_frac) + 35 * soot_frac + fine_noise * 10) / 255
+    anchor_g = (60 * (1 - soot_frac) + 32 * soot_frac + fine_noise * 8) / 255
+    anchor_b = (45 * (1 - soot_frac) + 30 * soot_frac + fine_noise * 5) / 255
 
-    # Deposit strength
+    # Deposit strength: patchy, textured — allow strong darkening at high intensity
     raw_str = field * (0.3 + 0.7 * patch_noise) * (0.85 + 0.15 * fine_noise)
-    strength = (raw_str * 0.8).clamp(max=0.75)
+    strength = (raw_str * 0.9).clamp(max=0.85)
 
     active = field > 0.01
 
-    # Compress toward anchor (veil model)
+    # Compress toward dark anchor (veil model — darkens and reduces contrast)
     out[0] = torch.where(active, out[0] * (1 - strength) + anchor_r * strength, out[0])
     out[1] = torch.where(active, out[1] * (1 - strength) + anchor_g * strength, out[1])
     out[2] = torch.where(active, out[2] * (1 - strength) + anchor_b * strength, out[2])
 
-    # Salt efflorescence
-    salt_active = field > 0.15
+    # Salt efflorescence: RARE, SMALL, DISCRETE crystalline specks
+    # Only at high mask intensity, very restricted coverage
+    salt_active = field > 0.4
     if salt_active.any():
-        salt_thresh = 0.7 - field * 0.45
+        salt_noise = make_noise(H, W, 1.5, generator=generator, device=image.device)
+        # High threshold so only a few percent of pixels get salt
+        salt_thresh = 0.85 - field * 0.15  # at mask=1.0, thresh=0.70 → ~30% of noise above
         salt_above = (salt_noise > salt_thresh) & salt_active
+
+        # Further sparsify with random dropout to get discrete specks, not smooth areas
+        speck_mask = torch.rand(H, W, generator=generator, device=image.device) < 0.3
+        salt_above = salt_above & speck_mask
+
         if salt_above.any():
             salt_str = ((salt_noise - salt_thresh) / (1.0 - salt_thresh)).clamp(0, 1)
-            salt_opacity = salt_str * field * 0.8
+            # Low opacity — salt is a thin crusty layer, not an opaque white paint
+            salt_opacity = (salt_str * field * 0.25).clamp(max=0.2)
 
-            warm = fine_noise > 0.5
-            salt_r = torch.where(warm, torch.tensor(230/255, device=image.device),
-                                 torch.tensor(220/255, device=image.device))
-            salt_g = torch.where(warm, torch.tensor(225/255, device=image.device),
-                                 torch.tensor(222/255, device=image.device))
-            salt_b = torch.where(warm, torch.tensor(210/255, device=image.device),
-                                 torch.tensor(225/255, device=image.device))
+            # Chalky off-white (not pure white — real salt is slightly warm/cool)
+            salt_color_r = torch.full_like(field, 210/255)
+            salt_color_g = torch.full_like(field, 205/255)
+            salt_color_b = torch.full_like(field, 195/255)
 
-            out[0] = torch.where(salt_above, out[0] * (1 - salt_opacity) + salt_r * salt_opacity, out[0])
-            out[1] = torch.where(salt_above, out[1] * (1 - salt_opacity) + salt_g * salt_opacity, out[1])
-            out[2] = torch.where(salt_above, out[2] * (1 - salt_opacity) + salt_b * salt_opacity, out[2])
-
-            # Sparkles
-            sparkle_mask = (torch.rand(H, W, generator=generator, device=image.device)
-                           < 0.15 * salt_str * field) & salt_above
-            if sparkle_mask.any():
-                sparkle = 0.15 + torch.rand(H, W, generator=generator, device=image.device) * 0.25
-                out[0] = torch.where(sparkle_mask, (out[0] + 40/255 * sparkle).clamp(max=1), out[0])
-                out[1] = torch.where(sparkle_mask, (out[1] + 38/255 * sparkle).clamp(max=1), out[1])
-                out[2] = torch.where(sparkle_mask, (out[2] + 35/255 * sparkle).clamp(max=1), out[2])
+            out[0] = torch.where(salt_above, out[0] * (1 - salt_opacity) + salt_color_r * salt_opacity, out[0])
+            out[1] = torch.where(salt_above, out[1] * (1 - salt_opacity) + salt_color_g * salt_opacity, out[1])
+            out[2] = torch.where(salt_above, out[2] * (1 - salt_opacity) + salt_color_b * salt_opacity, out[2])
 
     return out.clamp(0, 1)
 
