@@ -142,7 +142,7 @@ def preset_individual_fading(H: int, W: int, generator: torch.Generator = None,
                              device: torch.device = None) -> Dict[str, torch.Tensor]:
     masks = _empty_masks(H, W, device)
     if torch.rand(1, generator=generator).item() > 0.4:
-        _fill(masks, 'fading', 0.3 + torch.rand(1, generator=generator).item() * 0.5)
+        _fill(masks, 'fading', 0.2 + torch.rand(1, generator=generator).item() * 0.3)
     count = 2 + int(torch.randint(0, 4, (1,), generator=generator).item())
     for _ in range(count):
         cx = int(torch.randint(0, W, (1,), generator=generator).item())
