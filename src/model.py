@@ -49,21 +49,21 @@ class RestorationDiT(nn.Module):
     the concatenated conditioning input [z_t, z_y, M'].
     """
 
-    def __init__(self, cfg: ModelConfig,  device: str = "cuda"):
+    def __init__(self, cfg: ModelConfig,  device: str | torch.device = "cuda"):
         """Load pretrained FLUX.2 [klein] 4B base and re-initialize img_in.
 
         Steps:
             1. load_flow_model(cfg.flux_model_name) → Flux2 with pretrained weights.
-            2. Replace self.transformer.img_in with Linear(cfg.in_channels, cfg.hidden_size).
+            2. Replace self.flow_model.img_in with Linear(cfg.in_channels, cfg.hidden_size).
             3. Xavier uniform init on new img_in.
 
         Args:
             cfg: ModelConfig (flux_model_name, in_channels=261, hidden_size=3072).
         """
         super().__init__()
-        self.flow_model = load_flow_model(cfg.flux_model_name, device=device)
-        self.flow_model.img_in = nn.Linear(cfg.in_channels, cfg.hidden_size, bias=True).to(device)
-        nn.init.xavier_normal_(self.flow_model.img_in.weight)
+        self.cfg = cfg
+        self.flow_model = load_flow_model(cfg.flux_model_name, device=str(device))
+        self._reinit_img_in(cfg.in_channels, cfg.hidden_size)
 
     def _reinit_img_in(self, in_channels: int, hidden_size: int) -> None:
         """Replace img_in with a new randomly-initialized Linear layer.
@@ -72,7 +72,12 @@ class RestorationDiT(nn.Module):
             in_channels: 261 = 128 (z_t) + 128 (z_y) + K (mask).
             hidden_size: 3072 (Klein 4B).
         """
-        ...
+        new_in = nn.Linear(in_channels, hidden_size, bias=False)
+        nn.init.xavier_uniform_(new_in.weight)
+        self.flow_model.img_in = new_in.to(
+            device=self.flow_model.img_in.weight.device,
+            dtype=self.flow_model.img_in.weight.dtype
+        )
 
     def forward(
         self,
@@ -85,10 +90,10 @@ class RestorationDiT(nn.Module):
         """Predict velocity v_θ(z_t, t | z_y, M').
 
         Steps:
-            1. Concatenate [z_t, z_y, mask] → (B, 261, H', W'), cast to bfloat16.
+            1. Concatenate [z_t, z_y, mask] → (B, 261, H', W'), cast to bfloat16
             2. batched_prc_img → img_tokens (B, H'*W', 261), img_ids (B, H'*W', 4).
             3. Expand null_emb to batch B; batched_prc_txt → txt_tokens, txt_ids.
-            4. self.transformer(x=img_tokens, x_ids=img_ids, timesteps=t,
+            4. self.flow_model(x=img_tokens, x_ids=img_ids, timesteps=t,
                                 ctx=txt_tokens, ctx_ids=txt_ids, guidance=None).
                guidance=None because Klein 4B base has use_guidance_embed=False.
             5. Rearrange output (B, H'*W', 128) → (B, 128, H', W').
@@ -103,8 +108,35 @@ class RestorationDiT(nn.Module):
         Returns:
             Predicted velocity (B, 128, H', W'), same dtype as z_t.
         """
-        ...
-
+        if z_t.shape != z_y.shape:
+            raise ValueError("z_t and z_y must match shape")
+        b, c_lat, h, w = z_t.shape
+        if mask.shape[0] != b or mask.shape[-2:] != (h, w):
+            raise ValueError(f"mask spatial shape {tuple(mask.shape)} vs z {h,w}")
+        # FLUX transformer is kept in bfloat16 on CUDA for memory bandwidth.
+        dtype = torch.bfloat16 if z_t.device.type == "cuda" else torch.float32
+        x = torch.cat([z_t, z_y, mask], dim=1).to(dtype=dtype)
+        img_tokens, img_ids = batched_prc_img(x)
+        
+        if null_emb.shape[0] == 1 and b > 1:
+            txt = null_emb.expand(b, -1, -1).to(dtype=dtype)
+        else:
+            txt = null_emb.to(dtype=dtype)
+        txt_tokens, txt_ids = batched_prc_txt(txt)
+        
+        pred = self.flow_model(
+            x=img_tokens,
+            x_ids=img_ids,
+            timesteps=t.to(dtype=dtype),
+            ctx=txt_tokens, 
+            ctx_ids=txt_ids,
+            guidance=None
+        )
+        
+        vel = rearrange(pred, 'b (h w) c -> b c h w', h=h, w=w)
+        return vel.to(dtype=z_t.dtype)
+        
+            
     def set_stage(self, stage: str) -> None:
         """Freeze or unfreeze parameters for the given training stage.
 
@@ -112,7 +144,14 @@ class RestorationDiT(nn.Module):
             stage: "warmup" → freeze all except img_in.
                    "full"   → unfreeze all parameters.
         """
-        ...
+        if stage == "warmup": 
+            for name, p in self.flow_model.named_parameters(): 
+                p.requires_grad = name.startswith("img_in")
+        elif stage == "full":
+            for p in self.flow_model.parameters(): 
+                p.requires_grad_(True)
+        else: 
+            raise ValueError(f"Unknown stage {stage!r}; expected 'warmup' or 'full'")
 
     def get_trainable_params(self) -> List[dict]:
         """Return optimizer param groups with 'params' and 'name' keys.
@@ -126,4 +165,10 @@ class RestorationDiT(nn.Module):
         Returns:
             List of two param group dicts.
         """
-        ...
+        img_ids = {id(p) for p in self.flow_model.img_in.parameters()}
+        img_in_params = list(self.flow_model.img_in.parameters())
+        backbone_params = [p for p in self.flow_model.parameters() if id(p) not in img_ids]
+        return [
+            {"params": img_in_params, "name": "img_in"},
+            {"params": backbone_params, "name": "backbone"},
+        ]
