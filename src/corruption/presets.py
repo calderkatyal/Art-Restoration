@@ -142,7 +142,7 @@ def preset_individual_fading(H: int, W: int, generator: torch.Generator = None,
                              device: torch.device = None) -> Dict[str, torch.Tensor]:
     masks = _empty_masks(H, W, device)
     if torch.rand(1, generator=generator).item() > 0.5:
-        _fill(masks, 'fading', 0.1 + torch.rand(1, generator=generator).item() * 0.2)
+        _fill(masks, 'fading', 0.2 + torch.rand(1, generator=generator).item() * 0.4)
     count = 2 + int(torch.randint(0, 4, (1,), generator=generator).item())
     for _ in range(count):
         cx = int(torch.randint(0, W, (1,), generator=generator).item())
@@ -257,7 +257,7 @@ def preset_water_damage(H: int, W: int, generator: torch.Generator = None,
 def preset_sun_faded(H: int, W: int, generator: torch.Generator = None,
                      device: torch.device = None) -> Dict[str, torch.Tensor]:
     masks = _empty_masks(H, W, device)
-    _fill(masks, 'fading', 0.15 + torch.rand(1, generator=generator).item() * 0.2)
+    _fill(masks, 'fading', 0.2 + torch.rand(1, generator=generator).item() * 0.4)
     _blobs(masks, 'fading', 2 + int(torch.randint(0, 3, (1,), generator=generator).item()),
            W * 0.15, W * 0.3, 0.3, H, W, generator)
     _fill(masks, 'bloom', 0.2 + torch.rand(1, generator=generator).item() * 0.2)
