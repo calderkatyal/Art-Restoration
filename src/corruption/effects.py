@@ -424,19 +424,19 @@ def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
 
     # Compute flake field
     m = mask  # (H, W)
-    thresh = (m * m * 0.4 + m * 0.58).clamp(max=0.995)
+    thresh = (m * m * 0.3 + m * 0.68).clamp(max=0.998)
     sample = noise_low - (noise_hi - 0.5) * 0.22 * m
     is_flake = (sample < thresh) & (m >= 0.04)
 
     depth = ((thresh - sample) / thresh.clamp(min=0.02)).clamp(0, 1)
-    flake = (depth * (0.3 + 0.7 * m)).clamp(0, 1) * is_flake.float()
+    flake = (depth * (0.5 + 0.5 * m)).clamp(0, 1) * is_flake.float()
 
     # Render: replace with substrate
     active = flake >= 0.04
     if not active.any():
         return out
 
-    a = (flake * 1.05).clamp(0, 1)
+    a = (flake * 2.0).clamp(0, 1)
     # Rim darkening
     rim = torch.where((flake > 0.1) & (flake < 0.5),
                       (1.0 - (flake - 0.3).abs() / 0.2) * 0.35, torch.zeros_like(flake))

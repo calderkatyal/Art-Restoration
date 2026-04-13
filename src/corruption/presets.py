@@ -100,7 +100,7 @@ def preset_individual_paint_loss(H: int, W: int, generator: torch.Generator = No
         cy = int(torch.randint(0, H, (1,), generator=generator).item())
         r = W * (0.01 + torch.rand(1, generator=generator).item() * 0.06)
         _paint_blob(masks['paint_loss'], cx, cy, r,
-                    0.5 + torch.rand(1, generator=generator).item() * 0.5, generator)
+                    0.3 + torch.rand(1, generator=generator).item() * 0.5, generator)
     # Correlated cracks
     for _ in range(int(count * 0.6)):
         cx = int(torch.randint(0, W, (1,), generator=generator).item())
