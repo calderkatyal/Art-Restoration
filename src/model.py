@@ -49,7 +49,7 @@ class RestorationDiT(nn.Module):
     the concatenated conditioning input [z_t, z_y, M'].
     """
 
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig,  device: str = "cuda"):
         """Load pretrained FLUX.2 [klein] 4B base and re-initialize img_in.
 
         Steps:
@@ -60,7 +60,10 @@ class RestorationDiT(nn.Module):
         Args:
             cfg: ModelConfig (flux_model_name, in_channels=261, hidden_size=3072).
         """
-        ...
+        super().__init__()
+        self.flow_model = load_flow_model(cfg.flux_model_name, device=device)
+        self.flow_model.img_in = nn.Linear(cfg.in_channels, cfg.hidden_size, bias=True).to(device)
+        nn.init.xavier_normal_(self.flow_model.img_in.weight)
 
     def _reinit_img_in(self, in_channels: int, hidden_size: int) -> None:
         """Replace img_in with a new randomly-initialized Linear layer.
