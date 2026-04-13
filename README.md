@@ -10,7 +10,7 @@ Calder Katyal, Aryan Agarwal, Sohan Bendre, Sameer Bhatti
 
 This project frames artwork restoration as a **conditional latent rectified flow** problem. A pretrained FLUX.2 [klein] 4B DiT is fine-tuned to predict a velocity field that transports a corrupted image latent to a clean one. The FLUX.2 VAE is frozen throughout. Only `img_in` is re-initialized from scratch to accept the expanded input (corrupted latent + damage mask concatenated to the noisy latent).
 
-Supported degradation types: cracks, paint loss, staining, blur, color shift.
+Supported degradation types: cracks, paint loss, yellowing, stains, fading, bloom, surface deposits.
 
 ---
 
@@ -45,29 +45,41 @@ z_t ← m_intact ⊙ z_y + (1 - m_intact) ⊙ z_t
 
 ```
 src/
-├── config.py         # OmegaConf structured configs
-├── corruption.py     # Stochastic damage pipeline C(x) -> (y, M)
-├── dataset.py        # ArtRestorationDataset + RealDamageDataset
-├── model.py          # FLUX.2 DiT wrapper with re-initialized img_in
-├── vae.py            # Frozen FLUX.2 VAE encode/decode
-├── null_emb.py       # Precompute and cache null text embedding
-├── inference.py      # ODE sampling + data consistency
-├── evaluations.py    # PSNR and stratified per-damage-type metrics
-├── train.py          # Training loop (warmup + full stage)
-└── flux2/            # Verbatim source from black-forest-labs/flux2
+├── config.py          # OmegaConf structured configs
+├── corruption/        # Stochastic damage pipeline C(x) -> (y, M)
+│   ├── configs/
+│   │   └── default.yaml  # Corruption hyperparameters (preset probs, severity)
+│   ├── effects.py     # Individual corruption effect implementations
+│   ├── presets.py     # Individual & multi-degradation preset definitions
+│   ├── module.py      # CorruptionModule: main entry point
+│   └── color.py       # Color space conversions (sRGB ↔ CIELAB)
+├── dataset.py         # ArtRestorationDataset + RealDamageDataset
+├── model.py           # FLUX.2 DiT wrapper with re-initialized img_in
+├── vae.py             # Frozen FLUX.2 VAE encode/decode
+├── null_emb.py        # Precompute and cache null text embedding
+├── inference.py       # ODE sampling + data consistency
+├── evaluations.py     # PSNR and stratified per-damage-type metrics
+├── train.py           # Training loop (warmup + full stage)
+└── flux2/             # Verbatim source from black-forest-labs/flux2
+
+tools/
+└── mask_painter.py    # Browser-based mask painting GUI for inference
+
+tests/
+└── test_corruption_visual.py  # Visual test grid for all presets
 
 train/
 ├── configs/
-│   └── train.yaml    # Training + inference hyperparameters
+│   └── train.yaml     # Training hyperparameters
 └── scripts/
-    ├── warmup.sh     # SLURM: stage 1 (img_in only)
-    └── full.sh       # SLURM: stage 2 (all layers)
+    ├── warmup.sh      # SLURM: stage 1 (img_in only)
+    └── full.sh        # SLURM: stage 2 (all layers)
 
 inference/
 ├── configs/
-│   └── inference.yaml  # Inference hyperparameters
+│   └── inference.yaml # Inference hyperparameters
 └── scripts/
-    └── run.sh          # SLURM: run inference on a test set
+    └── run.sh         # SLURM: run inference on a test set
 ```
 
 ---
@@ -104,6 +116,34 @@ Settings are split by task:
 
 - **`train/configs/train.yaml`** — model, training, degradation, and inference-during-training settings
 - **`inference/configs/inference.yaml`** — model and inference settings for standalone runs
+
+---
+
+## Inference
+
+### 1. Paint damage masks (browser GUI)
+
+The mask painter launches a local web server. Open the printed URL in your browser to paint per-damage-type masks on each test image.
+
+```bash
+# Local machine:
+python tools/mask_painter.py --config inference/configs/inference.yaml
+
+# Remote (SSH) — run on remote, then forward the port locally:
+# On remote:
+python tools/mask_painter.py --config inference/configs/inference.yaml
+# It will print instructions like:
+#   ssh -N -L <PORT>:<COMPUTE_HOST>:<PORT> <USER>@<LOGIN_NODE>
+# Run that command in a LOCAL terminal, then open http://localhost:<PORT>
+```
+
+The GUI supports 7 damage types (cracks, paint loss, yellowing, stains, fading, bloom, surface deposits) with adjustable brush size. Finalize all images, and masks are saved and registered in the inference config automatically.
+
+### 2. Run restoration
+
+```bash
+python src/inference.py --config inference/configs/inference.yaml
+```
 
 ---
 

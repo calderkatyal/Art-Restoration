@@ -167,7 +167,7 @@ def build_grid(
                                for n in MULTI_PRESETS},
             )
             label = f"[Multi] {preset_name}"
-
+            
         module = CorruptionModule(cfg)
         corrupted, mask = module(img_tensor, seed=seed + idx)
 
