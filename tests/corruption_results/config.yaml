@@ -1,66 +1,110 @@
 corruption:
-  damage_types:
-  - cracks
+  channels:
+  - craquelure
+  - rip_tear
   - paint_loss
   - yellowing
-  - stains
   - fading
   - bloom
   - deposits
   - scratches
   num_channels: 8
-  individual_prob: 0.4
-  individual_presets:
-    cracks: 1.0
-    paint_loss: 1.0
-    yellowing: 1.0
-    stains: 1.0
-    fading: 1.0
-    bloom: 1.0
-    deposits: 1.0
-    scratches: 1.0
-  multi_presets:
-    light_aging: 1.0
-    heavy_craquelure: 1.0
-    water_damage: 1.0
-    sun_faded: 1.0
-    smoke_damage: 1.0
-    neglected_storage: 1.0
-    heat_damage: 1.0
-    flood_damage: 1.0
-    museum_wear: 1.0
-    salt_efflorescence: 1.0
-  severity_scale:
-    cracks: 1.0
-    paint_loss: 1.0
-    yellowing: 1.0
-    stains: 1.0
-    fading: 1.0
-    bloom: 1.0
-    deposits: 1.0
-    scratches: 1.0
+  num_simultaneous:
+    min: 1
+    max: 3
+  types:
+    craquelure:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: true
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 3
+      local_area_frac:
+      - 0.02
+      - 0.25
+    rip_tear:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: false
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 2
+      local_area_frac:
+      - 0.003
+      - 0.06
+    paint_loss:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: false
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 2
+      local_max_num: 5
+      local_area_frac:
+      - 0.0005
+      - 0.006
+    yellowing:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: true
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 3
+      local_area_frac:
+      - 0.03
+      - 0.3
+    fading:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: true
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 3
+      local_area_frac:
+      - 0.03
+      - 0.3
+    bloom:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: true
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 3
+      local_area_frac:
+      - 0.02
+      - 0.2
+    deposits:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: true
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 1
+      local_max_num: 3
+      local_area_frac:
+      - 0.02
+      - 0.2
+    scratches:
+      weight: 1.0
+      local_enabled: true
+      global_enabled: false
+      min_severity: 0.01
+      max_severity: 1.0
+      local_min_num: 2
+      local_max_num: 5
+      local_area_frac:
+      - 0.003
+      - 0.05
 test_settings:
   resolution: 384
-  seed: 100
-  data_dir: /Users/calderkatyal/Downloads/paintings
-  num_presets_tested: 18
-  individual_presets:
-  - cracks
-  - paint_loss
-  - yellowing
-  - stains
-  - fading
-  - bloom
-  - deposits
-  - scratches
-  multi_presets:
-  - light_aging
-  - heavy_craquelure
-  - water_damage
-  - sun_faded
-  - smoke_damage
-  - neglected_storage
-  - heat_damage
-  - flood_damage
-  - museum_wear
-  - salt_efflorescence
+  seed: 111
+  source_image: /Users/calderkatyal/Downloads/paintings/mona_lisa.jpg
+  min_severity: 0.01
+  max_severity: 1.0
+  num_cells: 13
