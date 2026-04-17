@@ -7,13 +7,14 @@ Architecture reference (Klein4BParams from flux2/model.py):
 
 img_in modification:
     Original:       nn.Linear(128,  3072, bias=False)
-    Re-initialized: nn.Linear(261,  3072, bias=False)
-    where 261 = 128 (z_t) + 128 (z_y) + 5 (mask channels K)
+    Re-initialized: nn.Linear(cfg.in_channels, 3072, bias=False)
+    where cfg.in_channels = 128 (z_t) + 128 (z_y) + K (mask channels).
 
     Xavier uniform initialization. All other weights loaded from pretrained.
 
 Token layout:
-    Image tokens:   rearrange (B, 261, H', W') → (B, H'*W', 261)  via batched_prc_img
+    Image tokens:   rearrange (B, in_channels, H', W') → (B, H'*W', in_channels)
+                    via batched_prc_img
     Context tokens: null_emb  (B, 512, 7680)                       via batched_prc_txt
     Position ids:   (B, seq_len, 4)  with axes (t, h, w, l)
 
@@ -34,9 +35,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
-from typing import List
+from typing import Any, List
 
-from .config import ModelConfig
 from .flux2.model import Flux2, Klein4BParams
 from .flux2.sampling import batched_prc_img, batched_prc_txt
 from .flux2.util import load_flow_model
@@ -49,7 +49,7 @@ class RestorationDiT(nn.Module):
     the concatenated conditioning input [z_t, z_y, M'].
     """
 
-    def __init__(self, cfg: ModelConfig,  device: str | torch.device = "cuda"):
+    def __init__(self, cfg: Any, device: str | torch.device = "cuda"):
         """Load pretrained FLUX.2 [klein] 4B base and re-initialize img_in.
 
         Steps:
@@ -58,7 +58,8 @@ class RestorationDiT(nn.Module):
             3. Xavier uniform init on new img_in.
 
         Args:
-            cfg: ModelConfig (flux_model_name, in_channels=261, hidden_size=3072).
+            cfg: Model sub-config (DictConfig or namespace) providing
+                 flux_model_name, in_channels, and hidden_size.
         """
         super().__init__()
         self.cfg = cfg

@@ -11,12 +11,11 @@ They are downsampled to latent resolution inside the training loop, not here.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from torch.utils.data import Dataset
 
-from .config import CorruptionConfig
 from .corruption import CorruptionModule
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -35,14 +34,14 @@ class ArtRestorationDataset(Dataset):
         self,
         data_dir: str,
         resolution: int,
-        corruption_config: CorruptionConfig,
+        corruption_config: Any,
     ):
         """Scan data_dir recursively for images and initialize corruption module.
 
         Args:
             data_dir:           Root directory of clean artwork images.
             resolution:         Square crop target (H = W = resolution).
-            corruption_config:  Config for CorruptionModule.
+            corruption_config:  DictConfig (cfg.corruption) for CorruptionModule.
         """
         ...
 

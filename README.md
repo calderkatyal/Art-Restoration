@@ -10,7 +10,7 @@ Calder Katyal, Aryan Agarwal, Sohan Bendre, Sameer Bhatti
 
 This project frames artwork restoration as a **conditional latent rectified flow** problem. A pretrained FLUX.2 [klein] 4B DiT is fine-tuned to predict a velocity field that transports a corrupted image latent to a clean one. The FLUX.2 VAE is frozen throughout. Only `img_in` is re-initialized from scratch to accept the expanded input (corrupted latent + damage mask concatenated to the noisy latent).
 
-Supported degradation types: cracks, paint loss, yellowing, stains, fading, bloom, surface deposits.
+Supported degradation types (8 channels): craquelure, rip/tear, paint loss, yellowing, fading, bloom, surface deposits, scratches.
 
 ---
 
@@ -45,12 +45,12 @@ z_t ← m_intact ⊙ z_y + (1 - m_intact) ⊙ z_t
 
 ```
 src/
-├── config.py          # OmegaConf structured configs
+├── utils.py           # load_config helper (merges corruption YAML + CLI overrides)
 ├── corruption/        # Stochastic damage pipeline C(x) -> (y, M)
 │   ├── configs/
-│   │   └── default.yaml  # Corruption hyperparameters (preset probs, severity)
+│   │   └── default.yaml  # Per-channel corruption hyperparameters
 │   ├── effects.py     # Individual corruption effect implementations
-│   ├── presets.py     # Individual & multi-degradation preset definitions
+│   ├── presets.py     # CHANNEL_NAMES + local/global mask generators
 │   ├── module.py      # CorruptionModule: main entry point
 │   └── color.py       # Color space conversions (sRGB ↔ CIELAB)
 ├── dataset.py         # ArtRestorationDataset + RealDamageDataset
@@ -137,7 +137,7 @@ python tools/mask_painter.py --config inference/configs/inference.yaml
 # Run that command in a LOCAL terminal, then open http://localhost:<PORT>
 ```
 
-The GUI supports 7 damage types (cracks, paint loss, yellowing, stains, fading, bloom, surface deposits) with adjustable brush size. Finalize all images, and masks are saved and registered in the inference config automatically.
+The GUI supports 8 damage types (craquelure, rip/tear, paint loss, yellowing, fading, bloom, surface deposits, scratches) with adjustable brush size. Finalize all images, and masks are saved and registered in the inference config automatically.
 
 ### 2. Run restoration
 

@@ -45,14 +45,14 @@ except ImportError:
 # ---------------------------------------------------------------------------
 
 CHANNELS = [
-    ("cracks",      (255,  80,  80)),
-    ("paint_loss",  (255, 180,  60)),
-    ("yellowing",   (240, 230,  60)),
-    ("stains",      (120,  70,  40)),
-    ("fading",      (180, 180, 255)),
-    ("bloom",       ( 80, 220, 220)),
-    ("deposits",    (160, 140, 100)),
-    ("scratches",   (220, 100, 220)),
+    ("craquelure", (255,  80,  80)),
+    ("rip_tear",   (230,  50,  50)),
+    ("paint_loss", (240, 150,  40)),
+    ("yellowing",  (240, 230,  60)),
+    ("fading",     (180, 180, 255)),
+    ("bloom",      ( 80, 220, 220)),
+    ("deposits",   (160, 140, 100)),
+    ("scratches",  (220, 100, 220)),
 ]
 NUM_CHANNELS = len(CHANNELS)
 OVERLAY_ALPHA = 0.45
@@ -147,6 +147,30 @@ body {
     width: 14px; height: 14px; border-radius: 3px;
     flex-shrink: 0;
 }
+.info-icon {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 14px; height: 14px; border-radius: 50%;
+    background: rgba(255, 255, 255, 0.18);
+    color: rgba(255, 255, 255, 0.95);
+    font-size: 10px; font-weight: 700; font-family: serif; font-style: italic;
+    margin-left: auto; cursor: help; flex-shrink: 0;
+    position: relative;
+    user-select: none;
+}
+.info-icon:hover { background: rgba(255, 255, 255, 0.32); }
+.info-icon:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    left: 22px; top: 50%; transform: translateY(-50%);
+    background: rgba(20, 20, 20, 0.97);
+    border: 1px solid rgba(255, 255, 255, 0.25);
+    color: #eee;
+    padding: 6px 10px; border-radius: 4px;
+    white-space: nowrap; font-size: 12px;
+    font-style: normal; font-weight: 400; font-family: inherit;
+    z-index: 1000; pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
 
 /* Sliders */
 .slider-row {
@@ -170,6 +194,8 @@ body {
 .btn-primary { background: #2a6634; border-color: #3a8; color: #fff; font-weight: 600; }
 .btn-primary:hover { background: #35aa55; }
 .btn-primary:disabled { background: #333; border-color: #444; color: #666; cursor: not-allowed; }
+.btn:disabled { background: #2a2a2a; border-color: #3a3a3a; color: #666; cursor: not-allowed; }
+.btn:disabled:hover { background: #2a2a2a; }
 .btn-danger { background: #833; border-color: #a44; }
 .btn-danger:hover { background: #a44; }
 .btn-row { display: flex; gap: 4px; margin-bottom: 4px; }
@@ -280,15 +306,19 @@ body {
 // ---------------------------------------------------------------------------
 // Channel definitions
 // ---------------------------------------------------------------------------
+// globalEnabled mirrors src/corruption/configs/default.yaml — channels
+// without a global implementation (rip_tear, paint_loss, scratches) must
+// only be painted locally, so the "Fill entire painting" button is
+// disabled while those channels are active.
 const CHANNELS = [
-    { id: "cracks",     label: "Cracks",            color: [255, 80, 80] },
-    { id: "paint_loss", label: "Paint loss",         color: [255, 180, 60] },
-    { id: "yellowing",  label: "Yellowing",          color: [240, 230, 60] },
-    { id: "stains",     label: "Stains",             color: [120, 70, 40] },
-    { id: "fading",     label: "Fading",             color: [180, 180, 255] },
-    { id: "bloom",      label: "Bloom",              color: [80, 220, 220] },
-    { id: "deposits",   label: "Surface deposits",   color: [160, 140, 100] },
-    { id: "scratches",  label: "Scratches",          color: [220, 100, 220] },
+    { id: "craquelure", label: "Craquelure",        color: [255, 80, 80],   globalEnabled: true  },
+    { id: "rip_tear",   label: "Rip / tear",        color: [230, 50, 50],   globalEnabled: false },
+    { id: "paint_loss", label: "Paint loss",        color: [240, 150, 40],  globalEnabled: false },
+    { id: "yellowing",  label: "Yellowing",         color: [240, 230, 60],  globalEnabled: true  },
+    { id: "fading",     label: "Fading",            color: [180, 180, 255], globalEnabled: true  },
+    { id: "bloom",      label: "Bloom",             color: [80, 220, 220],  globalEnabled: true  },
+    { id: "deposits",   label: "Surface deposits",  color: [160, 140, 100], globalEnabled: true  },
+    { id: "scratches",  label: "Scratches",         color: [220, 100, 220], globalEnabled: false },
 ];
 const NUM_CHANNELS = CHANNELS.length;
 const OVERLAY_ALPHA = 0.45;
@@ -537,6 +567,8 @@ function redo() {
 // Mask operations
 // ---------------------------------------------------------------------------
 function fillActive() {
+    const ch = CHANNELS[activeChannel];
+    if (ch && ch.globalEnabled === false) return;
     pushUndo(activeChannel);
     imageMasks[currentImageId][activeChannel].fill(1);
     renderCanvas();
@@ -588,10 +620,15 @@ function buildChannelButtons() {
         const btn = document.createElement("button");
         btn.className = "channel-btn" + (idx === activeChannel ? " active" : "");
         const [r, g, b] = ch.color;
-        btn.innerHTML = `<span class="channel-swatch" style="background:rgb(${r},${g},${b})"></span>${ch.label}`;
+        let html = `<span class="channel-swatch" style="background:rgb(${r},${g},${b})"></span><span>${ch.label}</span>`;
+        if (ch.tooltip) {
+            html += `<span class="info-icon" data-tooltip="${ch.tooltip}" onclick="event.stopPropagation();">i</span>`;
+        }
+        btn.innerHTML = html;
         btn.onclick = () => selectChannel(idx);
         container.appendChild(btn);
     });
+    updateFillButton();
 }
 
 function selectChannel(idx) {
@@ -599,6 +636,20 @@ function selectChannel(idx) {
     document.querySelectorAll(".channel-btn").forEach((btn, i) => {
         btn.className = "channel-btn" + (i === activeChannel ? " active" : "");
     });
+    updateFillButton();
+}
+
+function updateFillButton() {
+    const btn = document.getElementById("btnFill");
+    if (!btn) return;
+    const ch = CHANNELS[activeChannel];
+    if (ch && ch.globalEnabled === false) {
+        btn.disabled = true;
+        btn.title = `${ch.label} has no global implementation — paint locally instead.`;
+    } else {
+        btn.disabled = false;
+        btn.title = "";
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -773,7 +824,7 @@ function setupEvents() {
         else if (e.key === "ArrowRight") { e.preventDefault(); nextImage(); }
         else if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === "z") { e.preventDefault(); redo(); }
         else if ((e.ctrlKey || e.metaKey) && e.key === "z") { e.preventDefault(); undo(); }
-        else if (e.key >= "1" && e.key <= "8") { selectChannel(parseInt(e.key) - 1); }
+        else if (e.key >= "1" && e.key <= "9") { selectChannel(parseInt(e.key) - 1); }
     });
 
     // Window resize
