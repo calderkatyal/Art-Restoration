@@ -29,3 +29,8 @@ def get_device() -> torch.device:
     return torch.device("cuda", get_local_rank())
 
 
+def is_main_process() -> bool:
+    """True for global rank 0 (single-process runs are rank 0)."""
+    return get_global_rank() == 0
+
+
