@@ -28,7 +28,7 @@ class FluxVAE(nn.Module):
     SPATIAL_COMPRESSION = 16   # 8× (encoder downsampling) × 2× (2×2 patchify)
     LATENT_CHANNELS = 128       # z_channels=32 × ps[0]*ps[1]=4
 
-    def __init__(self, flux_model_name: str = "flux.2-klein-base-4b", device: str = "cuda"):
+    def __init__(self, flux_model_name: str = "flux.2-klein-base-4b", rank: int = 0, device: str = "cuda"):
         """Load and freeze the pretrained FLUX.2 VAE.
 
         Args:
@@ -36,7 +36,7 @@ class FluxVAE(nn.Module):
             device: Device to load the model onto.
         """
         super().__init__()
-        self.ae = load_ae(flux_model_name, device=device)
+        self.ae = load_ae(flux_model_name, rank=rank, device=device)
         for p in self.ae.parameters():
             p.requires_grad_(False)
 

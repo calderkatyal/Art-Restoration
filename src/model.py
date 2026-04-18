@@ -39,7 +39,7 @@ from typing import Any, List
 
 from .flux2.model import Flux2, Klein4BParams
 from .flux2.sampling import batched_prc_img, batched_prc_txt
-from .flux2.util import load_flow_model
+from .flux2.util import init_flow_model
 
 
 class RestorationDiT(nn.Module):
@@ -49,7 +49,7 @@ class RestorationDiT(nn.Module):
     the concatenated conditioning input [z_t, z_y, M'].
     """
 
-    def __init__(self, cfg: Any, device: str | torch.device = "cuda"):
+    def __init__(self, cfg: ModelConfig, device: str | torch.device = "cuda", img_in_dtype=torch.bfloat16):
         """Load pretrained FLUX.2 [klein] 4B base and re-initialize img_in.
 
         Steps:
@@ -62,23 +62,23 @@ class RestorationDiT(nn.Module):
                  flux_model_name, in_channels, and hidden_size.
         """
         super().__init__()
+        if isinstance(device, str):
+            device = torch.device(device)
+            
         self.cfg = cfg
-        self.flow_model = load_flow_model(cfg.flux_model_name, device=str(device))
-        self._reinit_img_in(cfg.in_channels, cfg.hidden_size)
+        self.flow_model = init_flow_model(cfg.flux_model_name)
+        self._reinit_img_in(cfg.in_channels, cfg.hidden_size, device=device, dtype=img_in_dtype)
 
-    def _reinit_img_in(self, in_channels: int, hidden_size: int) -> None:
+    def _reinit_img_in(self, in_channels: int, hidden_size: int, device: str | torch.device = "cuda", dtype=torch.bfloat16) -> None:
         """Replace img_in with a new randomly-initialized Linear layer.
 
         Args:
             in_channels: 261 = 128 (z_t) + 128 (z_y) + K (mask).
             hidden_size: 3072 (Klein 4B).
         """
-        new_in = nn.Linear(in_channels, hidden_size, bias=False)
+        new_in = nn.Linear(in_channels, hidden_size, bias=False, device=device, dtype=dtype)
         nn.init.xavier_uniform_(new_in.weight)
-        self.flow_model.img_in = new_in.to(
-            device=self.flow_model.img_in.weight.device,
-            dtype=self.flow_model.img_in.weight.dtype
-        )
+        self.flow_model.img_in = new_in
 
     def forward(
         self,
