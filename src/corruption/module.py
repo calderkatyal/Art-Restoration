@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image, ImageDraw
 from scipy.spatial import ConvexHull, QhullError
+from scipy.ndimage import label as _cc_label
 from typing import Tuple, Dict, Optional, List, Any
 
 from .effects import (
@@ -48,33 +49,60 @@ def _affected_pixels(before: torch.Tensor, after: torch.Tensor,
     return diff > threshold
 
 
-def _convex_hull_mask(pixels: torch.Tensor, H: int, W: int) -> torch.Tensor:
-    """(H, W) float32 binary mask = convex hull of `pixels`.
+def _per_component_hull_mask(pixels: torch.Tensor, H: int, W: int,
+                             merge_radius: int = 4) -> torch.Tensor:
+    """(H, W) float32 binary mask = UNION of convex hulls of each connected
+    component of `pixels`.
 
-    `pixels` is a (H, W) bool tensor marking affected pixels. Returns a
-    dense 0/1 mask covering the convex hull of those points. For <3 or
-    collinear points, falls back to the raw pixels.
+    Affected pixels are first dilated by `merge_radius` so that speckle
+    within one blob merges into the same component, while spatially
+    separate blobs remain distinct. The convex hull is computed
+    independently per component and then filled. This avoids the
+    "single hull spans every blob" failure mode where a multi-instance
+    mask collapses into one giant polygon covering the whole image.
     """
     mask = torch.zeros(H, W, dtype=torch.float32, device=pixels.device)
     if not pixels.any():
         return mask
 
-    ys, xs = pixels.nonzero(as_tuple=True)
-    pts = np.stack([xs.cpu().numpy(), ys.cpu().numpy()], axis=1).astype(np.float64)
+    r = int(merge_radius)
+    dil = pixels.float().unsqueeze(0).unsqueeze(0)
+    dil = F.max_pool2d(dil, kernel_size=2 * r + 1, stride=1, padding=r) > 0
+    dil_np = dil.squeeze(0).squeeze(0).cpu().numpy()
 
-    if pts.shape[0] < 3:
-        mask[ys, xs] = 1.0
-        return mask
-    try:
-        hull = ConvexHull(pts)
-    except QhullError:
-        mask[ys, xs] = 1.0
+    labels, n = _cc_label(dil_np)
+    if n == 0:
         return mask
 
-    verts = pts[hull.vertices]
-    poly = [(float(v[0]), float(v[1])) for v in verts]
+    ys_all, xs_all = pixels.nonzero(as_tuple=True)
+    ys_np = ys_all.cpu().numpy()
+    xs_np = xs_all.cpu().numpy()
+    comp_of_pt = labels[ys_np, xs_np]
+
     img = Image.new('L', (W, H), 0)
-    ImageDraw.Draw(img).polygon(poly, outline=1, fill=1)
+    draw = ImageDraw.Draw(img)
+    for comp_id in range(1, n + 1):
+        sel = comp_of_pt == comp_id
+        if not sel.any():
+            continue
+        cxs = xs_np[sel].astype(np.float64)
+        cys = ys_np[sel].astype(np.float64)
+        pts = np.stack([cxs, cys], axis=1)
+
+        if pts.shape[0] < 3:
+            for (xv, yv) in pts:
+                draw.point((int(xv), int(yv)), fill=1)
+            continue
+        try:
+            hull = ConvexHull(pts)
+        except QhullError:
+            for (xv, yv) in pts:
+                draw.point((int(xv), int(yv)), fill=1)
+            continue
+        verts = pts[hull.vertices]
+        poly = [(float(v[0]), float(v[1])) for v in verts]
+        draw.polygon(poly, outline=1, fill=1)
+
     arr = np.asarray(img, dtype=np.float32)
     return torch.from_numpy(arr).to(pixels.device)
 
@@ -251,11 +279,19 @@ class CorruptionModule:
                 extra['max_count'] = int(self.types[name].get('local_max_num', 8))
             before = out
             out = fn(out, m, generator=gen, **extra)
-            affected[name] = affected[name] | _affected_pixels(before, out)
+            # ROI = pixels the effect ACTUALLY modified above the diff
+            # threshold. Using affected pixels (rather than the input
+            # soft-mask ROI) keeps the mask tight around the drawn
+            # damage — a thin rip gets a thin-polygon mask instead of
+            # the wider band the generator sampled for it.
+            affected[name] = _affected_pixels(before, out)
 
-        # Output mask = convex hull of each channel's actually-changed pixels.
+        # Output mask = per-component convex hull of affected pixels.
+        # Per-component (not a single global hull) so multi-blob masks
+        # stay as N separate polygons instead of one huge polygon
+        # spanning all the blobs.
         mask_tensor = torch.stack(
-            [_convex_hull_mask(affected[name], H, W) for name in CHANNEL_NAMES],
+            [_per_component_hull_mask(affected[name], H, W) for name in CHANNEL_NAMES],
             dim=0,
         )
         return out.clamp(0, 1), mask_tensor
