@@ -47,7 +47,6 @@ CHANNEL_NAMES = [
     'paint_loss',
     'yellowing',
     'fading',
-    'bloom',
     'deposits',
     'scratches',
 ]
@@ -62,7 +61,6 @@ SHAPE_KIND_BY_CHANNEL = {
     'paint_loss': 'generic',
     'yellowing':  'generic',
     'fading':     'generic',
-    'bloom':      'generic',
     'deposits':   'generic',
     'scratches':  'scratches',
 }

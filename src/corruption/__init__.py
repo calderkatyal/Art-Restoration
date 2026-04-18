@@ -10,7 +10,6 @@ Corruption channels (K=8, each a single visual appearance):
   2: paint_loss   -- blob-shaped paint loss with substrate reveal (local only)
   3: yellowing    -- varnish yellowing (CIELAB a/b shift)
   4: fading       -- photochemical desaturation / bleach
-  5: bloom        -- milky multi-radius haze from degraded varnish
   6: deposits     -- grime / soot darkening veil
   7: scratches    -- thin linear abrasion marks (local only)
 

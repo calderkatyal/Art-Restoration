@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.corruption import CHANNEL_NAMES
 from src.corruption.effects import (
     apply_craquelure, apply_rip_tear, apply_paint_loss,
-    apply_yellowing, apply_fading, apply_bloom, apply_deposits,
+    apply_yellowing, apply_fading, apply_deposits,
     apply_scratches,
 )
 from src.corruption.presets import (
@@ -49,7 +49,6 @@ EFFECT_FNS = {
     'paint_loss': apply_paint_loss,
     'yellowing':  apply_yellowing,
     'fading':     apply_fading,
-    'bloom':      apply_bloom,
     'deposits':   apply_deposits,
     'scratches':  apply_scratches,
 }
@@ -89,6 +88,51 @@ def mask_to_pil(m: torch.Tensor) -> Image.Image:
     """Render a (H, W) mask in [0, 1] as a grayscale heatmap PIL image."""
     g = m.detach().cpu().clamp(0, 1)
     return T.ToPILImage()(g.unsqueeze(0))
+
+
+def mask_boundary(mask: torch.Tensor) -> torch.Tensor:
+    """
+    Compute a 1-pixel boundary of a binary mask using 4-neighborhood logic.
+    Returns a boolean tensor of shape (H, W).
+    """
+    m = (mask.detach().cpu() > 0.5)
+
+    up = torch.zeros_like(m)
+    down = torch.zeros_like(m)
+    left = torch.zeros_like(m)
+    right = torch.zeros_like(m)
+
+    up[1:] = m[:-1]
+    down[:-1] = m[1:]
+    left[:, 1:] = m[:, :-1]
+    right[:, :-1] = m[:, 1:]
+
+    interior = m & up & down & left & right
+    boundary = m & (~interior)
+    return boundary
+
+
+def overlay_mask_boundary(
+    image: Image.Image,
+    mask: torch.Tensor,
+    color: tuple[int, int, int] = (255, 0, 0),
+    width: int = 1,
+) -> Image.Image:
+    """
+    Overlay a bold boundary of the binary mask onto the image.
+    The boundary is drawn by placing filled circles centered on boundary pixels.
+    """
+    out = image.copy()
+    boundary = mask_boundary(mask)
+
+    ys, xs = torch.nonzero(boundary, as_tuple=True)
+    draw = ImageDraw.Draw(out)
+
+    r = 0
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        draw.point((x, y), fill=color)
+
+    return out
 
 
 def try_get_font(size: int = 18):
@@ -233,55 +277,60 @@ def build_grid(
 
         type_cfg = corruption_cfg.types[corr]
 
-        if False:
-            pass
-        else:
-            local_min = float(type_cfg.get("min_severity", min_severity))
-            local_max = float(type_cfg.get("max_severity", max_severity))
-            # User-specified defaults clamped by the per-type range, to keep
-            # the corruption within its valid operating regime.
-            s_lo = max(min_severity, local_min)
-            s_hi = min(max_severity, local_max)
+        local_min = float(type_cfg.get("min_severity", min_severity))
+        local_max = float(type_cfg.get("max_severity", max_severity))
+        # User-specified defaults clamped by the per-type range, to keep
+        # the corruption within its valid operating regime.
+        s_lo = max(min_severity, local_min)
+        s_hi = min(max_severity, local_max)
 
-            # Use the SAME seed for both min and max severity so the mask is
-            # generated at the same location — lets the user directly compare
-            # how intensity alone affects the appearance.
-            gen_lo = torch.Generator(device='cpu')
-            gen_lo.manual_seed(seed + idx)
-            gen_hi = torch.Generator(device='cpu')
-            gen_hi.manual_seed(seed + idx)
+        # Use the SAME seed for both min and max severity so the mask is
+        # generated at the same location — lets the user directly compare
+        # how intensity alone affects the appearance.
+        gen_lo = torch.Generator(device='cpu')
+        gen_lo.manual_seed(seed + idx)
+        gen_hi = torch.Generator(device='cpu')
+        gen_hi.manual_seed(seed + idx)
 
-            lo_img, lo_mask = apply_single(source, corr, mode, s_lo, type_cfg, gen_lo)
-            hi_img, hi_mask = apply_single(source, corr, mode, s_hi, type_cfg, gen_hi)
+        lo_img, lo_mask = apply_single(source, corr, mode, s_lo, type_cfg, gen_lo)
+        hi_img, hi_mask = apply_single(source, corr, mode, s_hi, type_cfg, gen_hi)
 
-            color = (200, 255, 200) if mode == "local" else (200, 220, 255)
-            label = f"[{mode}] {corr}"
-            draw.text((x0 + 4, y0), label, fill=color, font=font)
-            mask_draw.text((x0 + 4, y0), label, fill=color, font=font)
+        color = (200, 255, 200) if mode == "local" else (200, 220, 255)
+        label = f"[{mode}] {corr}"
+        draw.text((x0 + 4, y0), label, fill=color, font=font)
+        mask_draw.text((x0 + 4, y0), label, fill=color, font=font)
 
-            grid.paste(tensor_to_pil(lo_img), (x0, y0 + label_h))
-            grid.paste(tensor_to_pil(hi_img), (x0 + resolution + img_gap, y0 + label_h))
-            mask_grid.paste(mask_to_pil(lo_mask), (x0, y0 + label_h))
-            mask_grid.paste(mask_to_pil(hi_mask), (x0 + resolution + img_gap, y0 + label_h))
+        lo_img_pil = tensor_to_pil(lo_img)
+        hi_img_pil = tensor_to_pil(hi_img)
 
-            draw.text(
-                (x0 + 4, y0 + label_h + resolution - 16),
-                f"severity={s_lo:.2f}", fill=(200, 200, 200), font=small_font,
-            )
-            draw.text(
-                (x0 + resolution + img_gap + 4, y0 + label_h + resolution - 16),
-                f"severity={s_hi:.2f}", fill=(200, 200, 200), font=small_font,
-            )
-            mask_draw.text(
-                (x0 + 4, y0 + label_h + resolution - 16),
-                f"severity={s_lo:.2f}", fill=(200, 200, 200), font=small_font,
-            )
-            mask_draw.text(
-                (x0 + resolution + img_gap + 4, y0 + label_h + resolution - 16),
-                f"severity={s_hi:.2f}", fill=(200, 200, 200), font=small_font,
-            )
+        # NEW: overlay bold red mask boundaries onto the corrupted images
+        lo_img_pil = overlay_mask_boundary(lo_img_pil, lo_mask, color=(255, 0, 0), width=5)
+        hi_img_pil = overlay_mask_boundary(hi_img_pil, hi_mask, color=(255, 0, 0), width=5)
 
-            print(f"  {idx+1:2d}/{n_cells}  [{mode}] {corr:<20s} {s_lo:.2f} -> {s_hi:.2f}")
+        grid.paste(lo_img_pil, (x0, y0 + label_h))
+        grid.paste(hi_img_pil, (x0 + resolution + img_gap, y0 + label_h))
+
+        mask_grid.paste(mask_to_pil(lo_mask), (x0, y0 + label_h))
+        mask_grid.paste(mask_to_pil(hi_mask), (x0 + resolution + img_gap, y0 + label_h))
+
+        draw.text(
+            (x0 + 4, y0 + label_h + resolution - 16),
+            f"severity={s_lo:.2f}", fill=(200, 200, 200), font=small_font,
+        )
+        draw.text(
+            (x0 + resolution + img_gap + 4, y0 + label_h + resolution - 16),
+            f"severity={s_hi:.2f}", fill=(200, 200, 200), font=small_font,
+        )
+        mask_draw.text(
+            (x0 + 4, y0 + label_h + resolution - 16),
+            f"severity={s_lo:.2f}", fill=(200, 200, 200), font=small_font,
+        )
+        mask_draw.text(
+            (x0 + resolution + img_gap + 4, y0 + label_h + resolution - 16),
+            f"severity={s_hi:.2f}", fill=(200, 200, 200), font=small_font,
+        )
+
+        print(f"  {idx+1:2d}/{n_cells}  [{mode}] {corr:<20s} {s_lo:.2f} -> {s_hi:.2f}")
 
     grid_path = os.path.join(output_dir, "corruption_grid.png")
     grid.save(grid_path, quality=95)

@@ -13,7 +13,6 @@ Channels:
     paint_loss  — blob-shaped paint flaking with substrate reveal.
     yellowing   — varnish yellowing (CIELAB a/b offset).
     fading      — photochemical desaturation / bleach.
-    bloom       — milky multi-radius haze.
     deposits    — grime / soot darkening veil.
     scratches   — thin linear abrasion marks. Local only.
 """
@@ -791,10 +790,6 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
 
     fade_noise = make_noise(H, W, 20.0, generator=generator, device=image.device, normalize=False)
     m = mask.clamp(max=1.0)
-    # Fading target is NEUTRAL mid-gray (not warm off-white). This is
-    # the key distinction between fading (photochemical dye loss —
-    # everything drifts to neutral) and bloom (optical haze — warm/cool
-    # milky overlay). Neutral gray keeps fading visually distinct.
     bleach_r, bleach_g, bleach_b = 180/255, 180/255, 180/255
 
     n = 0.6 + 0.4 * fade_noise
@@ -820,86 +815,6 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
     out[2] = torch.where(active, out_b, out[2])
 
     return out.clamp(0, 1)
-
-
-def apply_bloom(image: torch.Tensor, mask: torch.Tensor,
-                generator: torch.Generator = None) -> torch.Tensor:
-    """Bloom / haze: out-of-focus milky blue-white veil over blurred image.
-
-    Signature distinguishing bloom from fading:
-      * Fading is CHROMATIC — colors drift toward neutral gray; blurriness
-        unchanged.
-      * Bloom is OPTICAL — image is BLURRED (hazy) and a strong COOL
-        blue-white milk is painted over it; colors remain saturated
-        underneath but read through a diffuse glow.
-
-    The previous implementation used a strong screen-blend brighten +
-    soft desaturation which, on mid-toned paintings, produced a washed-
-    out pastel result nearly identical to fading. We now:
-      1. Blur the image hard (diffuse, dreamy) — the dominant signature.
-      2. BOOST saturation slightly in the blurred layer so the hue
-         survives through the haze (unlike fading, which kills hue).
-      3. Paint a milky cool blue-white veil over the top with an alpha
-         that scales strongly with severity.
-      4. Add a mild screen-glow from bright areas only (captures the
-         true bloom phenomenon where highlights leak into neighbors)
-         but at much lower intensity than before so it doesn't
-         wash out mid-tones.
-    """
-    C, H, W = image.shape
-    out = image.clone()
-
-    if mask.max() < 0.02:
-        return out
-
-    m = mask.unsqueeze(0)
-
-    # (1) Hard blur of the image itself — the defining signature of
-    # haze / bloom. Stronger than the previous 6px softening.
-    softened = gaussian_blur_2d(out, 9.0)
-
-    # (2) Saturation boost on the blurred layer: the haze desaturates
-    # perceptually on its own (via the milky overlay in step 3), so
-    # pre-boosting chroma here keeps hue readable through the veil.
-    # This is the visual anti-fading: colors remain present but
-    # veiled, rather than fading's desaturate-to-gray.
-    s_lum = softened[0] * 0.299 + softened[1] * 0.587 + softened[2] * 0.114
-    sat_boost = 1.25
-    sat_r = s_lum + (softened[0] - s_lum) * sat_boost
-    sat_g = s_lum + (softened[1] - s_lum) * sat_boost
-    sat_b = s_lum + (softened[2] - s_lum) * sat_boost
-    softened = torch.stack([sat_r, sat_g, sat_b], dim=0).clamp(0, 1)
-
-    # (3) Highlight-driven glow — only bright pixels leak into neighbors.
-    # This captures the real optical cause of bloom (veiling glare from
-    # scratched varnish / dust scattering highlights). Gated by
-    # luminance squared so mid-tones don't contribute.
-    lum = (out[0] * 0.299 + out[1] * 0.587 + out[2] * 0.114)
-    hi_gate = (lum * lum).unsqueeze(0)
-    hi_img = out * hi_gate
-    glow = (gaussian_blur_2d(hi_img, 12.0) * 0.4
-            + gaussian_blur_2d(hi_img, 28.0) * 0.6)
-    # Screen blend at modest strength (was 0.95 → washed mid-tones).
-    glow_str = m * 0.35 * (1.0 + 0.3 * m)
-    screen = 1.0 - (1.0 - softened) * (1.0 - glow * glow_str)
-
-    # Mix blurred (with glow) and a smaller amount of original content so
-    # the local structure is clearly BLURRED but not completely lost.
-    # `softened_mix` weights the hazy layer; at m=1 it's 0.85 blurred
-    # vs 0.15 sharp — strong out-of-focus signature.
-    softened_mix = (m * 0.60 + m * m * 0.25).clamp(max=0.85)
-    result = screen * softened_mix + out * (1.0 - softened_mix)
-
-    # (4) Milky COOL blue-white haze overlay (strong, chromatic, NOT
-    # neutral — this is the key visual that tells bloom from fading).
-    # Strength raised substantially from 0.28 base → 0.42, and the
-    # color is slightly more blue-shifted.
-    haze = torch.tensor([218/255, 235/255, 250/255], device=image.device).view(3, 1, 1)
-    haze_mix = (m * 0.42 + m * m * 0.15).clamp(max=0.75)
-    result = result * (1.0 - haze_mix) + haze * haze_mix
-
-    active = mask.unsqueeze(0) >= 0.02
-    return torch.where(active, result, out).clamp(0, 1)
 
 
 def apply_deposits(image: torch.Tensor, mask: torch.Tensor,

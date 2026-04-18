@@ -9,8 +9,8 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   latent_channels: 128         # VAE z_channels=32 * patchify 2x2
   spatial_compression: 16      # 8x encoder downsample * 2x patchify
-  mask_channels: 8             # K damage channels
-  in_channels: 264             # 128 (z_t) + 128 (z_y) + 8 (mask)
+  mask_channels: 7             # K damage channels
+  in_channels: 263             # 128 (z_t) + 128 (z_y) + 7 (mask)
   hidden_size: 3072
   context_in_dim: 7680         # 3 Qwen3-4B layers * 2560
   text_encoder_variant: "4B"

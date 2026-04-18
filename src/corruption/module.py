@@ -28,7 +28,6 @@ from .effects import (
     apply_paint_loss,
     apply_yellowing,
     apply_fading,
-    apply_bloom,
     apply_deposits,
     apply_scratches,
 )
@@ -113,7 +112,6 @@ def _per_component_hull_mask(pixels: torch.Tensor, H: int, W: int,
 PIPELINE_ORDER = [
     'yellowing',
     'fading',
-    'bloom',
     'deposits',
     'scratches',
     'craquelure',
@@ -128,7 +126,6 @@ EFFECT_FNS = {
     'paint_loss':  apply_paint_loss,
     'yellowing':   apply_yellowing,
     'fading':      apply_fading,
-    'bloom':       apply_bloom,
     'deposits':    apply_deposits,
     'scratches':   apply_scratches,
 }

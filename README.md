@@ -10,7 +10,7 @@ Calder Katyal, Aryan Agarwal, Sohan Bendre, Sameer Bhatti
 
 This project frames artwork restoration as a **conditional latent rectified flow** problem. A pretrained FLUX.2 [klein] 4B DiT is fine-tuned to predict a velocity field that transports a corrupted image latent to a clean one. The FLUX.2 VAE is frozen throughout. Only `img_in` is re-initialized from scratch to accept the expanded input (corrupted latent + damage mask concatenated to the noisy latent).
 
-Supported degradation types (8 channels): craquelure, rip/tear, paint loss, yellowing, fading, bloom, surface deposits, scratches.
+Supported degradation types (8 channels): craquelure, rip/tear, paint loss, yellowing, fading, surface deposits, scratches.
 
 ---
 
@@ -137,7 +137,7 @@ python tools/mask_painter.py --config inference/configs/inference.yaml
 # Run that command in a LOCAL terminal, then open http://localhost:<PORT>
 ```
 
-The GUI supports 8 damage types (craquelure, rip/tear, paint loss, yellowing, fading, bloom, surface deposits, scratches) with adjustable brush size. Finalize all images, and masks are saved and registered in the inference config automatically.
+The GUI supports 7 damage types (craquelure, rip/tear, paint loss, yellowing, fading, surface deposits, scratches) with adjustable brush size. Finalize all images, and masks are saved and registered in the inference config automatically.
 
 ### 2. Run restoration
 
