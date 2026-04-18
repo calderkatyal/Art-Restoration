@@ -288,6 +288,62 @@ def main(cfg: DictConfig):
     local_rank = get_local_rank()
     
     ds_config = OmegaConf.to_container(cfg.ds_config, resolve=True)
+    
+    print(f"Running dist training with world_size: {world_size}, this is rank {global_rank}")
+    
+    vae_model = FluxVAE(
+        flux_model_name=cfg.model.flux_model_name,
+        rank=global_rank,
+        device=device,   
+    ) # fp32, may want to make bf16
+
+    flow_model = RestorationDiT(
+        cfg=cfg.model,
+        device=device, 
+        img_in_dtype=torch.bfloat16
+    ) # meta device
+
+    train_mode = "from_scratch"
+    
+    if cfg.train.resume_from: 
+        pass
+    elif ():
+        pass
+    else: 
+        pass
+        
+    
+    load_pretrained_flow_weights(
+        model=flow_model.flow_model,
+        model_name=cfg.model.flux_model_name,
+        rank=global_rank,
+        device=device,
+    )
+
+    
+    
+    
+    # 
+    
+    
+    # not necessary but for consistency
+    flow_model = flow_model.to(device=device, dtype=torch.bfloat16)
+
+
+    flow_model, optimizer, train_dataloader, lr_scheduler = deepspeed.initialize(
+        model=flow_model,
+        model_parameters=[p for p in flow_model.parameters() if p.requires_grad],
+        config=ds_config,
+        training_data=None,   # replace with dataset if you want DS to build the loader
+    )
+
+    flow_model.train()
+
+    vae_model = vae_model.to(device).requires_grad_(False).eval() # we may also want to make this bf16
+
+    
+    
+    
 
 
 if __name__ == "__main__":

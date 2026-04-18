@@ -2,6 +2,7 @@ import base64
 import io
 import os
 import sys
+import copy
 
 import huggingface_hub
 import torch
@@ -88,42 +89,53 @@ FLUX2_MODEL_INFO = {
 }
 
 
-def load_flow_model(model_name: str, debug_mode: bool = False, device: str | torch.device = "cuda") -> Flux2:
+def init_flow_model(model_name: str, debug_mode: bool = False) -> Flux2:
     config = FLUX2_MODEL_INFO[model_name.lower()]
+    params = copy.deepcopy(config["params"])
 
     if debug_mode:
-        config["params"].depth = 1
-        config["params"].depth_single_blocks = 1
-    else:
-        if config["model_path"] in os.environ:
-            weight_path = os.environ[config["model_path"]]
-            assert os.path.exists(weight_path), f"Provided weight path {weight_path} does not exist"
-        else:
-            # download from huggingface
-            try:
-                weight_path = huggingface_hub.hf_hub_download(
-                    repo_id=config["repo_id"],
-                    filename=config["filename"],
-                    repo_type="model",
-                )
-            except huggingface_hub.errors.RepositoryNotFoundError:
-                print(
-                    f"Failed to access the model repository. Please check your internet "
-                    f"connection and make sure you've access to {config['repo_id']}."
-                    "Stopping."
-                )
-                sys.exit(1)
+        params.depth = 1
+        params.depth_single_blocks = 1
 
-    if not debug_mode:
-        with torch.device("meta"):
-            model = Flux2(FLUX2_MODEL_INFO[model_name.lower()]["params"]).to(torch.bfloat16)
-        print(f"Loading {weight_path} for the FLUX.2 weights")
-        sd = load_sft(weight_path, device=str(device))
-        model.load_state_dict(sd, strict=True, assign=True)
-        return model.to(device)
+    with torch.device("meta"):
+        model = Flux2(params).to(torch.bfloat16)
+    return model
+        
+        
+def load_pretrained_flow_weights(
+    model: Flux2,
+    model_name: str,
+    rank: int = 0,
+    device: str | torch.device = "cuda",
+) -> Flux2:
+    config = FLUX2_MODEL_INFO[model_name.lower()]
+    
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    if config["model_path"] in os.environ:
+        weight_path = os.environ[config["model_path"]]
+        assert os.path.exists(weight_path), f"Provided weight path {weight_path} does not exist"
     else:
-        with torch.device(device):
-            return Flux2(FLUX2_MODEL_INFO[model_name.lower()]["params"]).to(torch.bfloat16)
+        try:
+            weight_path = huggingface_hub.hf_hub_download(
+                repo_id=config["repo_id"],
+                filename=config["filename"],
+                repo_type="model",
+            )
+        except huggingface_hub.errors.RepositoryNotFoundError:
+            print(
+                f"Failed to access the model repository. Please check your internet "
+                f"connection and make sure you've access to {config['repo_id']}."
+                "Stopping."
+            )
+            sys.exit(1)
+
+    print(f"[rank {rank}] Loading {weight_path} for FLUX.2 weights")
+
+    sd = load_sft(weight_path, device=str(device))
+    model.load_state_dict(sd, strict=True, assign=True)
+    return model
 
 
 def load_text_encoder(model_name: str, device: str | torch.device = "cuda"):
@@ -131,7 +143,7 @@ def load_text_encoder(model_name: str, device: str | torch.device = "cuda"):
     return config["text_encoder_load_fn"](device=device)
 
 
-def load_ae(model_name: str, device: str | torch.device = "cuda") -> AutoEncoder:
+def load_ae(model_name: str, rank: int = 0, device: str | torch.device = "cuda") -> AutoEncoder:
     config = FLUX2_MODEL_INFO[model_name.lower()]
 
     if "AE_MODEL_PATH" in os.environ:
@@ -159,7 +171,7 @@ def load_ae(model_name: str, device: str | torch.device = "cuda") -> AutoEncoder
     with torch.device("meta"):
         ae = AutoEncoder(AutoEncoderParams())
 
-    print(f"Loading {weight_path} for the AutoEncoder weights")
+    print(f"[rank {rank}] Loading {weight_path} for the AutoEncoder weights")
     sd = load_sft(weight_path, device=str(device))
     ae.load_state_dict(sd, strict=True, assign=True)
 
