@@ -585,15 +585,18 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
     sev_scale = float(mask.max().item())
     sev_norm = max(0.0, min(1.0, (sev_scale - 0.3) / 0.7))
 
-    # Width scales with severity. Floor at 2.5px so the lowest-severity
-    # tear is still physically visible (a 1-pixel slit is invisible in
-    # practice). sev_norm=0 -> max_w=2.5, sev_norm=1 -> max_w=18.
-    max_w = 2.5 + sev_norm * 15.5
+    # Width scales with severity. Floor raised to 3.5px so a low-severity
+    # tear renders as a clearly visible thin slit (the previous 2.5 was
+    # on the edge of disappearing into anti-aliasing at typical preview
+    # sizes). sev_norm=0 -> max_w=3.5, sev_norm=1 -> max_w=18.
+    max_w = 3.5 + sev_norm * 14.5
 
     # Walker length is driven by the mask bbox — we walk enough to traverse
     # the full mask and rely on the mask-clip in `_walk_tear_spine` (which
     # bails after wandering 6+ steps outside mask) to stop naturally.
-    steps_per_dir = max(15, int(bbox_diag * 0.60))
+    # Floor raised from 15 to 25 so a low-sev tear is reliably elongated
+    # (thin but visible) rather than appearing as a tiny dot.
+    steps_per_dir = max(25, int(bbox_diag * 0.60))
 
     # Find every connected component of the mask and guarantee at least
     # one tear per component so a 2-region mask never renders with only
@@ -601,6 +604,11 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
     components = _mask_component_centers(mask, min_val=0.02)
     extra = int(torch.randint(0, 2, (1,), generator=generator).item())
     num_tears = max(len(components), 1) + extra
+
+    # Reserve one index for a forced-line tear so at least one tear is
+    # always an elongated slit — otherwise the RNG could pick puncture
+    # for every tear at low sev and leave the effect nearly invisible.
+    forced_line_idx = int(torch.randint(0, num_tears, (1,), generator=generator).item())
 
     for t_idx in range(num_tears):
         if t_idx < len(components):
@@ -620,18 +628,25 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
             sx, sy = float(start[0]), float(start[1])
 
         # Pick shape mode for this tear.
-        shape_rand = torch.rand(1, generator=generator).item()
-        if shape_rand < 0.10:
-            shape_mode = 'puncture'
-        elif shape_rand < 0.30:
-            shape_mode = 'branched'
-        else:
+        if t_idx == forced_line_idx:
             shape_mode = 'line'
+        else:
+            shape_rand = torch.rand(1, generator=generator).item()
+            # Puncture probability scales from 0 at the lowest severity
+            # (a 3-4px hole is too small to read as a puncture) up to
+            # 10% at the highest severity.
+            punct_p = 0.10 * sev_norm
+            if shape_rand < punct_p:
+                shape_mode = 'puncture'
+            elif shape_rand < punct_p + 0.20:
+                shape_mode = 'branched'
+            else:
+                shape_mode = 'line'
 
         if shape_mode == 'puncture':
             # Irregular hole only. Slightly larger than half max_w so it
             # reads as a distinct hole rather than a tiny dot.
-            radius = max(1.5, max_w * 0.9)
+            radius = max(2.5, max_w * 0.9)
             _paint_tear_puncture(
                 out, mask, sx, sy, radius, generator,
             )
@@ -809,40 +824,78 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
 
 def apply_bloom(image: torch.Tensor, mask: torch.Tensor,
                 generator: torch.Generator = None) -> torch.Tensor:
-    """Bloom / haze: multi-radius glow + screen blend + milky warm haze overlay."""
+    """Bloom / haze: out-of-focus milky blue-white veil over blurred image.
+
+    Signature distinguishing bloom from fading:
+      * Fading is CHROMATIC — colors drift toward neutral gray; blurriness
+        unchanged.
+      * Bloom is OPTICAL — image is BLURRED (hazy) and a strong COOL
+        blue-white milk is painted over it; colors remain saturated
+        underneath but read through a diffuse glow.
+
+    The previous implementation used a strong screen-blend brighten +
+    soft desaturation which, on mid-toned paintings, produced a washed-
+    out pastel result nearly identical to fading. We now:
+      1. Blur the image hard (diffuse, dreamy) — the dominant signature.
+      2. BOOST saturation slightly in the blurred layer so the hue
+         survives through the haze (unlike fading, which kills hue).
+      3. Paint a milky cool blue-white veil over the top with an alpha
+         that scales strongly with severity.
+      4. Add a mild screen-glow from bright areas only (captures the
+         true bloom phenomenon where highlights leak into neighbors)
+         but at much lower intensity than before so it doesn't
+         wash out mid-tones.
+    """
     C, H, W = image.shape
     out = image.clone()
 
     if mask.max() < 0.02:
         return out
 
-    lum = (out[0] * 0.299 + out[1] * 0.587 + out[2] * 0.114)
-    contrib = lum
-    hi_img = out * contrib.unsqueeze(0)
-
-    glow1 = gaussian_blur_2d(hi_img, 8.0)
-    glow2 = gaussian_blur_2d(hi_img, 20.0)
-    glow3 = gaussian_blur_2d(hi_img, 40.0)
-    bloom = glow1 * 0.3 + glow2 * 0.4 + glow3 * 0.3
-
-    softened = gaussian_blur_2d(out, 6.0)
-
     m = mask.unsqueeze(0)
-    # Screen-blend bloom. Linear floor preserves visibility at low
-    # severity; quadratic boost adds ~25% extra punch at the high end
-    # (m=1.0 → 0.95 * 1.25 = 1.19) without affecting low-severity look.
-    bloom_str = m * 0.95 * (1.0 + 0.25 * m)
-    screen = 1.0 - (1.0 - out) * (1.0 - bloom * bloom_str)
 
-    soft_mix = m * 0.55 + m * m * 0.10
-    result = screen * (1.0 - soft_mix) + softened * soft_mix
+    # (1) Hard blur of the image itself — the defining signature of
+    # haze / bloom. Stronger than the previous 6px softening.
+    softened = gaussian_blur_2d(out, 9.0)
 
-    # Milky COOL haze — real varnish bloom / moisture damage shows a
-    # blue-white milky cast, not a warm one (yellowing is separate).
-    # This also visually distinguishes bloom from fading (which drifts
-    # to neutral gray) and deposits (warm brown/soot).
-    haze = torch.tensor([220/255, 232/255, 245/255], device=image.device).view(3, 1, 1)
-    haze_mix = m * 0.28 + m * m * 0.14
+    # (2) Saturation boost on the blurred layer: the haze desaturates
+    # perceptually on its own (via the milky overlay in step 3), so
+    # pre-boosting chroma here keeps hue readable through the veil.
+    # This is the visual anti-fading: colors remain present but
+    # veiled, rather than fading's desaturate-to-gray.
+    s_lum = softened[0] * 0.299 + softened[1] * 0.587 + softened[2] * 0.114
+    sat_boost = 1.25
+    sat_r = s_lum + (softened[0] - s_lum) * sat_boost
+    sat_g = s_lum + (softened[1] - s_lum) * sat_boost
+    sat_b = s_lum + (softened[2] - s_lum) * sat_boost
+    softened = torch.stack([sat_r, sat_g, sat_b], dim=0).clamp(0, 1)
+
+    # (3) Highlight-driven glow — only bright pixels leak into neighbors.
+    # This captures the real optical cause of bloom (veiling glare from
+    # scratched varnish / dust scattering highlights). Gated by
+    # luminance squared so mid-tones don't contribute.
+    lum = (out[0] * 0.299 + out[1] * 0.587 + out[2] * 0.114)
+    hi_gate = (lum * lum).unsqueeze(0)
+    hi_img = out * hi_gate
+    glow = (gaussian_blur_2d(hi_img, 12.0) * 0.4
+            + gaussian_blur_2d(hi_img, 28.0) * 0.6)
+    # Screen blend at modest strength (was 0.95 → washed mid-tones).
+    glow_str = m * 0.35 * (1.0 + 0.3 * m)
+    screen = 1.0 - (1.0 - softened) * (1.0 - glow * glow_str)
+
+    # Mix blurred (with glow) and a smaller amount of original content so
+    # the local structure is clearly BLURRED but not completely lost.
+    # `softened_mix` weights the hazy layer; at m=1 it's 0.85 blurred
+    # vs 0.15 sharp — strong out-of-focus signature.
+    softened_mix = (m * 0.60 + m * m * 0.25).clamp(max=0.85)
+    result = screen * softened_mix + out * (1.0 - softened_mix)
+
+    # (4) Milky COOL blue-white haze overlay (strong, chromatic, NOT
+    # neutral — this is the key visual that tells bloom from fading).
+    # Strength raised substantially from 0.28 base → 0.42, and the
+    # color is slightly more blue-shifted.
+    haze = torch.tensor([218/255, 235/255, 250/255], device=image.device).view(3, 1, 1)
+    haze_mix = (m * 0.42 + m * m * 0.15).clamp(max=0.75)
     result = result * (1.0 - haze_mix) + haze * haze_mix
 
     active = mask.unsqueeze(0) >= 0.02
@@ -911,7 +964,19 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
     if mask_sum < 1:
         return out
 
-    active_mask = mask >= 0.05
+    # Severity-relative active threshold. Soft mask peak ranges from
+    # ≈0.30 (sev=0.01) to 1.0 (sev=1.0); a fixed 0.05 cut-off leaves
+    # only ~16% of a low-sev band above threshold, so most of the
+    # scratch band falls outside "active" and the walker paints almost
+    # nothing. Scaling the threshold to 15% of the mask peak keeps the
+    # active region ≈ constant fraction of the band across severities.
+    mask_max = float(mask.max().item())
+    if mask_max < 0.02:
+        return out
+    active_thr = max(0.02, mask_max * 0.15)
+    seed_thr = max(0.02, mask_max * 0.50)  # sample start near band ridge
+
+    active_mask = mask >= active_thr
     if not active_mask.any():
         return out
     ys_active, xs_active = active_mask.nonzero(as_tuple=True)
@@ -924,24 +989,28 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
     budget_local = max(20, int(bbox_diag * 1.2))
     scratch_len_base = min(budget_full, budget_local)
 
-    # Scratch count tracks how much of the image is masked, so high
-    # local_max_num (many scattered blobs) yields many scratches.
-    # When `max_count` is supplied (the channel's local_max_num) it acts
-    # as a HARD upper bound — number of scratches <= max_count exactly.
+    # At least one scratch per mask component so every mask blob gets a
+    # visible scratch. Previous active-area-based count could round to
+    # zero for thin low-sev bands and leave a blob empty.
+    components = _mask_component_centers(mask, min_val=active_thr)
     active_frac = float(active_mask.sum().item()) / float(H * W)
-    num_scratches = max(1, int(round(active_frac * 170)))
+    num_scratches = max(len(components), int(round(active_frac * 170)))
+    # Small variability so not every render has identical count.
+    num_scratches += int(torch.randint(0, 2, (1,), generator=generator).item())
     if max_count is not None:
         num_scratches = min(num_scratches, max(1, int(max_count)))
+    num_scratches = max(1, num_scratches)
+
     # Align base scratch direction with the mask's principal axis so
     # scratches run ALONG the band. Individual scratches still get
-    # ±45° of jitter via the `+ (rand-0.5)*pi*0.5` term below, so
+    # ±15° of jitter via the `+ (rand-0.5)*pi*0.16` term below, so
     # parallel-looking bands still have visual variety.
-    base_angle = _mask_principal_angle(mask)
+    base_angle = _mask_principal_angle(mask, min_val=active_thr)
     cr, cg, cb = _sample_canvas_color(image)
 
     # Luminance-aware boost: on dark content, a subtle scratch alpha is
     # invisible, so increase it when the region is dark overall.
-    lum_boost = _local_lum_boost(image, mask, min_val=0.05, max_boost=1.7)
+    lum_boost = _local_lum_boost(image, mask, min_val=active_thr, max_boost=1.7)
 
     for _ in range(num_scratches):
         start = _sample_point_in_mask(mask, generator, min_val=0.05)
@@ -949,32 +1018,52 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             continue
         sx, sy = start
 
-        # Narrow the per-scratch angle spread to ±18° so individual
-        # scratches stay ALONG the (possibly thin) mask band — with
-        # ±45° they'd exit a 6px-wide band within a few steps and
-        # leave the effect almost invisible.
-        angle = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.20
-        scratch_len = max(10, int(scratch_len_base * (0.6 + torch.rand(1, generator=generator).item() * 0.8)))
-        width = 1 + int(torch.rand(1, generator=generator).item() * 1.5)
+        # Narrow the per-scratch angle spread to ±15° so individual
+        # scratches stay ALONG the (possibly thin) mask band and look
+        # like a coherent scratch cluster rather than a scribble.
+        angle = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.16
+        scratch_len = max(12, int(scratch_len_base * (0.6 + torch.rand(1, generator=generator).item() * 0.8)))
+        # Widths 1-2 px. Real scratches in varnish are hairlines; wide
+        # gouges would read as paint loss, not scratches.
+        width = 1 if torch.rand(1, generator=generator).item() < 0.7 else 2
         half_w = width // 2
-        # Scratch opacity sampled in 0.25-0.55. Floor raised so the lowest
-        # severity stays visibly present across seeds (was producing
-        # invisible hairlines at the unlucky tail). With the
-        # severity-heavy blend below, m=0.3 (sev≈0.01) gives effective
-        # alpha ≈ 0.07-0.18 — faint but visible — while m=1.0 reaches
-        # 0.25-0.55.
-        scratch_str = 0.25 + torch.rand(1, generator=generator).item() * 0.30
+        # Scratch opacity sampled in 0.35-0.70. Range widened and floor
+        # raised so even the unluckiest low-sev draw is clearly visible
+        # (previous 0.25-0.55 produced hairlines lost in JPEG noise on
+        # low-contrast backgrounds).
+        scratch_str = 0.35 + torch.rand(1, generator=generator).item() * 0.35
+
+        # Small chance of a brighter (burnished) scratch — light reflects
+        # off a fresh abrasion. This is stylistically distinct from the
+        # dark substrate-reveal scratch and adds realism variety.
+        use_bright = torch.rand(1, generator=generator).item() < 0.18
+        if use_bright:
+            scratch_r, scratch_g, scratch_b = 0.94, 0.92, 0.86
+        else:
+            scratch_r, scratch_g, scratch_b = cr, cg, cb
+
+        # Random micro-breaks: real scratches often read as discontinuous
+        # due to the drag of the scratching object skipping across uneven
+        # paint. 0-2 break ranges (each 2-4 steps long) per scratch.
+        n_breaks = int(torch.randint(0, 3, (1,), generator=generator).item())
+        breaks = []
+        for _b in range(n_breaks):
+            bs = int(torch.rand(1, generator=generator).item() * max(1, scratch_len - 5))
+            be = bs + 2 + int(torch.rand(1, generator=generator).item() * 3)
+            breaks.append((bs, be))
 
         px, py = float(sx), float(sy)
         step_size = 1.5
         # Per-step curvature capped so total angular drift over the whole
-        # scratch stays well below half a circle, eliminating the
-        # accidental near-perfect rings that appeared when many long
-        # scratches were drawn at once.
-        max_step_curve = 0.45 / max(40.0, float(scratch_len))
+        # scratch stays well below half a circle — previously this
+        # produced near-perfect rings. Halved from 0.45 so scratches
+        # read as nearly-straight slashes (real scratches are not
+        # curly); combined with the ±15° angle jitter this still gives
+        # enough variety between scratches.
+        max_step_curve = 0.20 / max(40.0, float(scratch_len))
         curvature = (torch.rand(1, generator=generator).item() - 0.5) * max_step_curve
 
-        for _ in range(scratch_len):
+        for step_i in range(scratch_len):
             angle += curvature
             px += math.cos(angle) * step_size
             py += math.sin(angle) * step_size
@@ -986,6 +1075,21 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             if mask[iy, ix].item() < 0.05:
                 continue
 
+            # Skip painting if we're inside a micro-break.
+            in_break = False
+            for (bs, be) in breaks:
+                if bs <= step_i < be:
+                    in_break = True
+                    break
+            if in_break:
+                continue
+
+            # Parabolic taper: alpha peaks mid-scratch, fades at the
+            # ends. Real scratches start and end softly where the tool
+            # lifts off the surface.
+            t = step_i / max(1, scratch_len - 1)
+            length_taper = max(0.25, 1.0 - (2.0 * t - 1.0) ** 2)
+
             for dy in range(-half_w, half_w + 1):
                 for dx in range(-half_w, half_w + 1):
                     nx, ny = ix + dx, iy + dy
@@ -993,23 +1097,15 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                         local_m = mask[ny, nx].item()
                         if local_m < 0.05:
                             continue
-                        # Strongly severity-skewed blend (super-linear in
-                        # local_m) so sev=0.01 reads as barely-there
-                        # hairlines while sev=1.0 reads as solid abrasions.
-                        # At m≈0.20 (sev≈0.01 falloff): coeff ≈ 0.07,
-                        #   alpha ≈ 0.025-0.055, mostly invisible faint.
-                        # At m≈0.70 (sev≈1.0 falloff): coeff ≈ 0.55,
-                        #   alpha ≈ 0.20-0.45 → solid scratches.
-                        # ~7-9x stronger at high vs low severity.
-                        # Keep sev=1.0 coefficient at 1.0; raise floor
-                        # from 0.02 to 0.15 so sev=0.01 (m=0.3) gives
-                        # coeff ≈ 0.33 (~2.6× stronger than before) — a
-                        # visibly-present hairline rather than an
-                        # invisible faint smudge.
-                        coeff = 0.15 + 0.85 * (local_m ** 1.3)
-                        a = min(1.0, scratch_str * coeff * lum_boost)
-                        out[0, ny, nx] = out[0, ny, nx] * (1 - a) + cr * a
-                        out[1, ny, nx] = out[1, ny, nx] * (1 - a) + cg * a
-                        out[2, ny, nx] = out[2, ny, nx] * (1 - a) + cb * a
+                        # Severity-dependent alpha. Floor raised from
+                        # 0.15 to 0.35 so sev=0.01 (m≈0.30) yields a
+                        # visible hairline (coeff ≈ 0.50) rather than a
+                        # near-invisible smudge (coeff ≈ 0.33 before).
+                        # sev=1.0 (m≈1.0) still saturates at 1.0.
+                        coeff = 0.35 + 0.65 * (local_m ** 1.1)
+                        a = min(1.0, scratch_str * coeff * lum_boost * length_taper)
+                        out[0, ny, nx] = out[0, ny, nx] * (1 - a) + scratch_r * a
+                        out[1, ny, nx] = out[1, ny, nx] * (1 - a) + scratch_g * a
+                        out[2, ny, nx] = out[2, ny, nx] * (1 - a) + scratch_b * a
 
     return out.clamp(0, 1)
