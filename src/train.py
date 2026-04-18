@@ -66,7 +66,6 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
-from .config import CorruptionConfig
 from .corruption import downsample_mask
 from .dataset import ArtRestorationDataset
 from .distributed import get_device, get_global_rank, get_world_size, is_main_process
@@ -155,21 +154,6 @@ def _unwrap_model(engine: Any) -> RestorationDiT:
     the object may already be the raw ``nn.Module``.
     """
     return engine.module if hasattr(engine, "module") else engine
-
-
-def _to_corruption_config(path: str) -> CorruptionConfig:
-    """Load ``CorruptionConfig`` from YAML and merge with structured dataclass defaults.
-
-    Args:
-        path: Filesystem path to a corruption YAML (e.g. ``src/corruption/configs/default.yaml``).
-
-    Returns:
-        A concrete :class:`~src.config.CorruptionConfig` instance.
-    """
-    raw = OmegaConf.load(path)
-    base = OmegaConf.structured(CorruptionConfig())
-    merged = OmegaConf.merge(base, raw)
-    return OmegaConf.to_object(merged)
 
 
 def setup_model(
@@ -325,12 +309,11 @@ def setup_dataloader(
         ``(dataloader, dataset)`` — the dataset is returned so callers can attach a
         sampler that references the **same** object instance if they rebuild the loader.
     """
-    corrupt_cfg = _to_corruption_config(cfg.corruption.config_path)
     data_dir = cfg.train.data_dir if split == "train" else cfg.train.val_dir
     ds = ArtRestorationDataset(
         data_dir=data_dir,
         resolution=int(cfg.train.resolution),
-        corruption_config=corrupt_cfg,
+        corruption_config=cfg.corruption,
         max_simultaneous=max_simultaneous,
     )
     nw = int(getattr(cfg.train, "num_workers", 4))
@@ -525,7 +508,7 @@ def _curriculum_max_sim(cfg: DictConfig, epoch: int) -> int | None:
 
 def _build_train_loader(
     cfg: DictConfig,
-    corrupt_cfg: CorruptionConfig,
+    corrupt_cfg: DictConfig,
     max_sim: int | None,
     world_size: int,
 ) -> tuple[DataLoader, ArtRestorationDataset, Optional[DistributedSampler]]:
@@ -537,7 +520,7 @@ def _build_train_loader(
 
     Args:
         cfg:          Full config.
-        corrupt_cfg:  Merged :class:`~src.config.CorruptionConfig` (shared, not mutated).
+        corrupt_cfg:  Loaded corruption config from ``cfg.corruption`` (shared, not mutated).
         max_sim:      Curriculum override (``1`` or ``None``).
         world_size:   ``torch.distributed`` world size (1 means single-process).
 
@@ -644,8 +627,8 @@ def main(cfg: DictConfig) -> None:
     vae = vae.to(device).requires_grad_(False).eval()
 
     # --- Consistency guard: corruption YAML K must match img_in width 128+128+K ---
-    corrupt_cfg = _to_corruption_config(cfg.corruption.config_path)
-    k_mask = corrupt_cfg.num_channels
+    corrupt_cfg = cfg.corruption
+    k_mask = int(corrupt_cfg.num_channels)
     if int(cfg.model.mask_channels) != k_mask or int(cfg.model.in_channels) != 128 + 128 + k_mask:
         raise ValueError(
             f"model.mask_channels / in_channels must match corruption (K={k_mask}): "

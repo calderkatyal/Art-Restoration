@@ -8,7 +8,7 @@ Usage (on remote machine):
 Produces:
     tests/corruption_results/
         corruption_grid.png   -- grid of all 18 presets (8 individual + 10 multi)
-        config.yaml           — the CorruptionConfig used
+        config.yaml           — the corruption YAML used
 """
 
 import argparse
@@ -20,14 +20,15 @@ from pathlib import Path
 
 import torch
 import torchvision.transforms as T
+from omegaconf import OmegaConf
 from PIL import Image, ImageDraw, ImageFont
 
 # Allow running as `python -m tests.test_corruption_visual` from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.config import CorruptionConfig
 from src.corruption import CorruptionModule
 from src.corruption.presets import INDIVIDUAL_PRESETS, MULTI_PRESETS, CHANNEL_NAMES
+from src.utils import load_corruption_config
 
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -135,7 +136,7 @@ def build_grid(
     draw.text((grid_w // 2 - 200, 8), "Corruption Pipeline Visual Test",
               fill=(255, 255, 255), font=title_font)
 
-    config = CorruptionConfig()
+    config = load_corruption_config("src/corruption/configs/default.yaml")
 
     for idx, (preset_type, preset_name) in enumerate(presets):
         col = idx % n_cols
@@ -154,17 +155,29 @@ def build_grid(
 
         # Force this specific preset
         if preset_type == "individual":
-            cfg = CorruptionConfig(
-                individual_prob=1.0,
-                individual_presets={n: (1.0 if n == preset_name else 0.0)
-                                    for n in INDIVIDUAL_PRESETS},
+            cfg = OmegaConf.merge(
+                config,
+                OmegaConf.create(
+                    {
+                        "individual_prob": 1.0,
+                        "individual_presets": {
+                            n: (1.0 if n == preset_name else 0.0) for n in INDIVIDUAL_PRESETS
+                        },
+                    }
+                ),
             )
             label = f"[Individual] {preset_name}"
         else:
-            cfg = CorruptionConfig(
-                individual_prob=0.0,
-                multi_presets={n: (1.0 if n == preset_name else 0.0)
-                               for n in MULTI_PRESETS},
+            cfg = OmegaConf.merge(
+                config,
+                OmegaConf.create(
+                    {
+                        "individual_prob": 0.0,
+                        "multi_presets": {
+                            n: (1.0 if n == preset_name else 0.0) for n in MULTI_PRESETS
+                        },
+                    }
+                ),
             )
             label = f"[Multi] {preset_name}"
             
@@ -200,10 +213,9 @@ def build_grid(
     print(f"\nGrid saved to {grid_path}")
 
     # Save config as YAML
-    from omegaconf import OmegaConf
     config_path = os.path.join(output_dir, "config.yaml")
     conf_dict = {
-        "corruption": OmegaConf.to_container(OmegaConf.structured(config)),
+        "corruption": OmegaConf.to_container(config, resolve=True),
         "test_settings": {
             "resolution": resolution,
             "seed": seed,

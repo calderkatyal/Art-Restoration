@@ -35,9 +35,8 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
-from typing import List
+from typing import Any, List
 
-from .config import ModelConfig
 from .flux2.model import Flux2, Klein4BParams
 from .flux2.sampling import batched_prc_img, batched_prc_txt
 from .flux2.util import init_flow_model, load_pretrained_flow_weights
@@ -52,7 +51,7 @@ class RestorationDiT(nn.Module):
 
     def __init__(
         self,
-        cfg: ModelConfig,
+        cfg: Any,
         device: str | torch.device = "cuda",
         img_in_dtype=torch.bfloat16,
         load_pretrained: bool = True,
@@ -66,7 +65,7 @@ class RestorationDiT(nn.Module):
             3. Replace ``img_in`` with ``Linear(cfg.in_channels, cfg.hidden_size)`` and Xavier init.
 
         Args:
-            cfg: ModelConfig (flux_model_name, in_channels=128+128+K, hidden_size=3072).
+            cfg: YAML-backed model config (flux_model_name, in_channels=128+128+K, hidden_size=3072).
             device: Target device for weights and new ``img_in``.
             img_in_dtype: Dtype for the re-initialized ``img_in`` layer.
             load_pretrained: If False, skip weight load (random backbone; debug only).

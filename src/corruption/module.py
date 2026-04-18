@@ -7,7 +7,7 @@ patterns and the effect functions to apply pixel-level corruption.
 
 import torch
 import torch.nn.functional as F
-from typing import Tuple, Dict, Optional, List
+from typing import Any, Optional, Tuple
 
 from .effects import (
     apply_cracks, apply_linear_cracks, apply_paint_loss_crack,
@@ -35,12 +35,12 @@ class CorruptionModule:
       yellowing -> fading -> stains -> bloom -> deposits -> scratches -> cracks -> paint_loss
 
     Usage:
-        config = CorruptionConfig()
+        config = OmegaConf.load("src/corruption/configs/default.yaml")
         module = CorruptionModule(config)
         corrupted, mask = module(clean_image)
     """
 
-    def __init__(self, config: 'CorruptionConfig'):
+    def __init__(self, config: Any):
         self.config = config
 
     def __call__(
