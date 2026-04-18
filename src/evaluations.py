@@ -1,16 +1,19 @@
 """Quantitative evaluation metrics for restoration quality.
 
 Metrics:
-    compute_psnr      — full-image or masked-region PSNR (dB)
-    compute_psnr_stratified — per-damage-type PSNR breakdown
+    :func:`compute_psnr` — full-image PSNR or PSNR restricted to damaged pixels
+        (union over mask channels when ``K > 1``).
+    :func:`compute_psnr_stratified` — per-damage-channel PSNR for ablation / logging.
 
-All functions operate on (B, C, H, W) float32 tensors in [0, 1].
-Masks are (B, K, H, W) binary float32 at pixel resolution,
-one channel per damage type in degradation.damage_types order.
+All functions expect ``(B, C, H, W)`` ``float32`` tensors in ``[0, 1]``. Masks are
+``(B, K, H, W)`` binary ``float32`` with one channel per damage type in the same order
+as ``CorruptionConfig.damage_types`` / the corruption module's channel stack.
 """
 
-import torch
 from typing import Dict, List, Optional
+
+import torch
+import torch.nn.functional as F
 
 
 def compute_psnr(
@@ -18,27 +21,48 @@ def compute_psnr(
     target: torch.Tensor,
     mask: Optional[torch.Tensor] = None,
 ) -> float:
-    """Compute PSNR (dB) between prediction and target.
+    """Compute PSNR (dB) between ``prediction`` and ``target``.
 
-    Full-image mode (mask=None):
-        MSE = mean over all B×C×H×W elements.
+    **Full-image mode** (``mask is None``):
+        ``MSE`` is the mean squared error over all ``B × C × H × W`` elements, then
+        ``PSNR = 10 * log10(1 / MSE)`` (peak value 1.0 for images in ``[0,1]``).
 
-    Masked mode (mask provided):
-        MSE = sum of squared errors at damaged pixels
-              / (number of damaged pixels × C)
-        where damaged pixels are those where max_k(mask_k) == 1.
+    **Masked mode** (``mask`` provided):
+        A pixel is **damaged** if ``max_k mask[:,k,h,w] >= 0.5`` when ``K > 1``, else
+        if ``mask[:,0] >= 0.5``. ``MSE`` averages squared error over damaged pixels
+        across all colour channels. Returns ``nan`` if there are zero damaged pixels
+        in the batch slice.
 
     Args:
-        prediction: (B, C, H, W) float32 in [0, 1].
-        target:     (B, C, H, W) float32 in [0, 1].
-        mask:       Optional (B, K, H, W) or (B, 1, H, W) binary float32.
-                    If None, full-image PSNR is computed.
+        prediction: ``(B, C, H, W)`` restored image.
+        target:     ``(B, C, H, W)`` ground truth.
+        mask:       Optional ``(B, K, H, W)`` or ``(B, 1, H, W)`` mask.
 
     Returns:
-        PSNR in dB averaged over the batch.
-        float('inf') if MSE == 0. float('nan') if mask has no damaged pixels.
+        Scalar PSNR in decibels (Python ``float``). ``inf`` if ``MSE == 0`` exactly.
     """
-    ...
+    pred = prediction.detach().float()
+    tgt = target.detach().float()
+
+    if mask is None:
+        mse = F.mse_loss(pred, tgt)
+        if mse.item() <= 0.0:
+            return float("inf")
+        return (10.0 * torch.log10(torch.tensor(1.0, device=mse.device) / mse)).item()
+
+    m = mask.float()
+    if m.dim() == 4 and m.shape[1] > 1:
+        m = m.max(dim=1, keepdim=True).values
+    damaged = (m >= 0.5).float()
+    _, c, _, _ = pred.shape
+    err2 = (pred - tgt).pow(2) * damaged
+    denom = damaged.sum() * float(c)
+    if denom <= 0:
+        return float("nan")
+    mse = err2.sum() / denom
+    if mse.item() <= 0.0:
+        return float("inf")
+    return (10.0 * torch.log10(torch.tensor(1.0, device=mse.device) / mse)).item()
 
 
 def compute_psnr_stratified(
@@ -47,19 +71,31 @@ def compute_psnr_stratified(
     mask: torch.Tensor,
     damage_types: List[str],
 ) -> Dict[str, float]:
-    """Compute per-damage-type PSNR over each mask channel independently.
+    """Compute per-damage-type PSNR using each mask channel independently.
 
-    For each channel k, computes PSNR restricted to pixels where mask[:, k] == 1,
-    regardless of whether other channels are also active at those pixels.
+    For each channel ``k``, evaluates :func:`compute_psnr` with a single-channel mask
+    ``mask[:, k:k+1]``, so the metric only sees pixels where **that** damage type is
+    active (even if other channels are also 1 at the same pixel).
 
     Args:
-        prediction:   (B, C, H, W) float32 in [0, 1].
-        target:       (B, C, H, W) float32 in [0, 1].
-        mask:         (B, K, H, W) binary float32, K == len(damage_types).
-        damage_types: List of K damage type names, e.g. ["crack", "paint_loss", ...].
+        prediction:   ``(B, C, H, W)`` in ``[0, 1]``.
+        target:       ``(B, C, H, W)`` in ``[0, 1]``.
+        mask:         ``(B, K, H, W)`` binary; ``K`` must equal ``len(damage_types)``.
+        damage_types: Human-readable names for logging keys.
 
     Returns:
-        Dict mapping damage type name → PSNR in dB.
-        Value is float('nan') if that channel has no damaged pixels in the batch.
+        Mapping ``damage_type_name → PSNR`` in dB. Value may be ``nan`` if a channel
+        has no active pixels in the batch.
+
+    Raises:
+        ValueError: If ``mask.shape[1] != len(damage_types)``.
     """
-    ...
+    out: Dict[str, float] = {}
+    _, k, _, _ = mask.shape
+    if k != len(damage_types):
+        raise ValueError(f"mask has {k} channels but {len(damage_types)} damage types")
+
+    for i, name in enumerate(damage_types):
+        ch = mask[:, i : i + 1]
+        out[name] = compute_psnr(prediction, target, mask=ch)
+    return out

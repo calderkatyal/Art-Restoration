@@ -1,30 +1,18 @@
 """Inference via Euler ODE integration with hard data-consistency projection.
 
 At each integration step:
-    1. Predict velocity:  vel = v_θ(z_t, t | z_y, M')
-    2. Euler step:        z_t ← z_t + (t_prev - t_curr) * vel
-    3. Data consistency:  z_t ← m_intact ⊙ z_y  +  m_dam ⊙ z_t
-       where  m_dam    = max_k(M'_k)   (any damaged channel → 1)
-              m_intact = 1 - m_dam
+    1. Predict velocity:  ``vel = v_θ(z_t, t | z_y, M')``
+    2. Euler update:      ``z_t ← z_t + (t_next - t_curr) * vel``
+    3. Data consistency:  ``z_t ← m_intact ⊙ z_y + m_dam ⊙ z_t``
+       where ``m_dam = max_k(M'_k)`` (any damaged channel active) and ``m_intact = 1 - m_dam``.
 
-Timestep schedule: FLUX.2 empirical SNR-shifted schedule from
-flux2/sampling.py get_schedule(num_steps, image_seq_len).
+Timesteps follow the FLUX.2 empirical SNR-shifted schedule from
+:func:`~src.flux2.sampling.get_schedule`.
 
-Usage:
-    python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
-        [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
-
-Arguments:
-    --checkpoint  Path to trained model .pt file (required).
-    --input       Path to damaged input image (required).
-    --output      Path to save restored image (required).
-    --config      Path to YAML config (default: configs/default.yaml).
-    --damage      One or more damage types present in the image:
-                      crack | paint_loss | stain | blur | color_shift
-                  A full-image mask of ones is set for each named type.
-                  Omit to mark all channels as damaged.
-    --steps       Number of ODE Euler steps (default: model.num_steps from config).
-    --device      Device to run on (default: cuda).
+Typical CLI usage (once a plain ``state_dict`` export exists) is documented in the
+``python -m src.inference`` block at the bottom of this file; training validation calls
+:func:`sample` directly with a :class:`~src.model.RestorationDiT` checkpoint wrapped or
+unwrapped by DeepSpeed.
 """
 
 import torch
@@ -45,32 +33,54 @@ def sample(
     num_steps: int = 50,
     device: str = "cuda",
 ) -> torch.Tensor:
-    """Restore a corrupted image via Euler ODE integration.
+    """Restore a corrupted RGB batch by integrating the learned velocity field.
 
-    Steps:
-        1. z_y = vae.encode(corrupted_image)       → (B, 128, H/16, W/16)
-        2. M'  = downsample_mask(mask, factor=16)  → (B, K, H/16, W/16)
-        3. z_t ~ N(0, I), same shape as z_y.
-        4. timesteps = get_schedule(num_steps, H'*W')  — SNR-shifted schedule.
-        5. For each (t_curr, t_prev) in timesteps:
-               vel  = model(z_t, t_curr, z_y, M', null_emb)
-               z_t ← z_t + (t_prev - t_curr) * vel
-               z_t ← data_consistency_step(z_t, z_y, M')
-        6. return vae.decode(z_t)                  → (B, 3, H, W) in [0, 1]
+    Steps (latent space):
+        1. ``z_y = vae.encode(corrupted_image)``
+        2. ``M' = downsample_mask(mask, factor=vae.spatial_compression)``
+        3. ``z_t ~ N(0, I)`` matching ``z_y`` shape
+        4. ``timesteps = get_schedule(num_steps, H'*W')``
+        5. For each adjacent pair ``(t_curr, t_next)`` in the schedule, apply Euler +
+           :func:`data_consistency_step`.
+        6. ``return vae.decode(z_t)`` clamped to ``[0, 1]``.
 
     Args:
-        model:           Trained RestorationDiT in eval mode.
-        vae:             Frozen FluxVAE.
-        corrupted_image: (B, 3, H, W) float32 in [0, 1]. H, W divisible by 16.
-        mask:            (B, K, H, W) float32 binary at pixel resolution.
-        null_emb:        (1, 512, 7680) precomputed null text embedding.
-        num_steps:       Number of Euler steps.
-        device:          Device string.
+        model:           Trained ``RestorationDiT`` in ``eval()`` mode.
+        vae:             Frozen ``FluxVAE``.
+        corrupted_image: ``(B, 3, H, W)`` in ``[0, 1]``; ``H, W`` divisible by 16.
+        mask:            ``(B, K, H, W)`` damage tensor at **pixel** resolution.
+        null_emb:        ``(1, 512, 7680)`` cached null text embedding.
+        num_steps:       Number of Euler steps (more = slower, often sharper).
+        device:          ``"cuda"`` or ``"cpu"`` string controlling tensor placement.
 
     Returns:
-        (B, 3, H, W) float32 in [0, 1] — restored image.
+        ``(B, 3, H, W)`` ``float32`` restored RGB in ``[0, 1]``.
     """
-    ...
+    corrupted_image = corrupted_image.to(device)
+    mask = mask.to(device)
+    null_emb = null_emb.to(device)
+
+    z_y = vae.encode(corrupted_image)
+    m_lat = downsample_mask(mask, factor=vae.spatial_compression)
+    b, _, h, w = z_y.shape
+    z_t = torch.randn_like(z_y)
+    seq_len = h * w
+    timesteps = get_schedule(num_steps, seq_len)
+
+    dtype = torch.bfloat16 if z_t.device.type == "cuda" else torch.float32
+    z_t = z_t.to(dtype=dtype)
+    z_y = z_y.to(dtype=dtype)
+    m_lat = m_lat.to(dtype=dtype)
+    null_b = null_emb.to(dtype=dtype)
+
+    for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((b,), float(t_curr), device=device, dtype=dtype)
+        vel = model(z_t, t_vec, z_y, m_lat, null_b)
+        z_t = z_t + (float(t_next) - float(t_curr)) * vel
+        z_t = data_consistency_step(z_t, z_y, m_lat)
+
+    restored = vae.decode(z_t.float())
+    return restored.clamp(0.0, 1.0)
 
 
 def data_consistency_step(
@@ -78,30 +88,25 @@ def data_consistency_step(
     z_y: torch.Tensor,
     mask_latent: torch.Tensor,
 ) -> torch.Tensor:
-    """Hard data-consistency projection in latent space.
+    """Hard data-consistency projection in latent space (intact regions copy ``z_y``).
 
-    Preserves intact (non-damaged) latent regions from z_y:
-        m_dam    = max_k(M'_k)          (B, 1, H', W')
-        m_intact = 1 - m_dam
-        z_t     ← m_intact ⊙ z_y  +  m_dam ⊙ z_t
+    Damaged vs intact is derived from **max** over mask channels at each spatial cell:
+    if any damage type is active (value ``≥ 0.5``), that cell keeps the denoised ``z_t``;
+    otherwise it is reset to the encoded damaged image ``z_y`` (preserves uncorrupted content).
 
     Args:
-        z_t:          Current latent (B, 128, H', W').
-        z_y:          Corrupted image latent (B, 128, H', W').
-        mask_latent:  Downsampled mask (B, K, H', W') values in {0, 1}.
+        z_t:          Current latent iterate ``(B, 128, H', W')``.
+        z_y:          Encoded corrupted image, same shape as ``z_t``.
+        mask_latent:  Downsampled ``(B, K, H', W')`` mask.
 
     Returns:
-        Projected latent (B, 128, H', W').
+        Projected latent ``z_t`` with the same dtype/device as inputs.
     """
-    ...
-
+    m_dam = mask_latent.max(dim=1, keepdim=True).values
+    m_dam = (m_dam >= 0.5).to(dtype=z_t.dtype)
+    m_intact = 1.0 - m_dam
+    return m_intact * z_y + m_dam * z_t
 
 
 if __name__ == "__main__":
-    """Restore a damaged image using a trained checkpoint.
-
-    Usage:
-        python -m src.inference --checkpoint checkpoints/final.pt --input damaged.png --output restored.png \
-            [--config configs/default.yaml] [--damage crack paint_loss] [--steps 50] [--device cuda]
-    """
-    ...
+    pass

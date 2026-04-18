@@ -73,7 +73,7 @@ class ModelConfig:
         latent_channels:      VAE latent channels after patchify (128).
         spatial_compression:  Total VAE spatial downsampling factor (16).
         mask_channels:        K damage-type mask channels.
-        in_channels:          img_in input dim = 128 + 128 + K = 261.
+        in_channels:          img_in input dim = 128 + 128 + K (K = mask_channels).
         hidden_size:          DiT hidden dimension (3072 for Klein 4B).
         context_in_dim:       Text context dim (7680).
         text_encoder_variant: Qwen3 variant string for load_qwen3_embedder.
@@ -118,10 +118,12 @@ class SchedulerConfig:
         name:          Scheduler name ("cosine").
         warmup_steps:  Linear warmup duration in optimizer steps.
         min_lr:        Minimum LR at end of cosine decay.
+        max_steps:     Total optimizer steps for cosine phase (set from dataloader in training).
     """
     name: str = "cosine"
     warmup_steps: int = 500
     min_lr: float = 1e-6
+    max_steps: int = 500_000
 
 
 @dataclass
@@ -196,8 +198,11 @@ class TrainConfig:
         batch_size:   Per-GPU batch size.
         num_epochs:   Total training epochs across both stages.
         seed:         Random seed.
-        save_every:   Checkpoint save interval in optimizer steps.
+        save_every:   Checkpoint save interval in optimizer steps (all ranks call DeepSpeed save).
+        save_every_images: Also save when this many global images (across all GPUs) have been seen since last save; None disables image-based saves.
         log_every:    Loss logging interval in optimizer steps.
+        val_every:    Run validation (rank 0) every N optimizer steps; large value disables.
+        num_workers:  DataLoader worker processes per rank.
         resume_from:  Optional path to a checkpoint .pt file to resume from.
         optimizer:    OptimizerConfig.
         scheduler:    SchedulerConfig.
@@ -215,7 +220,10 @@ class TrainConfig:
     num_epochs: int = 50
     seed: int = 42
     save_every: int = 1000
+    save_every_images: Optional[int] = 10000
     log_every: int = 100
+    val_every: int = 2000
+    num_workers: int = 4
     resume_from: Optional[str] = None
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
     scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
@@ -255,5 +263,10 @@ def load_config(yaml_path: str, overrides: Optional[List[str]] = None) -> Config
 
     Returns:
         Merged and type-validated Config object.
+
+    Note:
+        Training uses :func:`src.utils.load_config` (OmegaConf DictConfig) so YAML
+        may include ``wandb``, ``ds_config``, and ``inference`` without a strict
+        dataclass schema.
     """
     ...

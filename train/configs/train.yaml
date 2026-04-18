@@ -3,7 +3,7 @@ model:
   latent_channels: 128       # VAE z_channels=32 × 2×2 patchify
   spatial_compression: 16    # 8× encoder × 2× patchify
   mask_channels: 8           # 8 corruption types
-  in_channels: 263           # 128 (z_t) + 128 (z_y) + 7 (mask)
+  in_channels: 264           # 128 (z_t) + 128 (z_y) + 8 (mask M')
   hidden_size: 3072
   context_in_dim: 7680       # 3 Qwen3-4B layers × 2560
   text_encoder_variant: "4B"
@@ -21,7 +21,10 @@ train:
   num_epochs: 50
   seed: 42
   save_every: 1000
+  save_every_images: 10000
   log_every: 100
+  val_every: 2000
+  num_workers: 4
   resume_from: null
 
   optimizer:
@@ -34,6 +37,7 @@ train:
     name: "cosine"
     warmup_steps: 500
     min_lr: 1e-6
+    max_steps: 500000
 
   warmup:
     epochs: 5
@@ -49,6 +53,25 @@ train:
 
 corruption:
   config_path: "src/corruption/configs/default.yaml"
+
+# DeepSpeed (ZeRO-2 + bf16). train_micro_batch_size_per_gpu is set at runtime from train.batch_size.
+ds_config:
+  train_batch_size: "auto"
+  train_micro_batch_size_per_gpu: "auto"
+  gradient_accumulation_steps: 1
+  steps_per_print: 100
+  gradient_clipping: 1.0
+  bf16:
+    enabled: true
+  fp16:
+    enabled: false
+  zero_optimization:
+    stage: 2
+    allgather_partitions: true
+    reduce_scatter: true
+    overlap_comm: true
+    contiguous_gradients: true
+  wall_clock_breakdown: false
 
 # Inference settings used for periodic validation sampling during training
 inference:
