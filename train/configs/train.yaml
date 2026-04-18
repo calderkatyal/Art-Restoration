@@ -2,8 +2,8 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   latent_channels: 128       # VAE z_channels=32 × 2×2 patchify
   spatial_compression: 16    # 8× encoder × 2× patchify
-  mask_channels: 7           # 7 corruption types
-  in_channels: 263           # 128 (z_t) + 128 (z_y) + 7 (mask)
+  mask_channels: 8           # 8 corruption types
+  in_channels: 264           # 128 (z_t) + 128 (z_y) + 8 (mask)
   hidden_size: 3072
   context_in_dim: 7680       # 3 Qwen3-4B layers × 2560
   text_encoder_variant: "4B"
@@ -13,11 +13,17 @@ train:
   # stage: "warmup" trains only img_in (backbone frozen)
   #        "full"   trains all layers
   stage: "warmup"
-  data_dir: "./data/wikiart"
-  val_dir: "./data/wikiart_val"
+  data_dir: "./data/wikiart"   # single WikiArt root; train/eval split happens in dataset.py
   output_dir: "./checkpoints"
   resolution: 512
   batch_size: 4
+  num_workers: 4
+  train_ratio: 0.99
+  split_seed: 42
+  corruption_seed: 42
+  pin_memory: true
+  persistent_workers: true
+  snapshot_every_n_steps: 1
   num_epochs: 50
   seed: 42
   save_every: 1000

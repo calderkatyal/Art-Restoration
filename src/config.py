@@ -189,11 +189,21 @@ class TrainConfig:
     Attributes:
         stage:        "warmup" → freeze backbone, train img_in only.
                       "full"   → train all layers with separate per-group LRs.
-        data_dir:     Root dir of clean WikiArt training images.
-        val_dir:      Root dir of clean WikiArt validation images.
+        data_dir:     Root dir of clean WikiArt images. dataset.py derives the
+                      train/eval split from this single directory.
         output_dir:   Directory for checkpoints.
         resolution:   Square crop resolution (H = W = resolution).
         batch_size:   Per-GPU batch size.
+        num_workers:  DataLoader worker count.
+        train_ratio:  Fraction of WikiArt used for the train split.
+        split_seed:   Seed for the deterministic train/eval split and shuffling.
+        corruption_seed:
+                      Base seed for the corruption RNG stream.
+        pin_memory:   Whether DataLoader should pin host memory.
+        persistent_workers:
+                      Keep DataLoader workers alive across epochs.
+        snapshot_every_n_steps:
+                      torchdata StatefulDataLoader snapshot cadence.
         num_epochs:   Total training epochs across both stages.
         seed:         Random seed.
         save_every:   Checkpoint save interval in optimizer steps.
@@ -208,10 +218,16 @@ class TrainConfig:
     """
     stage: str = "warmup"
     data_dir: str = "./data/wikiart"
-    val_dir: str = "./data/wikiart_val"
     output_dir: str = "./checkpoints"
     resolution: int = 512
     batch_size: int = 4
+    num_workers: int = 4
+    train_ratio: float = 0.8
+    split_seed: int = 42
+    corruption_seed: int = 42
+    pin_memory: bool = True
+    persistent_workers: bool = True
+    snapshot_every_n_steps: int = 1
     num_epochs: int = 50
     seed: int = 42
     save_every: int = 1000

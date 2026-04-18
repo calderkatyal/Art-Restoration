@@ -4,9 +4,10 @@
 corruption on-the-fly, and exposes deterministic 80/20 split handling from a
 single root directory. The split is stratified by the top-level genre folder.
 
-`StatefulEpochSampler` is designed to work with
-`torchdata.stateful_dataloader.StatefulDataLoader` so training can resume
-mid-epoch and still know exactly which examples have already been consumed.
+`StatefulEpochSampler` and `DistributedStatefulEpochSampler` are designed to
+work with `torchdata.stateful_dataloader.StatefulDataLoader` so training can
+resume mid-epoch and still know exactly which examples have already been
+consumed, both for single-process and DDP training.
 
 `RealDamageDataset` remains available for future real-damage evaluation, but
 no dedicated dataloader helper is implemented for it yet.
@@ -15,11 +16,13 @@ no dedicated dataloader helper is implemented for it yet.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Literal, Optional, Sequence
 
 import torch
+import torch.distributed as dist
 from PIL import Image, ImageOps
 from torch.utils.data import Dataset, Sampler, get_worker_info
 from torchvision.transforms import InterpolationMode
@@ -296,12 +299,12 @@ class StatefulEpochSampler(Sampler[int]):
         if self._cached_order is not None and self._cached_epoch == self.epoch:
             return self._cached_order
 
-        if not self.shuffle:
-            order = list(range(self._length))
-        else:
-            generator = torch.Generator(device="cpu")
-            generator.manual_seed(self.seed + self.epoch)
-            order = torch.randperm(self._length, generator=generator).tolist()
+        order = _epoch_order(
+            self._length,
+            shuffle=self.shuffle,
+            seed=self.seed,
+            epoch=self.epoch,
+        )
 
         self._cached_epoch = self.epoch
         self._cached_order = order
@@ -326,6 +329,158 @@ class StatefulEpochSampler(Sampler[int]):
         self._cached_order = None
 
 
+class DistributedStatefulEpochSampler(Sampler[int]):
+    """DDP-aware deterministic sampler with resumable intra-epoch position tracking.
+
+    The sampler builds a single deterministic global order per epoch, then
+    slices that order by rank using the same padding/truncation semantics as
+    `torch.utils.data.DistributedSampler`. The sampler state is local to each
+    rank, so resuming a run restores the exact remaining shard for that rank.
+    """
+
+    def __init__(
+        self,
+        data_source: Sequence[Any],
+        *,
+        num_replicas: int,
+        rank: int,
+        shuffle: bool = True,
+        seed: int = 42,
+        drop_last: bool = False,
+    ):
+        if num_replicas < 1:
+            raise ValueError("num_replicas must be >= 1")
+        if rank < 0 or rank >= num_replicas:
+            raise ValueError(
+                f"rank must be in [0, num_replicas). Got rank={rank}, "
+                f"num_replicas={num_replicas}."
+            )
+
+        self._length = len(data_source)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.drop_last = bool(drop_last)
+        self.num_samples = _distributed_num_samples(
+            self._length,
+            num_replicas=self.num_replicas,
+            drop_last=self.drop_last,
+        )
+        self.total_size = self.num_samples * self.num_replicas
+        self.epoch = 0
+        self.position = 0
+        self._cached_epoch: Optional[int] = None
+        self._cached_rank_order: Optional[List[int]] = None
+
+    def __iter__(self) -> Iterator[int]:
+        if self.position >= self.num_samples:
+            self.advance_epoch()
+
+        order = self.current_order()
+        while self.position < self.num_samples:
+            index = order[self.position]
+            self.position += 1
+            yield index
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def state_dict(self) -> Dict[str, Any]:
+        return {
+            "epoch": self.epoch,
+            "position": self.position,
+            "shuffle": self.shuffle,
+            "seed": self.seed,
+            "length": self._length,
+            "num_replicas": self.num_replicas,
+            "rank": self.rank,
+            "drop_last": self.drop_last,
+            "num_samples": self.num_samples,
+            "total_size": self.total_size,
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        current_num_samples = _distributed_num_samples(
+            self._length,
+            num_replicas=self.num_replicas,
+            drop_last=self.drop_last,
+        )
+        if int(state_dict["length"]) != self._length:
+            raise ValueError(
+                "Sampler length changed between save and resume. "
+                f"Saved={state_dict['length']} current={self._length}."
+            )
+        if int(state_dict["num_replicas"]) != self.num_replicas:
+            raise ValueError(
+                "num_replicas changed between save and resume. "
+                f"Saved={state_dict['num_replicas']} current={self.num_replicas}."
+            )
+        if int(state_dict["rank"]) != self.rank:
+            raise ValueError(
+                f"rank changed between save and resume. "
+                f"Saved={state_dict['rank']} current={self.rank}."
+            )
+        if bool(state_dict["drop_last"]) != self.drop_last:
+            raise ValueError(
+                "drop_last changed between save and resume. "
+                f"Saved={state_dict['drop_last']} current={self.drop_last}."
+            )
+        if int(state_dict["num_samples"]) != current_num_samples:
+            raise ValueError(
+                "Distributed shard length changed between save and resume. "
+                f"Saved={state_dict['num_samples']} current={current_num_samples}."
+            )
+
+        self.epoch = int(state_dict["epoch"])
+        self.position = int(state_dict["position"])
+        self.shuffle = bool(state_dict["shuffle"])
+        self.seed = int(state_dict["seed"])
+        self.num_samples = current_num_samples
+        self.total_size = self.num_samples * self.num_replicas
+        self._cached_epoch = None
+        self._cached_rank_order = None
+
+    def current_order(self) -> List[int]:
+        if self._cached_rank_order is not None and self._cached_epoch == self.epoch:
+            return self._cached_rank_order
+
+        global_order = _epoch_order(
+            self._length,
+            shuffle=self.shuffle,
+            seed=self.seed,
+            epoch=self.epoch,
+        )
+        distributed_order = _distribute_order(
+            global_order,
+            num_replicas=self.num_replicas,
+            rank=self.rank,
+            drop_last=self.drop_last,
+        )
+
+        self._cached_epoch = self.epoch
+        self._cached_rank_order = distributed_order
+        return distributed_order
+
+    def seen_indices(self) -> List[int]:
+        return self.current_order()[: self.position]
+
+    def remaining_indices(self) -> List[int]:
+        return self.current_order()[self.position :]
+
+    def advance_epoch(self) -> None:
+        self.epoch += 1
+        self.position = 0
+        self._cached_epoch = None
+        self._cached_rank_order = None
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = int(epoch)
+        self.position = 0
+        self._cached_epoch = None
+        self._cached_rank_order = None
+
+
 def build_wikiart_dataloader(
     *,
     data_dir: str,
@@ -344,6 +499,9 @@ def build_wikiart_dataloader(
     persistent_workers: bool = False,
     snapshot_every_n_steps: int = 1,
     return_metadata: bool = True,
+    distributed: bool = False,
+    num_replicas: Optional[int] = None,
+    rank: Optional[int] = None,
 ):
     """Build a WikiArt dataset plus a torchdata StatefulDataLoader.
 
@@ -360,6 +518,14 @@ def build_wikiart_dataloader(
         )
 
     canonical_split = _canonicalize_split(split)
+    resolved_num_replicas: Optional[int] = None
+    resolved_rank: Optional[int] = None
+    if distributed:
+        resolved_num_replicas, resolved_rank = _resolve_distributed_context(
+            num_replicas=num_replicas,
+            rank=rank,
+        )
+
     dataset = ArtRestorationDataset(
         data_dir=data_dir,
         resolution=resolution,
@@ -367,15 +533,32 @@ def build_wikiart_dataloader(
         split=canonical_split,
         train_ratio=train_ratio,
         split_seed=split_seed,
-        corruption_seed=corruption_seed,
+        corruption_seed=_offset_seed_for_rank(
+            corruption_seed,
+            rank=resolved_rank,
+        ),
         deterministic_corruption=deterministic_corruption,
         return_metadata=return_metadata,
     )
-    sampler = StatefulEpochSampler(
-        dataset,
-        shuffle=(canonical_split == "train") if shuffle is None else shuffle,
-        seed=split_seed + (0 if canonical_split == "train" else 1_000_003),
-    )
+    sampler_shuffle = (canonical_split == "train") if shuffle is None else shuffle
+    sampler_drop_last = (canonical_split == "train") if drop_last is None else drop_last
+    sampler_seed = split_seed + (0 if canonical_split == "train" else 1_000_003)
+
+    if distributed:
+        sampler = DistributedStatefulEpochSampler(
+            dataset,
+            num_replicas=resolved_num_replicas,
+            rank=resolved_rank,
+            shuffle=sampler_shuffle,
+            seed=sampler_seed,
+            drop_last=sampler_drop_last,
+        )
+    else:
+        sampler = StatefulEpochSampler(
+            dataset,
+            shuffle=sampler_shuffle,
+            seed=sampler_seed,
+        )
 
     dataloader = StatefulDataLoader(
         dataset,
@@ -383,7 +566,7 @@ def build_wikiart_dataloader(
         sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=(canonical_split == "train") if drop_last is None else drop_last,
+        drop_last=sampler_drop_last,
         persistent_workers=persistent_workers and num_workers > 0,
         worker_init_fn=_wikiart_worker_init_fn if num_workers > 0 else None,
         snapshot_every_n_steps=snapshot_every_n_steps,
@@ -629,3 +812,76 @@ def _build_stem_index(root: Path) -> Dict[str, Path]:
         index[stem] = path
 
     return index
+
+
+def _epoch_order(length: int, *, shuffle: bool, seed: int, epoch: int) -> List[int]:
+    if not shuffle:
+        return list(range(length))
+
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(seed) + int(epoch))
+    return torch.randperm(length, generator=generator).tolist()
+
+
+def _distributed_num_samples(length: int, *, num_replicas: int, drop_last: bool) -> int:
+    if drop_last and length % num_replicas != 0:
+        return math.ceil((length - num_replicas) / num_replicas)
+    return math.ceil(length / num_replicas)
+
+
+def _distribute_order(
+    order: Sequence[int],
+    *,
+    num_replicas: int,
+    rank: int,
+    drop_last: bool,
+) -> List[int]:
+    if drop_last:
+        total_size = _distributed_num_samples(
+            len(order),
+            num_replicas=num_replicas,
+            drop_last=True,
+        ) * num_replicas
+        distributed = list(order[:total_size])
+    else:
+        num_samples = _distributed_num_samples(
+            len(order),
+            num_replicas=num_replicas,
+            drop_last=False,
+        )
+        total_size = num_samples * num_replicas
+        distributed = list(order)
+        if total_size > len(distributed):
+            padding = total_size - len(distributed)
+            if padding <= len(distributed):
+                distributed.extend(distributed[:padding])
+            else:
+                repeats = math.ceil(padding / len(distributed))
+                distributed.extend((distributed * repeats)[:padding])
+
+    return distributed[rank:total_size:num_replicas]
+
+
+def _resolve_distributed_context(
+    *,
+    num_replicas: Optional[int],
+    rank: Optional[int],
+) -> tuple[int, int]:
+    if num_replicas is None or rank is None:
+        if not dist.is_available() or not dist.is_initialized():
+            raise ValueError(
+                "Distributed dataloader requested without explicit "
+                "`num_replicas`/`rank`, and torch.distributed is not initialized."
+            )
+        if num_replicas is None:
+            num_replicas = dist.get_world_size()
+        if rank is None:
+            rank = dist.get_rank()
+
+    return int(num_replicas), int(rank)
+
+
+def _offset_seed_for_rank(seed: int, rank: Optional[int]) -> int:
+    if rank is None:
+        return int(seed)
+    return int(seed) + int(rank) * 1_000_003
