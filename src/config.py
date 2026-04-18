@@ -194,6 +194,7 @@ class TrainConfig:
         data_dir:     Root dir of clean WikiArt training images.
         val_dir:      Root dir of clean WikiArt validation images.
         output_dir:   Directory for checkpoints.
+        checkpoint_dir: Directory containing DeepSpeed ``step_*`` checkpoints.
         resolution:   Square crop resolution (H = W = resolution).
         batch_size:   Per-GPU batch size.
         num_epochs:   Total training epochs across both stages.
@@ -215,6 +216,7 @@ class TrainConfig:
     data_dir: str = "./data/wikiart"
     val_dir: str = "./data/wikiart_val"
     output_dir: str = "./checkpoints"
+    checkpoint_dir: str = "./checkpoints/deepspeed_ckpt"
     resolution: int = 512
     batch_size: int = 4
     num_epochs: int = 50

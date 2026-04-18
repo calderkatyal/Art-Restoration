@@ -84,6 +84,33 @@ class RestorationDiT(nn.Module):
             )
         self._reinit_img_in(cfg.in_channels, cfg.hidden_size, device=device, dtype=img_in_dtype)
 
+    def load_pretrained_backbone(
+        self,
+        model_name: str,
+        rank: int = 0,
+        device: str | torch.device = "cuda",
+    ) -> None:
+        """Load pretrained FLUX weights into matching backbone tensors only.
+
+        This is used as a fallback path after a failed checkpoint restore when the
+        current ``img_in`` width differs from the pretrained model's 128-channel
+        projection. ``img_in`` is intentionally left unchanged.
+        """
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        temp_model = init_flow_model(model_name)
+        load_pretrained_flow_weights(temp_model, model_name, rank=rank, device=device)
+
+        target = self.flow_model.state_dict()
+        source = temp_model.state_dict()
+        for key, value in source.items():
+            if key.startswith("img_in"):
+                continue
+            if key in target and target[key].shape == value.shape:
+                target[key] = value
+        self.flow_model.load_state_dict(target, strict=False)
+
     def _reinit_img_in(self, in_channels: int, hidden_size: int, device: str | torch.device = "cuda", dtype=torch.bfloat16) -> None:
         """Replace img_in with a new randomly-initialized Linear layer.
 

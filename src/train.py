@@ -176,6 +176,7 @@ def setup_model(
     cfg: DictConfig,
     device: torch.device,
     rank: int,
+    load_pretrained: bool = True,
 ) -> tuple[RestorationDiT, FluxVAE, torch.Tensor]:
     """Construct the restoration DiT, frozen FLUX VAE, and cached null text embedding.
 
@@ -186,6 +187,7 @@ def setup_model(
         cfg:    Full OmegaConf ``DictConfig`` (uses ``cfg.model`` and ``cfg.train.stage``).
         device: CUDA device for this process (typically ``cuda:LOCAL_RANK``).
         rank:   Global rank, forwarded to weight download logging and VAE init.
+        load_pretrained: Whether to load FLUX pretrained weights before widening ``img_in``.
 
     Returns:
         Tuple ``(restoration_dit, flux_vae, null_emb)`` where ``null_emb`` has shape
@@ -195,7 +197,7 @@ def setup_model(
         cfg=cfg.model,
         device=device,
         img_in_dtype=torch.bfloat16,
-        load_pretrained=True,
+        load_pretrained=load_pretrained,
         rank=rank,
     )
     flow_model.set_stage(cfg.train.stage)
@@ -566,6 +568,38 @@ def _build_train_loader(
     return loader, ds, sampler
 
 
+def _latest_checkpoint_tag(checkpoint_dir: Path) -> str | None:
+    """Return most recent ``step_*`` checkpoint tag under ``checkpoint_dir``."""
+    if not checkpoint_dir.exists():
+        return None
+    candidates = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith("step_")]
+    if not candidates:
+        return None
+
+    def key_fn(path: Path) -> tuple[int, float]:
+        try:
+            step = int(path.name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            step = -1
+        return (step, path.stat().st_mtime)
+
+    return max(candidates, key=key_fn).name
+
+
+def _resolve_checkpoint_strategy(cfg: DictConfig) -> tuple[str | None, str | None]:
+    """Choose one loading source: explicit resume, latest checkpoint, or pretrained."""
+    resume_from = cfg.train.get("resume_from")
+    if resume_from and str(resume_from) != "from_scratch":
+        rp = Path(str(resume_from))
+        return str(rp.parent), rp.name
+
+    ckpt_dir = Path(str(cfg.train.get("checkpoint_dir", Path(cfg.train.output_dir) / "deepspeed_ckpt")))
+    tag = _latest_checkpoint_tag(ckpt_dir)
+    if tag is None:
+        return None, None
+    return str(ckpt_dir), tag
+
+
 def main(cfg: DictConfig) -> None:
     """Initialize distributed training, run epochs, log, validate, and checkpoint.
 
@@ -597,8 +631,16 @@ def main(cfg: DictConfig) -> None:
 
     wandb_init(cfg, cfg)
 
-    # --- Models: pretrained Flux2 backbone + widened img_in, frozen AE, null text ctx ---
-    flow_model, vae, null_emb = setup_model(cfg, device, rank)
+    load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
+    should_try_checkpoint = load_dir is not None and load_tag is not None
+
+    # --- Models: either checkpoint-first init (no pretrained) or pretrained fallback path ---
+    flow_model, vae, null_emb = setup_model(
+        cfg,
+        device,
+        rank,
+        load_pretrained=not should_try_checkpoint,
+    )
     vae = vae.to(device).requires_grad_(False).eval()
 
     # --- Consistency guard: corruption YAML K must match img_in width 128+128+K ---
@@ -646,23 +688,37 @@ def main(cfg: DictConfig) -> None:
     images_since_save = 0
     last_save_step = 0
 
-    # --- Resume: ``resume_from`` should be a concrete tag dir, e.g. .../deepspeed_ckpt/step_1000 ---
-    resume_path = cfg.train.get("resume_from")
-    if resume_path:
-        load_dir = str(Path(resume_path).parent)
-        tag = Path(resume_path).name
-        _, client = engine.load_checkpoint(load_dir, tag=tag)
-        if client:
-            start_epoch = int(client.get("epoch", 0))
-            global_step = int(client.get("step", 0))
-            images_since_save = int(client.get("images_since_save", 0))
-            last_save_step = global_step
-            new_max = _curriculum_max_sim(cfg, start_epoch)
-            if new_max != max_sim:
-                max_sim = new_max
-                train_loader, _, train_sampler = _build_train_loader(
-                    cfg, corrupt_cfg, max_sim, world_size
+    # --- Single-source load policy: checkpoint OR pretrained; fallback to pretrained on errors ---
+    if should_try_checkpoint:
+        try:
+            _, client = engine.load_checkpoint(load_dir, tag=load_tag)
+            if client:
+                start_epoch = int(client.get("epoch", 0))
+                global_step = int(client.get("step", 0))
+                images_since_save = int(client.get("images_since_save", 0))
+                last_save_step = global_step
+                new_max = _curriculum_max_sim(cfg, start_epoch)
+                if new_max != max_sim:
+                    max_sim = new_max
+                    train_loader, _, train_sampler = _build_train_loader(
+                        cfg, corrupt_cfg, max_sim, world_size
+                    )
+                if is_main_process():
+                    print(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
+            else:
+                raise RuntimeError("DeepSpeed returned empty client_state while loading checkpoint.")
+        except Exception as exc:
+            if is_main_process():
+                print(
+                    f"[train] Checkpoint load failed ({exc}); falling back to pretrained weights."
                 )
+            _unwrap_model(engine).load_pretrained_backbone(
+                cfg.model.flux_model_name, rank=rank, device=device
+            )
+            start_epoch = 0
+            global_step = 0
+            images_since_save = 0
+            last_save_step = 0
 
     engine.train()
 

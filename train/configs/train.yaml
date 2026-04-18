@@ -16,6 +16,7 @@ train:
   data_dir: "./data/wikiart"
   val_dir: "./data/wikiart_val"
   output_dir: "./checkpoints"
+  checkpoint_dir: "./checkpoints/deepspeed_ckpt"
   resolution: 512
   batch_size: 4
   num_epochs: 50
