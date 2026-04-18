@@ -11,7 +11,7 @@
 # src/corruption/presets.py::_effective_severity.
 #
 # Local shape family (per-channel; hard-coded in presets.py):
-#   craquelure / paint_loss / yellowing / fading / bloom / deposits
+#   craquelure / paint_loss / yellowing / fading / deposits
 #       -> 'generic'  : random irregular elongated blob. Severity-INVARIANT
 #                       in shape; severity only modulates the soft mask.
 #   rip_tear   -> 'rip_tear'  : elongated curved band. Half-width scales
@@ -26,11 +26,10 @@ channels:
   - paint_loss      # 2  blob-shaped paint loss with substrate reveal — local only
   - yellowing       # 3  varnish yellowing (CIELAB a/b shift)
   - fading          # 4  photochemical desaturation / bleach
-  - bloom           # 5  milky multi-radius haze from degraded varnish
   - deposits        # 6  grime / soot darkening veil
   - scratches       # 7  thin linear abrasion marks — local only
 
-num_channels: 8
+num_channels: 7
 
 # Range of how many distinct types are active per image.
 num_simultaneous:
@@ -101,16 +100,6 @@ types:
     local_min_num: 1
     local_max_num: 3
     local_area_frac: [0.03, 0.30]
-
-  bloom:
-    weight: 1.0
-    local_enabled: true
-    global_enabled: true
-    min_severity: 0.01
-    max_severity: 1.0
-    local_min_num: 1
-    local_max_num: 3
-    local_area_frac: [0.02, 0.20]
 
   deposits:
     weight: 1.0

@@ -50,7 +50,6 @@ CHANNELS = [
     ("paint_loss", (240, 150,  40)),
     ("yellowing",  (240, 230,  60)),
     ("fading",     (180, 180, 255)),
-    ("bloom",      ( 80, 220, 220)),
     ("deposits",   (160, 140, 100)),
     ("scratches",  (220, 100, 220)),
 ]
@@ -316,7 +315,6 @@ const CHANNELS = [
     { id: "paint_loss", label: "Paint loss",        color: [240, 150, 40],  globalEnabled: false },
     { id: "yellowing",  label: "Yellowing",         color: [240, 230, 60],  globalEnabled: true  },
     { id: "fading",     label: "Fading",            color: [180, 180, 255], globalEnabled: true  },
-    { id: "bloom",      label: "Bloom",             color: [80, 220, 220],  globalEnabled: true  },
     { id: "deposits",   label: "Surface deposits",  color: [160, 140, 100], globalEnabled: true  },
     { id: "scratches",  label: "Scratches",         color: [220, 100, 220], globalEnabled: false },
 ];
