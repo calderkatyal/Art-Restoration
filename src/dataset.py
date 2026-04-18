@@ -9,11 +9,11 @@ square and resize to ``cfg.train.resolution``.
 
 Masks are ``(K, H, W)`` ``float32`` at **pixel** resolution. The training loop
 downsamples them to latent resolution with :func:`~src.corruption.downsample_mask`;
-``K`` must match ``cfg.model.mask_channels`` / ``CorruptionConfig.num_channels``.
+``K`` must match ``cfg.model.mask_channels`` / ``cfg.corruption.num_channels``.
 """
 
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 import copy
 import random
 
@@ -22,7 +22,6 @@ from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
 
-from .config import CorruptionConfig
 from .corruption import CorruptionModule
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -46,7 +45,7 @@ class ArtRestorationDataset(Dataset):
         self,
         data_dir: str,
         resolution: int,
-        corruption_config: CorruptionConfig,
+        corruption_config: Any,
         max_simultaneous: Optional[int] = None,
     ):
         """Scan ``data_dir`` for images and build a :class:`~src.corruption.CorruptionModule`.
@@ -54,7 +53,7 @@ class ArtRestorationDataset(Dataset):
         Args:
             data_dir:          Root directory scanned recursively for image extensions.
             resolution:        Square ``H == W`` after center-crop and resize.
-            corruption_config: Dataclass controlling preset weights and severity.
+            corruption_config: YAML-backed config object controlling preset weights and severity.
             max_simultaneous:  If ``1``, bias corruption toward single-type damage; else unused.
         """
         self.data_dir = Path(data_dir)

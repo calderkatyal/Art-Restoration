@@ -7,7 +7,7 @@ Metrics:
 
 All functions expect ``(B, C, H, W)`` ``float32`` tensors in ``[0, 1]``. Masks are
 ``(B, K, H, W)`` binary ``float32`` with one channel per damage type in the same order
-as ``CorruptionConfig.damage_types`` / the corruption module's channel stack.
+as ``cfg.corruption.damage_types`` / the corruption module's channel stack.
 """
 
 from typing import Dict, List, Optional
