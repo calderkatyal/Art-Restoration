@@ -20,9 +20,9 @@ train:
   # "warmup": backbone frozen, only img_in trained
   # "full":   all layers trained with per-group LRs
   stage: "warmup"
-  data_dir: "./data/wikiart"
-  val_dir: "./data/wikiart_val"
-  output_dir: "./checkpoints"
+  data_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
+  val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
+  checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
   batch_size: 4
   num_epochs: 50
