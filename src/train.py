@@ -37,31 +37,35 @@ Arguments:
 
 import os
 import argparse
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import deepspeed
+from omegaconf import DictConfig, OmegaConf
 
-from .config import Config, WandbConfig, load_config
+from .utils import load_config
 from .model import RestorationDiT
 from .vae import FluxVAE
 from .corruption import downsample_mask
 from .null_emb import load_or_compute_null_embedding
 from .dataset import ArtRestorationDataset
+from .distributed import get_device, get_global_rank, get_local_rank, get_world_size
 from .inference import sample
 from .evaluations import compute_psnr
 
 
-def wandb_init(cfg: WandbConfig, train_cfg: Config) -> None:
+def wandb_init(cfg: Any, train_cfg: Any) -> None:
     """Initialize a wandb run if cfg.enabled is True.
 
     Calls wandb.init() with project, entity, name, tags from cfg.
     Logs the full train config as wandb.config.
 
     Args:
-        cfg:       WandbConfig controlling project, entity, run_name, tags.
-        train_cfg: Full Config — logged to wandb.config for reproducibility.
+        cfg:       cfg.wandb sub-config (enabled, project, entity, run_name, tags).
+        train_cfg: Full DictConfig — logged to wandb.config for reproducibility.
     """
     ...
 
@@ -82,19 +86,19 @@ def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
     ...
 
 
-def train(cfg: Config) -> None:
+def train(cfg: DictConfig) -> None:
     """Main training entry point.
 
     Sets up model, VAE, null embedding, optimizer, scheduler, and dataloaders,
     then runs the epoch loop with optional curriculum and periodic validation.
 
     Args:
-        cfg: Full Config loaded from YAML + CLI overrides.
+        cfg: Full DictConfig loaded from YAML + CLI overrides.
     """
     ...
 
 
-def setup_model(cfg: Config, device: str = "cuda"):
+def setup_model(cfg: DictConfig, device: str = "cuda"):
     """Initialize RestorationDiT, FluxVAE, and null embedding.
 
     Calls model.set_stage(cfg.train.stage) to freeze/unfreeze parameters.
@@ -112,7 +116,7 @@ def setup_model(cfg: Config, device: str = "cuda"):
     ...
 
 
-def build_optimizer(model: RestorationDiT, cfg: Config) -> torch.optim.Optimizer:
+def build_optimizer(model: RestorationDiT, cfg: DictConfig) -> torch.optim.Optimizer:
     """Build AdamW with per-param-group LRs based on training stage.
 
     Warmup stage → one active group:
@@ -133,7 +137,7 @@ def build_optimizer(model: RestorationDiT, cfg: Config) -> torch.optim.Optimizer
     ...
 
 
-def build_scheduler(optimizer: torch.optim.Optimizer, cfg: Config):
+def build_scheduler(optimizer: torch.optim.Optimizer, cfg: DictConfig):
     """Build cosine LR scheduler with linear warmup.
 
     Warmup: linear ramp over cfg.train.scheduler.warmup_steps steps.
@@ -150,7 +154,7 @@ def build_scheduler(optimizer: torch.optim.Optimizer, cfg: Config):
 
 
 def setup_dataloader(
-    cfg: Config,
+    cfg: DictConfig,
     max_simultaneous: int | None = None,
     split: str = "train",
 ) -> DataLoader:
@@ -207,7 +211,7 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler,
     step: int,
-    cfg: Config,
+    cfg: DictConfig,
     path: str,
 ) -> None:
     """Save model state_dict, optimizer, scheduler, step, and serialized config.
@@ -217,7 +221,7 @@ def save_checkpoint(
         optimizer: Optimizer.
         scheduler: LR scheduler.
         step:      Current training step.
-        cfg:       Config (serialized via OmegaConf.to_yaml for reproducibility).
+        cfg:       DictConfig (serialized via OmegaConf.to_yaml for reproducibility).
         path:      Output .pt file path.
     """
     ...
@@ -251,7 +255,7 @@ def validate(
     vae: FluxVAE,
     val_loader: DataLoader,
     null_emb: torch.Tensor,
-    cfg: Config,
+    cfg: DictConfig,
     device: str = "cuda",
 ) -> dict:
     """Compute validation PSNR on held-out synthetically corrupted images.
@@ -272,6 +276,74 @@ def validate(
         Dict with keys 'psnr_full' and 'psnr_masked' (floats, batch-averaged).
     """
     ...
+
+
+def main(cfg: DictConfig): 
+    
+    deepspeed.init_distributed(dist_backend='nccl')
+    
+    device = get_device()
+    world_size = get_world_size()
+    global_rank = get_global_rank()
+    local_rank = get_local_rank()
+    
+    ds_config = OmegaConf.to_container(cfg.ds_config, resolve=True)
+    
+    print(f"Running dist training with world_size: {world_size}, this is rank {global_rank}")
+    
+    vae_model = FluxVAE(
+        flux_model_name=cfg.model.flux_model_name,
+        rank=global_rank,
+        device=device,   
+    ) # fp32, may want to make bf16
+
+    flow_model = RestorationDiT(
+        cfg=cfg.model,
+        device=device, 
+        img_in_dtype=torch.bfloat16
+    ) # meta device
+
+    train_mode = "from_scratch"
+    
+    if cfg.train.resume_from: 
+        pass
+    elif ():
+        pass
+    else: 
+        pass
+        
+    
+    load_pretrained_flow_weights(
+        model=flow_model.flow_model,
+        model_name=cfg.model.flux_model_name,
+        rank=global_rank,
+        device=device,
+    )
+
+    
+    
+    
+    # 
+    
+    
+    # not necessary but for consistency
+    flow_model = flow_model.to(device=device, dtype=torch.bfloat16)
+
+
+    flow_model, optimizer, train_dataloader, lr_scheduler = deepspeed.initialize(
+        model=flow_model,
+        model_parameters=[p for p in flow_model.parameters() if p.requires_grad],
+        config=ds_config,
+        training_data=None,   # replace with dataset if you want DS to build the loader
+    )
+
+    flow_model.train()
+
+    vae_model = vae_model.to(device).requires_grad_(False).eval() # we may also want to make this bf16
+
+    
+    
+    
 
 
 if __name__ == "__main__":
@@ -299,4 +371,4 @@ if __name__ == "__main__":
         # Override any config field:
         python -m src.train train.batch_size=8 train.optimizer.lr=5e-5
     """
-    ...
+
