@@ -9,11 +9,16 @@ Per-sample stochastic pipeline:
         - Pick severity ~ Uniform[c.min_severity, c.max_severity].
         - Generate mask_c accordingly (local = blobs, global = uniform fill).
   3. Apply effects in fixed pipeline order, each consuming its own mask.
-  4. Return corrupted image and stacked (K, H, W) mask tensor.
+  4. For each channel, derive the OUTPUT binary mask as the convex hull
+     of pixels the effect actually modified (before/after diff).
+  5. Return corrupted image and stacked (K, H, W) binary mask tensor.
 """
 
+import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image, ImageDraw
+from scipy.spatial import ConvexHull, QhullError
 from typing import Tuple, Dict, Optional, List, Any
 
 from .effects import (
@@ -30,6 +35,48 @@ from .presets import (
     CHANNEL_NAMES, NUM_CHANNELS, SHAPE_KIND_BY_CHANNEL,
     generate_global_mask, generate_local_mask,
 )
+
+
+# ---------------------------------------------------------------------------
+# Convex-hull mask helpers
+# ---------------------------------------------------------------------------
+
+def _affected_pixels(before: torch.Tensor, after: torch.Tensor,
+                     threshold: float = 0.01) -> torch.Tensor:
+    """(H, W) bool tensor of pixels changed by more than `threshold`."""
+    diff = (before - after).abs().mean(dim=0)
+    return diff > threshold
+
+
+def _convex_hull_mask(pixels: torch.Tensor, H: int, W: int) -> torch.Tensor:
+    """(H, W) float32 binary mask = convex hull of `pixels`.
+
+    `pixels` is a (H, W) bool tensor marking affected pixels. Returns a
+    dense 0/1 mask covering the convex hull of those points. For <3 or
+    collinear points, falls back to the raw pixels.
+    """
+    mask = torch.zeros(H, W, dtype=torch.float32, device=pixels.device)
+    if not pixels.any():
+        return mask
+
+    ys, xs = pixels.nonzero(as_tuple=True)
+    pts = np.stack([xs.cpu().numpy(), ys.cpu().numpy()], axis=1).astype(np.float64)
+
+    if pts.shape[0] < 3:
+        mask[ys, xs] = 1.0
+        return mask
+    try:
+        hull = ConvexHull(pts)
+    except QhullError:
+        mask[ys, xs] = 1.0
+        return mask
+
+    verts = pts[hull.vertices]
+    poly = [(float(v[0]), float(v[1])) for v in verts]
+    img = Image.new('L', (W, H), 0)
+    ImageDraw.Draw(img).polygon(poly, outline=1, fill=1)
+    arr = np.asarray(img, dtype=np.float32)
+    return torch.from_numpy(arr).to(pixels.device)
 
 
 # Effects are applied in this fixed order. Channels present in
@@ -179,13 +226,16 @@ class CorruptionModule:
         soft_masks: Dict[str, torch.Tensor] = {
             name: torch.zeros(H, W, device=device) for name in CHANNEL_NAMES
         }
-        region_masks: Dict[str, torch.Tensor] = {
-            name: torch.zeros(H, W, device=device) for name in CHANNEL_NAMES
-        }
         for name in active:
-            soft_masks[name], region_masks[name] = self._sample_mask_for(
+            soft_masks[name], _ = self._sample_mask_for(
                 name, H, W, generator, device,
             )
+
+        # Per-channel affected-pixel accumulators (before/after diff).
+        affected: Dict[str, torch.Tensor] = {
+            name: torch.zeros(H, W, dtype=torch.bool, device=device)
+            for name in CHANNEL_NAMES
+        }
 
         out = image.clone()
         for name in PIPELINE_ORDER:
@@ -199,9 +249,15 @@ class CorruptionModule:
             if name == 'scratches':
                 # Hard cap so #scratches <= local_max_num exactly.
                 extra['max_count'] = int(self.types[name].get('local_max_num', 8))
+            before = out
             out = fn(out, m, generator=gen, **extra)
+            affected[name] = affected[name] | _affected_pixels(before, out)
 
-        mask_tensor = torch.stack([region_masks[name] for name in CHANNEL_NAMES], dim=0)
+        # Output mask = convex hull of each channel's actually-changed pixels.
+        mask_tensor = torch.stack(
+            [_convex_hull_mask(affected[name], H, W) for name in CHANNEL_NAMES],
+            dim=0,
+        )
         return out.clamp(0, 1), mask_tensor
 
     def corrupt_batch(self, images: torch.Tensor,
