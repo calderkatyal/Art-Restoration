@@ -1,29 +1,30 @@
 """Synthetic corruption module C(x) -> (y, M).
 
 Given a clean image x, produces a degraded image y and a multi-channel
-damage mask M in [0,1]^{K x H x W}.
+BINARY damage mask M in {0, 1}^{K x H x W} — each channel marks the
+exact pixels modified by that effect (channels may overlap).
 
-Corruption types (K=8 channels, in order):
-  0: cracks       -- Voronoi craquelure and/or linear structural cracks
-  1: paint_loss   -- flaking to substrate (crack-associated + user-region + edge-peeling)
-  2: yellowing    -- varnish yellowing (CIELAB a/b shift)
-  3: stains       -- water stains with tide lines and gravity-driven drip patterns
-  4: fading       -- photochemical bleaching / desaturation
-  5: bloom        -- haze / bloom from degraded varnish
-  6: deposits     -- grime / soot / salt efflorescence with corner/edge accumulation
-  7: scratches    -- surface scratches / abrasion marks
+Corruption channels (K=8, each a single visual appearance):
+  0: craquelure   -- Voronoi tessellation cracks from paint shrinkage
+  1: rip_tear     -- physical canvas tear with exposed substrate (local only)
+  2: paint_loss   -- blob-shaped paint loss with substrate reveal (local only)
+  3: yellowing    -- varnish yellowing (CIELAB a/b shift)
+  4: fading       -- photochemical desaturation / bleach
+  6: deposits     -- grime / soot darkening veil
+  7: scratches    -- thin linear abrasion marks (local only)
 
-downsample_mask() converts M from pixel resolution to latent resolution
-using max-pooling (kernel = stride = spatial_compression), so any
-damaged pixel within a block survives in M'.
+Per-sample mask generation is driven by src/corruption/configs/default.yaml.
+downsample_mask() converts M from pixel to latent resolution via max-pool.
 """
 
-from .module import CorruptionModule, downsample_mask
-from .presets import INDIVIDUAL_PRESETS, MULTI_PRESETS
+from .module import CorruptionModule, downsample_mask, PIPELINE_ORDER, EFFECT_FNS
+from .presets import CHANNEL_NAMES, NUM_CHANNELS
 
 __all__ = [
     "CorruptionModule",
     "downsample_mask",
-    "INDIVIDUAL_PRESETS",
-    "MULTI_PRESETS",
+    "CHANNEL_NAMES",
+    "NUM_CHANNELS",
+    "PIPELINE_ORDER",
+    "EFFECT_FNS",
 ]

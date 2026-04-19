@@ -1,13 +1,26 @@
 """Individual corruption effect implementations.
 
-All effects operate on (3, H, W) float32 tensors in [0, 1] with a
-(H, W) float32 mask in [0, 1] controlling per-pixel intensity.
+Each effect takes (3, H, W) float32 image in [0, 1] and a (H, W) float32
+SOFT mask in [0, 1] controlling per-pixel intensity, and returns the
+corrupted (3, H, W) image. The pipeline-level ROI (which pixels a human
+annotator would mark as damaged) is tracked by the mask generator, not
+by these functions. Each effect produces ONE visual appearance: no
+randomized mode selection inside the function.
+
+Channels:
+    craquelure  — Voronoi tessellation cracks (paint shrinkage craquelure).
+    rip_tear    — jagged tear with exposed canvas and shadow. Local only.
+    paint_loss  — blob-shaped paint flaking with substrate reveal.
+    yellowing   — varnish yellowing (CIELAB a/b offset).
+    fading      — photochemical desaturation / bleach.
+    deposits    — grime / soot darkening veil.
+    scratches   — thin linear abrasion marks. Local only.
 """
 
 import torch
 import torch.nn.functional as F
 import math
-from typing import Tuple
+from typing import Tuple, Optional
 
 from .color import rgb_to_lab, lab_to_rgb
 
@@ -17,13 +30,10 @@ from .color import rgb_to_lab, lab_to_rgb
 # ---------------------------------------------------------------------------
 
 def gaussian_blur_2d(field: torch.Tensor, sigma: float) -> torch.Tensor:
-    """Apply Gaussian blur to a 2D field (H, W) or (C, H, W).
-
-    Uses separable 1D convolutions for efficiency.
-    """
+    """Gaussian blur on (H, W) or (C, H, W) via separable 1D convolutions."""
     if sigma < 0.5:
         return field
-    ksize = int(math.ceil(sigma * 6)) | 1  # ensure odd
+    ksize = int(math.ceil(sigma * 6)) | 1
     ksize = max(3, ksize)
     x = torch.arange(ksize, dtype=field.dtype, device=field.device) - ksize // 2
     kernel_1d = torch.exp(-0.5 * (x / sigma) ** 2)
@@ -31,34 +41,27 @@ def gaussian_blur_2d(field: torch.Tensor, sigma: float) -> torch.Tensor:
 
     needs_batch = field.dim() == 2
     if needs_batch:
-        field = field.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        field = field.unsqueeze(0).unsqueeze(0)
     elif field.dim() == 3:
-        field = field.unsqueeze(0)  # (1, C, H, W)
+        field = field.unsqueeze(0)
 
     C = field.shape[1]
     pad = ksize // 2
-
-    # Horizontal
     kh = kernel_1d.view(1, 1, 1, ksize).expand(C, -1, -1, -1)
     out = F.conv2d(F.pad(field, (pad, pad, 0, 0), mode='reflect'), kh, groups=C)
-    # Vertical
     kv = kernel_1d.view(1, 1, ksize, 1).expand(C, -1, -1, -1)
     out = F.conv2d(F.pad(out, (0, 0, pad, pad), mode='reflect'), kv, groups=C)
 
     if needs_batch:
         return out.squeeze(0).squeeze(0)
-    else:
-        return out.squeeze(0)
+    return out.squeeze(0)
 
 
 def make_noise(H: int, W: int, blur_sigma: float,
                generator: torch.Generator = None,
                device: torch.device = None,
                normalize: bool = True) -> torch.Tensor:
-    """Generate smoothed noise field (H, W) in [0, 1].
-
-    Random noise → Gaussian blur → normalize to [0, 1].
-    """
+    """Smoothed noise field (H, W) in [0, 1]."""
     noise = torch.rand(H, W, generator=generator, device=device or torch.device('cpu'))
     noise = gaussian_blur_2d(noise, blur_sigma)
     if normalize:
@@ -69,7 +72,7 @@ def make_noise(H: int, W: int, blur_sigma: float,
 
 
 def box_blur_float(field: torch.Tensor, radius: int) -> torch.Tensor:
-    """Simple box blur on (H, W) field. Used for mask smoothing."""
+    """Box blur on (H, W) field. Used for mask smoothing."""
     if radius < 1:
         return field
     ksize = 2 * radius + 1
@@ -78,143 +81,161 @@ def box_blur_float(field: torch.Tensor, radius: int) -> torch.Tensor:
     return F.conv2d(F.pad(f, (radius, radius, radius, radius), mode='reflect'), kernel).squeeze(0).squeeze(0)
 
 
-# ---------------------------------------------------------------------------
-# Effect implementations
-# ---------------------------------------------------------------------------
+def _sample_canvas_color(image: torch.Tensor) -> Tuple[float, float, float]:
+    """Substrate color: 15% image mean blended with light canvas tone [215, 200, 175]/255."""
+    flat = image.view(3, -1)[:, ::40]
+    mr, mg, mb = flat[0].mean().item(), flat[1].mean().item(), flat[2].mean().item()
+    cr = min(1.0, mr * 0.15 + (215/255) * 0.85)
+    cg = min(1.0, mg * 0.15 + (200/255) * 0.85)
+    cb = min(1.0, mb * 0.15 + (175/255) * 0.85)
+    return cr, cg, cb
 
-def apply_linear_cracks(image: torch.Tensor, mask: torch.Tensor,
-                        generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply linear/structural cracks common in plaster and fresco.
 
-    Generates 1-3 long jagged lines traversing large portions of the image,
-    simulating structural cracks from wall movement. Each crack is a random
-    walk across the image with slight angular wandering and varying width.
+def _local_lum_boost(image: torch.Tensor, mask: torch.Tensor,
+                     min_val: float = 0.02,
+                     max_boost: float = 2.2) -> float:
+    """Return a luminance-aware strength multiplier.
 
-    Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
+    For effects that rely on darkening a thin structure (cracks, tears,
+    scratches), a pure multiplicative operation produces no visible change
+    on already-dark pixels. We measure the mean luminance of the masked
+    region and return a multiplier that boosts the effect strength for
+    dark regions.
+
+    Output range: ~1.0 for bright regions (lum ≥ 0.5), scaling up to
+    `max_boost` at lum → 0.
     """
-    C, H, W = image.shape
-    out = image.clone()
-    crack_mask = torch.zeros(H, W, device=image.device)
+    lum = image[0] * 0.299 + image[1] * 0.587 + image[2] * 0.114
+    w = (mask >= min_val).float()
+    if w.sum().item() < 1:
+        return 1.0
+    mean_lum = float((lum * w).sum().item() / w.sum().item())
+    # Piecewise: 1.0 at lum>=0.5, linear up to max_boost at lum=0.
+    t = max(0.0, min(1.0, (0.5 - mean_lum) / 0.5))
+    return 1.0 + (max_boost - 1.0) * t
 
-    mask_sum = mask.sum().item()
-    if mask_sum < 1:
-        return out, crack_mask
 
-    num_cracks = 1 + int(torch.randint(0, 3, (1,), generator=generator).item())
+def _mask_principal_angle(mask: torch.Tensor, min_val: float = 0.05) -> float:
+    """Return the angle (radians) of the mask's principal axis.
 
-    for _ in range(num_cracks):
-        # Pick start point near an edge
-        edge_side = int(torch.randint(0, 4, (1,), generator=generator).item())
-        if edge_side == 0:  # top
-            sx = int(torch.randint(0, W, (1,), generator=generator).item())
-            sy = int(torch.randint(0, max(1, H // 10), (1,), generator=generator).item())
-        elif edge_side == 1:  # bottom
-            sx = int(torch.randint(0, W, (1,), generator=generator).item())
-            sy = H - 1 - int(torch.randint(0, max(1, H // 10), (1,), generator=generator).item())
-        elif edge_side == 2:  # left
-            sx = int(torch.randint(0, max(1, W // 10), (1,), generator=generator).item())
-            sy = int(torch.randint(0, H, (1,), generator=generator).item())
-        else:  # right
-            sx = W - 1 - int(torch.randint(0, max(1, W // 10), (1,), generator=generator).item())
-            sy = int(torch.randint(0, H, (1,), generator=generator).item())
+    Used by rip_tear and scratches so the walker heads ALONG an
+    elongated mask rather than across it. For isotropic masks the
+    returned angle is arbitrary (the axis is ill-defined); that's fine
+    because the walker tolerates any direction inside a round blob.
+    """
+    active = mask >= min_val
+    if active.sum().item() < 10:
+        return 0.0
+    ys, xs = active.nonzero(as_tuple=True)
+    ys_f = ys.float()
+    xs_f = xs.float()
+    cx = xs_f.mean().item()
+    cy = ys_f.mean().item()
+    x_c = xs_f - cx
+    y_c = ys_f - cy
+    Sxx = float((x_c * x_c).mean().item())
+    Sxy = float((x_c * y_c).mean().item())
+    Syy = float((y_c * y_c).mean().item())
+    return 0.5 * math.atan2(2.0 * Sxy, Sxx - Syy)
 
-        # Initial angle pointing roughly toward center
-        cx_center, cy_center = W / 2.0, H / 2.0
-        angle = math.atan2(cy_center - sy, cx_center - sx)
-        # Add some randomness to initial angle
-        angle += (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.5
 
-        # Walk across image
-        px, py = float(sx), float(sy)
-        step_size = 2.0
-        max_steps = int(max(H, W) * 1.2)
+def _mask_component_centers(mask: torch.Tensor, min_val: float = 0.02):
+    """4-connectivity connected components on the active mask.
 
-        for step in range(max_steps):
-            # Random angular wandering
-            angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.3
-
-            px += math.cos(angle) * step_size
-            py += math.sin(angle) * step_size
-
-            ix, iy = int(round(px)), int(round(py))
-            if ix < 0 or ix >= W or iy < 0 or iy >= H:
-                break
-
-            # Check mask
-            if mask[iy, ix].item() < 0.05:
+    Returns a list of (cx, cy, size) tuples (one per component) sorted
+    by size descending. `cx`, `cy` are float centroids. Iterative BFS
+    on CPU using a bool grid — O(|active pixels|), fine for our small
+    masks (< ~10^5 active pixels per call).
+    """
+    active = (mask >= min_val).detach().cpu()
+    H, W = active.shape
+    visited = torch.zeros_like(active, dtype=torch.bool)
+    ys_all, xs_all = active.nonzero(as_tuple=True)
+    ys_list = ys_all.tolist()
+    xs_list = xs_all.tolist()
+    active_grid = active.tolist()  # nested Python lists for fast access
+    visited_grid = visited.tolist()
+    components = []
+    for idx in range(len(ys_list)):
+        y0 = ys_list[idx]; x0 = xs_list[idx]
+        if visited_grid[y0][x0]:
+            continue
+        stack = [(y0, x0)]
+        sx_sum = 0; sy_sum = 0; n = 0
+        while stack:
+            cy, cx = stack.pop()
+            if cy < 0 or cy >= H or cx < 0 or cx >= W:
                 continue
-
-            # Varying width (1-3 pixels)
-            width = 1 + int(torch.rand(1, generator=generator).item() * 2.5)
-            half_w = width // 2
-
-            for dy in range(-half_w, half_w + 1):
-                for dx in range(-half_w, half_w + 1):
-                    nx, ny = ix + dx, iy + dy
-                    if 0 <= nx < W and 0 <= ny < H:
-                        m_val = mask[ny, nx].item()
-                        if m_val > 0.05:
-                            # Darken along crack
-                            k = 1.0 - 0.55 * m_val
-                            out[0, ny, nx] *= k
-                            out[1, ny, nx] *= k
-                            out[2, ny, nx] *= k
-                            crack_mask[ny, nx] = 1.0
-
-    return out, crack_mask
+            if visited_grid[cy][cx] or not active_grid[cy][cx]:
+                continue
+            visited_grid[cy][cx] = True
+            sx_sum += cx; sy_sum += cy; n += 1
+            stack.append((cy + 1, cx))
+            stack.append((cy - 1, cx))
+            stack.append((cy, cx + 1))
+            stack.append((cy, cx - 1))
+        if n > 0:
+            components.append((sx_sum / n, sy_sum / n, n))
+    components.sort(key=lambda c: -c[2])
+    return components
 
 
-def apply_cracks(image: torch.Tensor, mask: torch.Tensor,
-                 generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply craquelure cracks — Voronoi, linear, or mixed.
+def _sample_point_in_mask(mask: torch.Tensor,
+                          generator: torch.Generator,
+                          min_val: float = 0.05,
+                          max_attempts: int = 300
+                          ) -> Optional[Tuple[int, int]]:
+    """Rejection-sample a point (x, y) whose mask value is above min_val.
 
-    Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
+    Used by rip_tear and scratches so they originate inside the masked
+    region. Returns None if no point passes rejection.
 
-    ~30% chance of linear-only cracks, ~15% chance of mixed (both linear
-    and Voronoi), ~55% chance of Voronoi-only. Linear cracks simulate
-    structural damage from wall movement. Voronoi cracks simulate age
-    craquelure from paint drying/shrinkage.
+    Severity invariance: acceptance is `rand < m / m_max` rather than
+    `rand < m`. This way the same generator state produces the same
+    sequence of accepted points regardless of the severity used when
+    building `mask` (because mask values scale uniformly with severity,
+    so `m / m_max` is the same ratio at each pixel).
     """
-    roll = torch.rand(1, generator=generator).item()
-
-    if roll < 0.30:
-        # Linear cracks only
-        return apply_linear_cracks(image, mask, generator=generator)
-    elif roll < 0.45:
-        # Mixed: apply linear first, then Voronoi on top
-        out, crack_mask = apply_linear_cracks(image, mask, generator=generator)
-        out, voronoi_mask = _apply_voronoi_cracks(out, mask, generator=generator)
-        crack_mask = (crack_mask + voronoi_mask).clamp(max=1.0)
-        return out, crack_mask
-    else:
-        # Voronoi only (original behavior)
-        return _apply_voronoi_cracks(image, mask, generator=generator)
+    H, W = mask.shape
+    mcpu = mask.detach().cpu()
+    m_max = max(float(mcpu.max().item()), 1e-6)
+    for _ in range(max_attempts):
+        x = int(torch.randint(0, W, (1,), generator=generator).item())
+        y = int(torch.randint(0, H, (1,), generator=generator).item())
+        m = mcpu[y, x].item()
+        if m < min_val:
+            continue
+        if torch.rand(1, generator=generator).item() < m / m_max:
+            return x, y
+    return None
 
 
-def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
-                          generator: torch.Generator = None) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply Voronoi craquelure cracks.
+# ---------------------------------------------------------------------------
+# Cracks
+# ---------------------------------------------------------------------------
 
-    Returns (corrupted_image, crack_mask) where crack_mask is binary (H, W).
+def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
+                     generator: torch.Generator = None) -> torch.Tensor:
+    """Craquelure: Voronoi tessellation cracks from age / paint-drying shrinkage.
 
-    Voronoi tessellation with nearest-two-site distance difference for
-    edge detection. Grid-based spatial lookup for minimum site spacing.
-    Edge width scales with cell size.
+    Nearest-two-site distance difference detects tessellation edges.
+    Grid-based spatial lookup enforces minimum site spacing; edge width
+    scales with cell size.
     """
     C, H, W = image.shape
     out = image.clone()
-    crack_mask = torch.zeros(H, W, device=image.device)
 
     mask_sum = mask.sum().item()
     if mask_sum < 1:
-        return out, crack_mask
+        return out
 
-    mean_mask = mask_sum / (H * W)
-    target = max(40, int(mean_mask * H * W / 200))
+    # Cell size is a FIXED function of image area — independent of severity.
+    # Severity controls line darkness (below), not tessellation density, so
+    # "intensity 0.01" and "intensity 1.0" produce the same cell layout.
+    target = max(40, int(H * W / 200))
     min_dist = 8
     min_dist2 = min_dist * min_dist
 
-    # Grid-based spatial lookup
     grid_cell = min_dist
     grid_w = math.ceil(W / grid_cell)
     grid_h = math.ceil(H / grid_cell)
@@ -222,6 +243,11 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
 
     sites = []
     mask_np = mask.cpu()
+    # Normalize placement probability by mask max so that the SAME RNG
+    # stream produces the same site pattern regardless of severity. Without
+    # this the acceptance rate scales with severity (low sev → more
+    # attempts → different generator state by the time `target` is met).
+    m_max = max(float(mask_np.max().item()), 1e-6)
     attempts = 0
     max_attempts = target * 50
 
@@ -230,7 +256,7 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
         x = int(torch.randint(0, W, (1,), generator=generator).item())
         y = int(torch.randint(0, H, (1,), generator=generator).item())
         m = mask_np[y, x].item()
-        if torch.rand(1, generator=generator).item() < m:
+        if torch.rand(1, generator=generator).item() < m / m_max:
             gx = x // grid_cell
             gy = y // grid_cell
             too_close = False
@@ -252,16 +278,24 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
                 grid[gy * grid_w + gx].append((x, y))
 
     if len(sites) < 2:
-        return out, crack_mask
+        return out
 
-    # Convert sites to tensor for vectorized distance computation
-    sites_t = torch.tensor(sites, dtype=torch.float32, device=image.device)  # (N, 2)
+    sites_t = torch.tensor(sites, dtype=torch.float32, device=image.device)
 
-    # Process in chunks to avoid OOM on large images
+    # Luminance-aware boost so crack lines remain visible on dark
+    # regions of the painting (Mona Lisa backgrounds, etc.). Kept mild
+    # here because cracks already cover a wide area — strong boosts
+    # cause cracks to dominate the composition on darker paintings.
+    lum_boost = _local_lum_boost(image, mask, min_val=0.02, max_boost=1.6)
+
+    # Dark ground-layer color that shows through a crack. Blending toward
+    # this color (rather than pure multiplicative darkening) keeps the
+    # crack visible on already-dark pixels where `pixel * k` is invisible.
+    cr, cg, cb = 0.06, 0.05, 0.04
+
     chunk_size = 4096
-    out_flat = out.view(3, -1).clone()  # (3, H*W)
+    out_flat = out.view(3, -1).clone()
     mask_flat = mask.view(-1)
-    crack_flat = crack_mask.view(-1)
 
     for start in range(0, H * W, chunk_size):
         end = min(start + chunk_size, H * W)
@@ -269,9 +303,9 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
         ys = indices // W
         xs = indices % W
 
-        # Skip pixels with low mask
         m_vals = mask_flat[start:end]
-        active = m_vals >= 20.0 / 255.0
+        # Low threshold so that severity=0.01 (effective ~0.3) still paints.
+        active = m_vals >= 0.02
         if not active.any():
             continue
 
@@ -279,18 +313,15 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
         ax = xs[active_idx].float()
         ay = ys[active_idx].float()
 
-        # Distances to all sites: (num_active, num_sites)
         dx = ax.unsqueeze(1) - sites_t[:, 0].unsqueeze(0)
         dy = ay.unsqueeze(1) - sites_t[:, 1].unsqueeze(0)
         dists = dx ** 2 + dy ** 2
 
-        # Find two nearest sites
         top2 = dists.topk(2, dim=1, largest=False)
         sd1 = top2.values[:, 0].sqrt()
         sd2 = top2.values[:, 1].sqrt()
         diff = sd2 - sd1
 
-        # Edge width proportional to cell size
         edge_width = (sd1 * 0.12).clamp(max=0.8)
         is_edge = (diff < edge_width) & (sd1 > 1.5)
 
@@ -300,363 +331,466 @@ def _apply_voronoi_cracks(image: torch.Tensor, mask: torch.Tensor,
             a = m_vals[edge_idx]
             d = diff[is_edge]
             ew = edge_width[is_edge]
-            k = 1.0 - 0.55 * a * (1.0 - d / ew)
+            # Alpha toward dark ground color: shaped by edge gradient,
+            # scaled by mask intensity^1.3 (super-linear), mildly boosted
+            # on dark regions. Super-linear severity response gives a bit
+            # darker cracks at high m (local sev=1.0) and a bit lighter
+            # at low m (global sev=0.01) without changing the inverse.
+            # At m=0.3: alpha base ≈ 0.21 (was 0.23, slightly lighter).
+            # At m=1.0: alpha base ≈ 0.52 (was 0.42, ~24% darker).
+            # Raise alpha floor from 0.12 → 0.18 so sev=0.01 (a=0.3)
+            # gives alpha_base ≈ 0.25 (was ~0.21) and is visible on
+            # dark content; keep alpha at a=1.0 unchanged (0.18+0.34=0.52).
+            alpha = ((0.18 + 0.34 * a ** 1.3) * (1.0 - d / ew) * lum_boost).clamp(max=1.0)
+            inv = 1.0 - alpha
 
-            out_flat[0, global_idx] *= k
-            out_flat[1, global_idx] *= k
-            out_flat[2, global_idx] *= k
-            crack_flat[global_idx] = 1.0
+            out_flat[0, global_idx] = out_flat[0, global_idx] * inv + cr * alpha
+            out_flat[1, global_idx] = out_flat[1, global_idx] * inv + cg * alpha
+            out_flat[2, global_idx] = out_flat[2, global_idx] * inv + cb * alpha
 
     out = out_flat.view(3, H, W)
-    crack_mask = crack_flat.view(H, W)
-    return out, crack_mask
+    return out
 
 
-def apply_paint_loss_crack(image: torch.Tensor, mask: torch.Tensor,
-                           crack_mask: torch.Tensor,
-                           generator: torch.Generator = None) -> torch.Tensor:
-    """Crack-associated paint loss: flakes along crack edges.
+def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
+                     sx: float, sy: float, start_angle: float,
+                     max_w: float, max_steps: int,
+                     generator: torch.Generator) -> None:
+    """Walk a tear spine from (sx, sy) along `start_angle` painting a
+    variable-width pure-black opening (canvas separation).
 
-    Blur crack mask for organic falloff, smooth noise for flake regions,
-    replace with substrate color.
+    - Interior is pure black (0,0,0) at full opacity — the painting is
+      physically separated, no underlying paint shows through.
+    - Edge offsets follow a slow random-walk (coherent jagged boundary)
+      rather than independent per-step noise (which produced the
+      pixel-scribble look). One RNG draw per step keeps the walker path
+      severity-invariant.
+    - Width tapers parabolically at the ends and drifts along the spine.
+    - A 1-pixel-wide darkened "lip" just outside the gash sells the
+      paint-pulled-apart appearance without bleeding into the interior.
+    """
+    _, H, W = out.shape
+    angle = start_angle
+    px, py = sx, sy
+    step_size = 1.0
+    out_streak = 0
+
+    # Random-walk width, initialized in the upper half of the allowed range.
+    w_now = max_w * (0.6 + 0.4 * torch.rand(1, generator=generator).item())
+    w_min = max(0.5, max_w * 0.35)
+    w_max = max_w * 1.15
+
+    # Slow random-walk edge offsets. Each step they nudge ±a small amount,
+    # producing coherent jagged boundaries instead of noisy per-step jitter.
+    edge_off_r = 0.0
+    edge_off_l = 0.0
+    edge_walk_step = max(0.06, max_w * 0.06)
+    edge_off_clip = max(0.30, max_w * 0.30)
+
+    for step in range(max_steps):
+        # Parabolic taper 0..1..0 across the walk.
+        t = step / max(1, max_steps - 1)
+        taper = max(0.20, 1.0 - (2.0 * t - 1.0) ** 2)
+
+        # Tear-like angular wander — small per step so the spine reads
+        # as a coherent line / gentle curve rather than a scribble.
+        angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.10
+
+        # Smooth width drift (random walk with bounds).
+        dw = (torch.rand(1, generator=generator).item() - 0.5) * max_w * 0.14
+        w_now = max(w_min, min(w_max, w_now + dw))
+
+        # Slow-walk edge offsets (one RNG draw each side, per step).
+        edge_off_r += (torch.rand(1, generator=generator).item() - 0.5) * edge_walk_step
+        edge_off_l += (torch.rand(1, generator=generator).item() - 0.5) * edge_walk_step
+        edge_off_r = max(-edge_off_clip, min(edge_off_clip, edge_off_r))
+        edge_off_l = max(-edge_off_clip, min(edge_off_clip, edge_off_l))
+
+        px += math.cos(angle) * step_size
+        py += math.sin(angle) * step_size
+
+        ix, iy = int(round(px)), int(round(py))
+        if ix < 0 or ix >= W or iy < 0 or iy >= H:
+            break
+        if mask[iy, ix].item() < 0.02:
+            out_streak += 1
+            if out_streak > 6:
+                break
+            continue
+        out_streak = 0
+
+        # Spine direction (cos_a, sin_a) and perpendicular (cos_p, sin_p).
+        cos_a = math.cos(angle)
+        sin_a = math.sin(angle)
+        perp_ang = angle + math.pi / 2
+        cos_p = math.cos(perp_ang)
+        sin_p = math.sin(perp_ang)
+
+        w_eff = w_now * taper
+        edge_r_eff = max(0.0, w_eff + edge_off_r)
+        edge_l_eff = max(0.0, w_eff + edge_off_l)
+        # 2D bounding box; +5 for shadow lip + curl highlight.
+        max_e = int(math.ceil(max(edge_r_eff, edge_l_eff))) + 5
+
+        for dy in range(-max_e, max_e + 1):
+            ny = iy + dy
+            if ny < 0 or ny >= H:
+                continue
+            for dx in range(-max_e, max_e + 1):
+                nx = ix + dx
+                if nx < 0 or nx >= W:
+                    continue
+                if mask[ny, nx].item() < 0.02:
+                    continue
+                # Signed distances in spine frame.
+                ox = (nx + 0.5) - px
+                oy = (ny + 0.5) - py
+                d_par = ox * cos_a + oy * sin_a       # along spine
+                d_perp = ox * cos_p + oy * sin_p      # across spine
+                # Only paint pixels whose along-spine offset is within
+                # ±0.6 step of this spine point — adjacent steps cover
+                # the rest. Keeps strips non-overlapping & solid.
+                if abs(d_par) > 0.6:
+                    continue
+                ad = abs(d_perp)
+                edge_lim = edge_r_eff if d_perp > 0 else edge_l_eff
+                if ad <= edge_lim:
+                    # Interior: pure black, full opacity.
+                    out[0, ny, nx] = 0.0
+                    out[1, ny, nx] = 0.0
+                    out[2, ny, nx] = 0.0
+                elif ad <= edge_lim + 2.0 and edge_lim > 0.5:
+                    # Shadow band — underside of paint that has lifted up
+                    # at the tear edge. Multiplicative darken preserves
+                    # underlying hue.
+                    lip_t = (ad - edge_lim) / 2.0
+                    darken = 0.18 + 0.55 * lip_t
+                    out[0, ny, nx] = out[0, ny, nx] * darken
+                    out[1, ny, nx] = out[1, ny, nx] * darken
+                    out[2, ny, nx] = out[2, ny, nx] * darken
+                elif ad <= edge_lim + 4.0 and edge_lim > 0.5:
+                    # Highlight band — top of the curled-up paint
+                    # catching the light. Warm off-white blended with low
+                    # alpha, peaking at the inner edge of the band.
+                    hl_t = (ad - (edge_lim + 2.0)) / 2.0   # 0..1
+                    hl_a = 0.22 * (1.0 - hl_t)             # peak at inner
+                    inv = 1.0 - hl_a
+                    out[0, ny, nx] = out[0, ny, nx] * inv + 0.96 * hl_a
+                    out[1, ny, nx] = out[1, ny, nx] * inv + 0.93 * hl_a
+                    out[2, ny, nx] = out[2, ny, nx] * inv + 0.86 * hl_a
+
+
+def _paint_tear_puncture(out: torch.Tensor, mask: torch.Tensor,
+                         cx: float, cy: float, radius: float,
+                         generator: torch.Generator) -> None:
+    """Paint a small irregular pure-black hole (puncture-style tear).
+
+    Interior is fully zeroed (paint physically missing). A 1.5px darkened
+    lip just outside the hole sells the torn-edge appearance.
+    """
+    _, H, W = out.shape
+    ri = int(math.ceil(radius)) + 5
+    # Random radial envelope sampled at 16 angles, interpolated in-between.
+    n_samples = 16
+    r_profile = [
+        radius * (0.70 + 0.50 * torch.rand(1, generator=generator).item())
+        for _ in range(n_samples)
+    ]
+
+    cxi, cyi = int(round(cx)), int(round(cy))
+    for dy in range(-ri, ri + 1):
+        ny = cyi + dy
+        if ny < 0 or ny >= H:
+            continue
+        for dx in range(-ri, ri + 1):
+            nx = cxi + dx
+            if nx < 0 or nx >= W:
+                continue
+            if mask[ny, nx].item() < 0.02:
+                continue
+            dist = math.hypot(dx, dy)
+            if dist < 1e-6:
+                r_here = r_profile[0]
+            else:
+                ang = math.atan2(dy, dx)  # -pi..pi
+                idx_f = ((ang + math.pi) / (2 * math.pi)) * n_samples
+                i0 = int(idx_f) % n_samples
+                i1 = (i0 + 1) % n_samples
+                frac = idx_f - int(idx_f)
+                r_here = r_profile[i0] * (1 - frac) + r_profile[i1] * frac
+
+            if dist <= r_here:
+                # Interior: pure black, fully opaque.
+                out[0, ny, nx] = 0.0
+                out[1, ny, nx] = 0.0
+                out[2, ny, nx] = 0.0
+            elif dist <= r_here + 2.0 and r_here > 0.5:
+                # Shadow band under lifted paint.
+                lip_t = (dist - r_here) / 2.0
+                darken = 0.18 + 0.55 * lip_t
+                out[0, ny, nx] = out[0, ny, nx] * darken
+                out[1, ny, nx] = out[1, ny, nx] * darken
+                out[2, ny, nx] = out[2, ny, nx] * darken
+            elif dist <= r_here + 4.0 and r_here > 0.5:
+                # Highlight on top of curled paint.
+                hl_t = (dist - (r_here + 2.0)) / 2.0
+                hl_a = 0.22 * (1.0 - hl_t)
+                inv = 1.0 - hl_a
+                out[0, ny, nx] = out[0, ny, nx] * inv + 0.96 * hl_a
+                out[1, ny, nx] = out[1, ny, nx] * inv + 0.93 * hl_a
+                out[2, ny, nx] = out[2, ny, nx] * inv + 0.86 * hl_a
+
+
+def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
+                   generator: torch.Generator = None) -> torch.Tensor:
+    """Physical rip / tear — elongated dark opening with jagged edges.
+
+    Approach:
+        1. Sample a start point INSIDE the mask blob.
+        2. Pick a shape mode:
+             - line (default, ~70%): bidirectional walk from the start.
+             - branched (~20%): bidirectional walk PLUS a sub-branch
+               coming off at a random perpendicular-ish angle — common
+               real-world feature when a tear forks around a weak spot.
+             - puncture (~10%): small irregular hole only, no elongation
+               — models a localized puncture / small detachment.
+        3. For each walked segment, paint a variable-width jagged opening
+           via `_walk_tear_spine` (see docstring there).
+
+    Severity governs OPENING WIDTH, not darkness: small tears are thin
+    dark slits, large tears are wide dark gashes, and the interior color
+    is ≈ the same in both regimes.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    if crack_mask.sum() < 1 or mask.sum() < 1:
+    if mask.sum().item() < 1:
         return out
 
-    # Sample canvas/substrate color
-    cr, cg, cb = _sample_canvas_color(image)
+    active_mask = mask >= 0.02
+    if not active_mask.any():
+        return out
 
-    # Blur crack mask for organic falloff
-    flake_field = gaussian_blur_2d(crack_mask, 3.0)
+    ys_active, xs_active = active_mask.nonzero(as_tuple=True)
+    y_lo, y_hi = int(ys_active.min()), int(ys_active.max())
+    x_lo, x_hi = int(xs_active.min()), int(xs_active.max())
+    bbox_diag = float(((y_hi - y_lo) ** 2 + (x_hi - x_lo) ** 2) ** 0.5)
+    if bbox_diag < 4.0:
+        return out
 
-    # Smooth noise field
-    noise_field = make_noise(H, W, 4.0, generator=generator, device=image.device)
+    # Severity scale from the user-facing mask magnitude. `mask.max()`
+    # ranges from ≈0.3 (severity 0.01) to 1.0 (severity 1.0) because of
+    # `_effective_severity`. We remap to [0, 1].
+    sev_scale = float(mask.max().item())
+    sev_norm = max(0.0, min(1.0, (sev_scale - 0.3) / 0.7))
 
-    for i_y in range(H):
-        for i_x in range(W):
-            ff = flake_field[i_y, i_x].item()
-            if ff < 0.05:
+    # Width scales with severity. Floor raised to 3.5px so a low-severity
+    # tear renders as a clearly visible thin slit (the previous 2.5 was
+    # on the edge of disappearing into anti-aliasing at typical preview
+    # sizes). sev_norm=0 -> max_w=3.5, sev_norm=1 -> max_w=18.
+    max_w = 3.5 + sev_norm * 14.5
+
+    # Walker length is driven by the mask bbox — we walk enough to traverse
+    # the full mask and rely on the mask-clip in `_walk_tear_spine` (which
+    # bails after wandering 6+ steps outside mask) to stop naturally.
+    # Floor raised from 15 to 25 so a low-sev tear is reliably elongated
+    # (thin but visible) rather than appearing as a tiny dot.
+    steps_per_dir = max(25, int(bbox_diag * 0.60))
+
+    # Find every connected component of the mask and guarantee at least
+    # one tear per component so a 2-region mask never renders with only
+    # a single tear visible.
+    components = _mask_component_centers(mask, min_val=0.02)
+    extra = int(torch.randint(0, 2, (1,), generator=generator).item())
+    num_tears = max(len(components), 1) + extra
+
+    # Reserve one index for a forced-line tear so at least one tear is
+    # always an elongated slit — otherwise the RNG could pick puncture
+    # for every tear at low sev and leave the effect nearly invisible.
+    forced_line_idx = int(torch.randint(0, num_tears, (1,), generator=generator).item())
+
+    for t_idx in range(num_tears):
+        if t_idx < len(components):
+            # First N tears: start at each component's centroid.
+            cx_c, cy_c, _size = components[t_idx]
+            sx, sy = float(cx_c), float(cy_c)
+            if mask[int(round(sy)), int(round(sx))].item() < 0.02:
+                # Centroid fell in a concavity — fall back to sampling.
+                alt = _sample_point_in_mask(mask, generator, min_val=0.05)
+                if alt is None:
+                    continue
+                sx, sy = float(alt[0]), float(alt[1])
+        else:
+            start = _sample_point_in_mask(mask, generator, min_val=0.05)
+            if start is None:
                 continue
-            um = mask[i_y, i_x].item()
-            if um < 0.05:
-                continue
-            nv = noise_field[i_y, i_x].item()
-            combined = ff * um
-            threshold = combined * 0.5
-            if nv > threshold + 0.25:
-                continue
-            edge = 1.0 - max(0.0, min(1.0, (nv - threshold) / 0.25))
-            a = min(0.95, combined * edge)
-            if a < 0.02:
-                continue
-            j = (torch.rand(1, generator=generator).item() - 0.5) * 12.0 / 255.0
-            out[0, i_y, i_x] = out[0, i_y, i_x] * (1 - a) + (cr + j) * a
-            out[1, i_y, i_x] = out[1, i_y, i_x] * (1 - a) + (cg + j) * a
-            out[2, i_y, i_x] = out[2, i_y, i_x] * (1 - a) + (cb + j) * a
+            sx, sy = float(start[0]), float(start[1])
+
+        # Pick shape mode for this tear.
+        if t_idx == forced_line_idx:
+            shape_mode = 'line'
+        else:
+            shape_rand = torch.rand(1, generator=generator).item()
+            # Puncture probability scales from 0 at the lowest severity
+            # (a 3-4px hole is too small to read as a puncture) up to
+            # 10% at the highest severity.
+            punct_p = 0.10 * sev_norm
+            if shape_rand < punct_p:
+                shape_mode = 'puncture'
+            elif shape_rand < punct_p + 0.20:
+                shape_mode = 'branched'
+            else:
+                shape_mode = 'line'
+
+        if shape_mode == 'puncture':
+            # Irregular hole only. Slightly larger than half max_w so it
+            # reads as a distinct hole rather than a tiny dot.
+            radius = max(2.5, max_w * 0.9)
+            _paint_tear_puncture(
+                out, mask, sx, sy, radius, generator,
+            )
+            continue
+
+        # Align the tear spine with the mask's principal axis so the
+        # walker heads down the long side of a narrow band rather than
+        # immediately exiting it. Add ±0.25 rad of jitter for variety.
+        mask_axis = _mask_principal_angle(mask)
+        base_angle = mask_axis + (torch.rand(1, generator=generator).item() - 0.5) * 0.50
+
+        # Bidirectional main axis.
+        for direction in (0.0, math.pi):
+            _walk_tear_spine(
+                out, mask,
+                sx, sy, base_angle + direction,
+                max_w, steps_per_dir, generator,
+            )
+
+        if shape_mode == 'branched':
+            # Perpendicular-ish branch, up to ~60° off perpendicular,
+            # half the length and width for a secondary rip.
+            branch_offset = (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.6
+            branch_angle = base_angle + math.pi / 2 + branch_offset
+            _walk_tear_spine(
+                out, mask,
+                sx, sy, branch_angle,
+                max_w * 0.65, max(20, steps_per_dir // 2),
+                generator,
+            )
 
     return out.clamp(0, 1)
 
 
-def apply_paint_loss_region(image: torch.Tensor, mask: torch.Tensor,
-                            generator: torch.Generator = None) -> torch.Tensor:
-    """Paint loss in user-defined regions (not crack-associated).
+# ---------------------------------------------------------------------------
+# Paint loss
+# ---------------------------------------------------------------------------
 
-    Two noise scales for patch shapes and ragged edges, threshold
-    from mask intensity. ~30% chance of edge-peeling mode where paint
-    loss follows edges/corners, peeling inward from painting borders.
+def apply_paint_loss(image: torch.Tensor, mask: torch.Tensor,
+                     generator: torch.Generator = None) -> torch.Tensor:
+    """Paint loss — fill the entire masked ROI with substrate color.
+
+    The mask defines the whole affected patch; the effect replaces paint
+    with a slightly textured substrate (warm canvas tone) across the
+    whole region. A narrow rim just INSIDE the boundary is darkened to
+    read as a small cavity / lifted edge. Severity controls how opaque
+    the substrate reveal is (low sev ≈ partial thinning, high sev ≈
+    total loss).
     """
     C, H, W = image.shape
     out = image.clone()
 
-    if mask.sum() < 1:
-        return out
-
-    cr, cg, cb = _sample_canvas_color(image)
-
-    # ~30% chance of edge-peeling mode
-    edge_peel = torch.rand(1, generator=generator).item() < 0.30
-    if edge_peel:
-        # Create gradient mask strongest at edges/corners
-        y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
-        x_coords = torch.arange(W, device=image.device).float().unsqueeze(0).expand(H, W)
-
-        # Distance from each border, normalized to [0, 1]
-        dist_top = y_coords / H
-        dist_bot = (H - 1 - y_coords) / H
-        dist_left = x_coords / W
-        dist_right = (W - 1 - x_coords) / W
-
-        # Minimum distance to any edge
-        edge_dist = torch.min(torch.min(dist_top, dist_bot), torch.min(dist_left, dist_right))
-
-        # Edge gradient: strong near edges, fading inward
-        # Max peel depth ~20% of image dimension
-        peel_depth = 0.15 + torch.rand(1, generator=generator).item() * 0.10
-        edge_gradient = (1.0 - (edge_dist / peel_depth).clamp(max=1.0))
-
-        # Corners get extra boost (product of two edge proximities)
-        corner_boost = (1.0 - (dist_top / peel_depth).clamp(max=1.0)) * \
-                       (1.0 - (dist_left / peel_depth).clamp(max=1.0)) + \
-                       (1.0 - (dist_top / peel_depth).clamp(max=1.0)) * \
-                       (1.0 - (dist_right / peel_depth).clamp(max=1.0)) + \
-                       (1.0 - (dist_bot / peel_depth).clamp(max=1.0)) * \
-                       (1.0 - (dist_left / peel_depth).clamp(max=1.0)) + \
-                       (1.0 - (dist_bot / peel_depth).clamp(max=1.0)) * \
-                       (1.0 - (dist_right / peel_depth).clamp(max=1.0))
-        corner_boost = corner_boost.clamp(max=1.0) * 0.4
-
-        edge_gradient = (edge_gradient + corner_boost).clamp(max=1.0)
-
-        # Use noise to make peeling boundary irregular
-        peel_noise = make_noise(H, W, 6.0, generator=generator, device=image.device)
-        edge_gradient = edge_gradient * (0.5 + 0.5 * peel_noise)
-
-        # Combine with user mask
-        mask = (mask * edge_gradient).clamp(0, 1)
-
-    # Low-frequency noise (patch shapes)
-    noise_low = make_noise(H, W, 10.0, generator=generator, device=image.device)
-    # High-frequency noise (edge irregularity)
-    noise_hi = make_noise(H, W, 2.0, generator=generator, device=image.device, normalize=False)
-
-    # Compute flake field
-    m = mask  # (H, W)
-    thresh = (m * m * 0.4 + m * 0.58).clamp(max=0.995)
-    sample = noise_low - (noise_hi - 0.5) * 0.22 * m
-    is_flake = (sample < thresh) & (m >= 0.04)
-
-    depth = ((thresh - sample) / thresh.clamp(min=0.02)).clamp(0, 1)
-    flake = (depth * (0.3 + 0.7 * m)).clamp(0, 1) * is_flake.float()
-
-    # Render: replace with substrate
-    active = flake >= 0.04
+    active = mask >= 0.02
     if not active.any():
         return out
 
-    a = (flake * 1.05).clamp(0, 1)
-    # Rim darkening
-    rim = torch.where((flake > 0.1) & (flake < 0.5),
-                      (1.0 - (flake - 0.3).abs() / 0.2) * 0.35, torch.zeros_like(flake))
+    cr, cg, cb = _sample_canvas_color(image)
+    m = mask.clamp(0, 1)
 
-    j = (torch.rand(H, W, generator=generator, device=image.device) - 0.5) * 18.0 / 255.0
+    # Substrate texture: tiny per-pixel jitter so the filled area doesn't
+    # look like a flat decal.
+    j = (torch.rand(H, W, generator=generator, device=image.device) - 0.5) * 20.0 / 255.0
+
+    # Inside-rim darkening: erode the mask by 2 px, difference with the
+    # raw mask is a 2-px-wide interior ring; darken this ring lightly.
+    af = active.float()
+    eroded = F.max_pool2d(-af.unsqueeze(0).unsqueeze(0), kernel_size=5,
+                          stride=1, padding=2).squeeze()
+    eroded = (-eroded).clamp(min=0)
+    rim = (af - eroded).clamp(min=0) * 0.35  # ~0.35 darken at rim
+
+    # Substrate opacity scales super-linearly with mask so low severity
+    # (m~0.3 peak, distance-decayed interior) reads as faint paint
+    # thinning rather than a clear hole, while high severity still
+    # opens up to full substrate reveal.
+    #   m=0.15 (sev≈0.01 mid-shape) → 0.06  (barely perceptible)
+    #   m=0.30 (sev≈0.01 interior)  → 0.16  (faint)
+    #   m=0.70 (sev≈1.0 mid-shape)  → 0.58
+    #   m=1.00 (sev=1.0 interior)   → 1.00
+    a_sub = (m ** 1.5).clamp(max=1.0) * af
     tr = ((cr + j) * (1.0 - rim)).clamp(0, 1)
     tg = ((cg + j) * (1.0 - rim)).clamp(0, 1)
     tb = ((cb + j) * (1.0 - rim)).clamp(0, 1)
 
-    out[0] = torch.where(active, out[0] * (1 - a) + tr * a, out[0])
-    out[1] = torch.where(active, out[1] * (1 - a) + tg * a, out[1])
-    out[2] = torch.where(active, out[2] * (1 - a) + tb * a, out[2])
+    out[0] = out[0] * (1.0 - a_sub) + tr * a_sub
+    out[1] = out[1] * (1.0 - a_sub) + tg * a_sub
+    out[2] = out[2] * (1.0 - a_sub) + tb * a_sub
 
     return out.clamp(0, 1)
 
+
+# ---------------------------------------------------------------------------
+# Optical / surface effects
+# ---------------------------------------------------------------------------
 
 def apply_yellowing(image: torch.Tensor, mask: torch.Tensor,
                     generator: torch.Generator = None) -> torch.Tensor:
-    """Varnish yellowing via CIELAB a/b shift.
+    """Varnish yellowing via positive CIELAB a/b offset.
 
-    Smooth mask, noise-modulated positive offsets to a and b channels.
+    Applied with a hard mask boundary — the effect fills the full ROI
+    and does not bleed past the binary region.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth the mask
-    field = box_blur_float(mask, 25)
-    # Noise field
-    noise = make_noise(H, W, 30.0, generator=generator, device=image.device, normalize=False)
-
-    active = field > 0.01
+    active = mask > 0.01
     if not active.any():
         return out
 
-    # Convert to LAB: need (H, W, 3)
-    rgb_hwc = out.permute(1, 2, 0)  # (H, W, 3)
+    noise = make_noise(H, W, 30.0, generator=generator, device=image.device, normalize=False)
+
+    rgb_hwc = out.permute(1, 2, 0)
     lab = rgb_to_lab(rgb_hwc)
 
-    m = field
-    offset_b = (16.0 + 36.0 * noise) * m  # toward yellow
-    offset_a = (4.0 + 12.0 * noise) * m   # slight reddish
+    m = mask.clamp(max=1.0)
+    m_resp = m * m.sqrt()
+    offset_b = (16.0 + 36.0 * noise) * m_resp
+    offset_a = (4.0 + 12.0 * noise) * m_resp
 
-    lab[..., 1] = lab[..., 1] + offset_a * active.float()
-    lab[..., 2] = lab[..., 2] + offset_b * active.float()
+    af = active.float()
+    lab[..., 1] = lab[..., 1] + offset_a * af
+    lab[..., 2] = lab[..., 2] + offset_b * af
 
     rgb_out = lab_to_rgb(lab)
-    out = rgb_out.permute(2, 0, 1).clamp(0, 1)
-    return out
-
-
-def apply_stains(image: torch.Tensor, mask: torch.Tensor,
-                 generator: torch.Generator = None) -> torch.Tensor:
-    """Water stains with tide lines.
-
-    Elliptical stain blobs with brown interior and darker tide-line ring
-    at evaporation edge.
-    """
-    C, H, W = image.shape
-    out = image.clone()
-
-    mask_sum = mask.sum().item()
-    if mask_sum < 1:
-        return out
-
-    mask_area = mask_sum
-    num_stains = max(2, int(mask_area / 800))
-
-    fill_field = torch.zeros(H, W, device=image.device)
-    edge_field = torch.zeros(H, W, device=image.device)
-
-    mask_cpu = mask.cpu()
-
-    for n in range(num_stains):
-        cx, cy = None, None
-        for _ in range(300):
-            x = int(torch.randint(0, W, (1,), generator=generator).item())
-            y = int(torch.randint(0, H, (1,), generator=generator).item())
-            if torch.rand(1, generator=generator).item() < mask_cpu[y, x].item():
-                cx, cy = x, y
-                break
-        if cx is None:
-            continue
-
-        rx = 20 + torch.rand(1, generator=generator).item() * 60
-        ry = 20 + torch.rand(1, generator=generator).item() * 50
-        angle = torch.rand(1, generator=generator).item() * math.pi
-        ca, sa = math.cos(angle), math.sin(angle)
-        stain_str = 0.4 + torch.rand(1, generator=generator).item() * 0.5
-
-        max_r = max(rx, ry) * 1.6
-        x0 = max(0, int(cx - max_r))
-        x1 = min(W - 1, int(cx + max_r))
-        y0 = max(0, int(cy - max_r))
-        y1 = min(H - 1, int(cy + max_r))
-
-        ys = torch.arange(y0, y1 + 1, device=image.device).float()
-        xs = torch.arange(x0, x1 + 1, device=image.device).float()
-        yy, xx = torch.meshgrid(ys, xs, indexing='ij')
-
-        dx = xx - cx
-        dy = yy - cy
-        u = (dx * ca + dy * sa) / rx
-        v = (-dx * sa + dy * ca) / ry
-        d = (u ** 2 + v ** 2).sqrt()
-
-        in_range = d <= 1.5
-        fill = (1.0 - d).clamp(min=0) * stain_str
-        fill_field[y0:y1+1, x0:x1+1] = torch.min(
-            (fill_field[y0:y1+1, x0:x1+1] + fill * in_range.float()).clamp(max=1.0),
-            torch.ones_like(fill)
-        )
-
-        edge_dist = (d - 0.9).abs()
-        tide_mask = (edge_dist < 0.2) & in_range
-        tide_line = (1.0 - edge_dist / 0.2) * stain_str * 1.2
-        edge_field[y0:y1+1, x0:x1+1] = (
-            edge_field[y0:y1+1, x0:x1+1] + tide_line * tide_mask.float()
-        ).clamp(max=1.0)
-
-    # Drip patterns: gravity-driven vertical elongation below some stains
-    drip_field = torch.zeros(H, W, device=image.device)
-    use_drips = torch.rand(1, generator=generator).item() < 0.40
-    if use_drips:
-        num_drips = max(1, num_stains // 2)
-        for _ in range(num_drips):
-            # Pick a random start point within stain regions
-            dx_start, dy_start = None, None
-            for __ in range(200):
-                x = int(torch.randint(0, W, (1,), generator=generator).item())
-                y = int(torch.randint(0, H, (1,), generator=generator).item())
-                if fill_field[y, x].item() > 0.1:
-                    dx_start, dy_start = x, y
-                    break
-            if dx_start is None:
-                continue
-
-            # Drip length: 10-40% of image height downward
-            drip_len = int(H * (0.10 + torch.rand(1, generator=generator).item() * 0.30))
-            drip_width = 2 + int(torch.rand(1, generator=generator).item() * 4)
-            drip_str = 0.3 + torch.rand(1, generator=generator).item() * 0.4
-
-            px = float(dx_start)
-            for dy_off in range(drip_len):
-                py = dy_start + dy_off
-                if py >= H:
-                    break
-                # Slight horizontal wandering
-                px += (torch.rand(1, generator=generator).item() - 0.5) * 1.5
-                ix = int(round(px))
-                ix = max(0, min(W - 1, ix))
-
-                # Fade out toward end of drip
-                fade = 1.0 - (dy_off / drip_len) ** 0.7
-                half_w = drip_width // 2
-
-                for ddx in range(-half_w, half_w + 1):
-                    nx = ix + ddx
-                    if 0 <= nx < W:
-                        dist_from_center = abs(ddx) / max(1, half_w)
-                        lateral_fade = 1.0 - dist_from_center ** 2
-                        val = drip_str * fade * lateral_fade
-                        drip_field[py, nx] = max(drip_field[py, nx].item(), val)
-
-    # Stain colors (float [0,1])
-    stain_r, stain_g, stain_b = 140/255, 105/255, 60/255
-    tide_r, tide_g, tide_b = 90/255, 65/255, 35/255
-
-    m = mask
-    fill = fill_field.clamp(max=0.7) * m
-    edge = edge_field.clamp(max=0.85) * m
-    active = (fill > 0.01) | (edge > 0.01)
-
-    if active.any():
-        # Interior stain
-        f5 = fill * 0.5
-        f55 = fill * 0.55
-        f6 = fill * 0.6
-        out[0] = torch.where(active & (fill > 0.01), out[0] * (1 - f5) + stain_r * f5, out[0])
-        out[1] = torch.where(active & (fill > 0.01), out[1] * (1 - f55) + stain_g * f55, out[1])
-        out[2] = torch.where(active & (fill > 0.01), out[2] * (1 - f6) + stain_b * f6, out[2])
-
-        # Tide line
-        ea = edge * 0.6
-        out[0] = torch.where(active & (edge > 0.01), out[0] * (1 - ea) + tide_r * ea, out[0])
-        out[1] = torch.where(active & (edge > 0.01), out[1] * (1 - ea) + tide_g * ea, out[1])
-        out[2] = torch.where(active & (edge > 0.01), out[2] * (1 - ea) + tide_b * ea, out[2])
-
-    # Drip stains
-    drip_active = drip_field > 0.01
-    if drip_active.any():
-        drip_a = (drip_field * m * 0.6).clamp(max=0.7)
-        drip_color_r, drip_color_g, drip_color_b = 120/255, 85/255, 45/255
-        out[0] = torch.where(drip_active, out[0] * (1 - drip_a) + drip_color_r * drip_a, out[0])
-        out[1] = torch.where(drip_active, out[1] * (1 - drip_a) + drip_color_g * drip_a, out[1])
-        out[2] = torch.where(drip_active, out[2] * (1 - drip_a) + drip_color_b * drip_a, out[2])
-
-    return out.clamp(0, 1)
+    # Hard-boundary: only modify pixels inside the ROI.
+    rgb_out = torch.where(af.unsqueeze(-1) > 0, rgb_out, rgb_hwc)
+    return rgb_out.permute(2, 0, 1).clamp(0, 1)
 
 
 def apply_fading(image: torch.Tensor, mask: torch.Tensor,
                  generator: torch.Generator = None) -> torch.Tensor:
-    """Photochemical fading: desaturation + bleaching.
+    """Photochemical fading: noise-modulated desaturation + bleach toward chalky off-white.
 
-    Smooth mask, noise-modulated desaturation toward luminance,
-    contrast compression toward chalky off-white.
+    Hard mask boundary — effect fills the full ROI, does not bleed past.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth mask
-    field = box_blur_float(mask, 12)
-    # Noise
-    fade_noise = make_noise(H, W, 20.0, generator=generator, device=image.device, normalize=False)
-
-    active = field > 0.01
+    active = mask > 0.01
     if not active.any():
         return out
 
-    m = field.clamp(max=1.0)  # direct mapping, no amplification (3x reduction)
-    bleach_r, bleach_g, bleach_b = 215/255, 205/255, 195/255
+    fade_noise = make_noise(H, W, 20.0, generator=generator, device=image.device, normalize=False)
+    m = mask.clamp(max=1.0)
+    bleach_r, bleach_g, bleach_b = 180/255, 180/255, 180/255
 
     n = 0.6 + 0.4 * fade_noise
     strength = m * n
@@ -664,13 +798,14 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
     r, g, b = out[0], out[1], out[2]
     lum = r * 0.299 + g * 0.587 + b * 0.114
 
-    # Desaturate
+    # Desaturation is the dominant component of real photochemical fading
+    # (pigments lose chroma while lightness mostly stays). Coefficient
+    # raised so the signature of fading reads clearly at high severity.
     desat_r = r + (lum - r) * strength * 0.85
     desat_g = g + (lum - g) * strength * 0.85
     desat_b = b + (lum - b) * strength * 0.85
 
-    # Bleach
-    bleach = strength * 0.6
+    bleach = strength * 0.35
     out_r = desat_r * (1 - bleach) + bleach_r * bleach
     out_g = desat_g * (1 - bleach) + bleach_g * bleach
     out_b = desat_b * (1 - bleach) + bleach_b * bleach
@@ -682,171 +817,60 @@ def apply_fading(image: torch.Tensor, mask: torch.Tensor,
     return out.clamp(0, 1)
 
 
-def apply_bloom(image: torch.Tensor, mask: torch.Tensor,
-                generator: torch.Generator = None) -> torch.Tensor:
-    """Bloom / haze from degraded varnish.
-
-    Multi-radius glow with screen blend, detail softening,
-    milky warm haze overlay.
-    """
-    C, H, W = image.shape
-    out = image.clone()
-
-    if mask.max() < 0.02:
-        return out
-
-    # 1. Extract luminance for glow source
-    lum = (out[0] * 0.299 + out[1] * 0.587 + out[2] * 0.114)  # (H, W)
-    contrib = lum  # low knee: all pixels contribute
-    hi_img = out * contrib.unsqueeze(0)  # (3, H, W)
-
-    # 2. Multi-radius blur
-    glow1 = gaussian_blur_2d(hi_img, 8.0)   # tight glow
-    glow2 = gaussian_blur_2d(hi_img, 20.0)  # wide haze
-    glow3 = gaussian_blur_2d(hi_img, 40.0)  # atmospheric
-
-    bloom = glow1 * 0.3 + glow2 * 0.4 + glow3 * 0.3  # (3, H, W)
-
-    # 3. Softened version for detail loss
-    softened = gaussian_blur_2d(out, 6.0)
-
-    # 4. Apply per pixel
-    m = mask.unsqueeze(0)  # (1, H, W)
-
-    # Screen blend
-    bloom_str = m * 0.9
-    screen = 1.0 - (1.0 - out) * (1.0 - bloom * bloom_str)
-
-    # Detail softening
-    soft_mix = m * 0.55
-    result = screen * (1.0 - soft_mix) + softened * soft_mix
-
-    # Milky haze overlay
-    haze = torch.tensor([210/255, 200/255, 185/255], device=image.device).view(3, 1, 1)
-    haze_mix = m * m * 0.3
-    result = result * (1.0 - haze_mix) + haze * haze_mix
-
-    active = mask.unsqueeze(0) >= 0.02
-    out = torch.where(active, result, out)
-    return out.clamp(0, 1)
-
-
 def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
                    generator: torch.Generator = None) -> torch.Tensor:
-    """Surface deposits: grime, soot, and salt efflorescence.
+    """Surface deposits: dark grime + soot particulate veil.
 
-    Real surface deposits are primarily DARKENING phenomena:
-    - Grime: warm dark brown particulate film from dust, oils, smoke residue.
-      Reduces contrast, dulls colors, makes painting look muddy and aged.
-    - Soot: cool dark gray/black carbon particles from fire/candle smoke.
-      Heavier at top (rises). Very opaque, nearly black at severe levels.
-    - Salt: rare, small discrete crystalline patches — NOT widespread white haze.
-      Only appears at high intensity as scattered crusty specks.
-
-    The dominant visual effect should be DARKENING and CONTRAST LOSS, not whitening.
+    Darkens and reduces contrast — the dominant visual effect of real grime
+    and soot accumulation. Warm brown (grime) mixed with near-black (soot),
+    soot heavier at top (smoke rises). Hard mask boundary.
     """
     C, H, W = image.shape
     out = image.clone()
 
-    # Smooth mask
-    field = box_blur_float(mask, 6)
-
+    field = mask
     if field.max() < 0.01:
         return out
 
-    # Corner/edge recess deposits: grime accumulates more near borders
-    use_corner_deposits = torch.rand(1, generator=generator).item() < 0.40
-    if use_corner_deposits:
-        y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
-        x_coords = torch.arange(W, device=image.device).float().unsqueeze(0).expand(H, W)
-
-        dist_top = y_coords / H
-        dist_bot = (H - 1 - y_coords) / H
-        dist_left = x_coords / W
-        dist_right = (W - 1 - x_coords) / W
-
-        edge_dist = torch.min(torch.min(dist_top, dist_bot), torch.min(dist_left, dist_right))
-
-        # Stronger deposits within ~15% of edges
-        edge_boost = (1.0 - (edge_dist / 0.15).clamp(max=1.0)) * 0.4
-
-        # Corners: where two edges are both close
-        corner_mask = (1.0 - (dist_top / 0.15).clamp(max=1.0)) * \
-                      (1.0 - (dist_left / 0.15).clamp(max=1.0)) + \
-                      (1.0 - (dist_top / 0.15).clamp(max=1.0)) * \
-                      (1.0 - (dist_right / 0.15).clamp(max=1.0)) + \
-                      (1.0 - (dist_bot / 0.15).clamp(max=1.0)) * \
-                      (1.0 - (dist_left / 0.15).clamp(max=1.0)) + \
-                      (1.0 - (dist_bot / 0.15).clamp(max=1.0)) * \
-                      (1.0 - (dist_right / 0.15).clamp(max=1.0))
-        corner_mask = corner_mask.clamp(max=1.0) * 0.3
-
-        field = (field + edge_boost + corner_mask).clamp(0, 1)
-
-    # Noise fields
     patch_noise = make_noise(H, W, 18.0, generator=generator, device=image.device)
     fine_noise = make_noise(H, W, 2.0, generator=generator, device=image.device)
     med_noise = make_noise(H, W, 8.0, generator=generator, device=image.device)
 
-    # Vertical bias for soot (heavier at top — smoke rises)
     y_coords = torch.arange(H, device=image.device).float().unsqueeze(1).expand(H, W)
     vert_bias = 1.0 - (y_coords / H) * 0.3
     soot_frac = med_noise * vert_bias
 
-    # Anchor colors: DARK — grime is warm brown, soot is near-black
-    # Grime anchor: ~(70, 60, 45)/255, Soot anchor: ~(35, 32, 30)/255
-    anchor_r = (70 * (1 - soot_frac) + 35 * soot_frac + fine_noise * 10) / 255
-    anchor_g = (60 * (1 - soot_frac) + 32 * soot_frac + fine_noise * 8) / 255
-    anchor_b = (45 * (1 - soot_frac) + 30 * soot_frac + fine_noise * 5) / 255
+    # Lighter warm-brown anchor (was 70/60/45). On dark paintings the old
+    # anchor was too close to the existing pixel values, so the blend
+    # produced essentially no visible change; the new anchor is a warm
+    # mid-brown that shifts both dark and mid-tones toward a grimy hue.
+    anchor_r = (110 * (1 - soot_frac) + 50 * soot_frac + fine_noise * 10) / 255
+    anchor_g = (88 * (1 - soot_frac) + 42 * soot_frac + fine_noise * 8) / 255
+    anchor_b = (60 * (1 - soot_frac) + 35 * soot_frac + fine_noise * 5) / 255
 
-    # Deposit strength: patchy, textured — allow strong darkening at high intensity
-    raw_str = field * (0.3 + 0.7 * patch_noise) * (0.85 + 0.15 * fine_noise)
-    strength = (raw_str * 0.9).clamp(max=0.85)
+    # Base strength raised so min severity (field≈0.3) blends ~25% toward
+    # the grime anchor — enough to be visible on dark content.
+    raw_str = field * (0.45 + 0.55 * patch_noise) * (0.85 + 0.15 * fine_noise)
+    strength = (raw_str * 1.1).clamp(max=0.85)
 
     active = field > 0.01
-
-    # Compress toward dark anchor (veil model — darkens and reduces contrast)
     out[0] = torch.where(active, out[0] * (1 - strength) + anchor_r * strength, out[0])
     out[1] = torch.where(active, out[1] * (1 - strength) + anchor_g * strength, out[1])
     out[2] = torch.where(active, out[2] * (1 - strength) + anchor_b * strength, out[2])
-
-    # Salt efflorescence: RARE, SMALL, DISCRETE crystalline specks
-    # Only at high mask intensity, very restricted coverage
-    salt_active = field > 0.4
-    if salt_active.any():
-        salt_noise = make_noise(H, W, 1.5, generator=generator, device=image.device)
-        # High threshold so only a few percent of pixels get salt
-        salt_thresh = 0.85 - field * 0.15  # at mask=1.0, thresh=0.70 → ~30% of noise above
-        salt_above = (salt_noise > salt_thresh) & salt_active
-
-        # Further sparsify with random dropout to get discrete specks, not smooth areas
-        speck_mask = torch.rand(H, W, generator=generator, device=image.device) < 0.3
-        salt_above = salt_above & speck_mask
-
-        if salt_above.any():
-            salt_str = ((salt_noise - salt_thresh) / (1.0 - salt_thresh)).clamp(0, 1)
-            # Low opacity — salt is a thin crusty layer, not an opaque white paint
-            salt_opacity = (salt_str * field * 0.25).clamp(max=0.2)
-
-            # Chalky off-white (not pure white — real salt is slightly warm/cool)
-            salt_color_r = torch.full_like(field, 210/255)
-            salt_color_g = torch.full_like(field, 205/255)
-            salt_color_b = torch.full_like(field, 195/255)
-
-            out[0] = torch.where(salt_above, out[0] * (1 - salt_opacity) + salt_color_r * salt_opacity, out[0])
-            out[1] = torch.where(salt_above, out[1] * (1 - salt_opacity) + salt_color_g * salt_opacity, out[1])
-            out[2] = torch.where(salt_above, out[2] * (1 - salt_opacity) + salt_color_b * salt_opacity, out[2])
 
     return out.clamp(0, 1)
 
 
 def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
-                    generator: torch.Generator = None) -> torch.Tensor:
-    """Surface scratches: thin linear marks from abrasion.
+                    generator: torch.Generator = None,
+                    max_count: Optional[int] = None) -> torch.Tensor:
+    """Thin linear abrasion marks with slightly clustered orientations.
 
-    Generates 2-8 scratch lines per application. Each is a thin line (1-2px)
-    with slight curve, slightly lightening or revealing substrate.
-    Orientations are random but slightly clustered.
+    Each scratch starts at a random point inside the masked region and
+    walks for a length proportional to the local mask extent. For large
+    (global-style) masks this yields the same long abrasions as before;
+    for small local blobs the scratches stay inside and terminate when
+    they leave the damaged region.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -855,39 +879,106 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
     if mask_sum < 1:
         return out
 
-    num_scratches = 2 + int(torch.randint(0, 7, (1,), generator=generator).item())
+    # Severity-relative active threshold. Soft mask peak ranges from
+    # ≈0.30 (sev=0.01) to 1.0 (sev=1.0); a fixed 0.05 cut-off leaves
+    # only ~16% of a low-sev band above threshold, so most of the
+    # scratch band falls outside "active" and the walker paints almost
+    # nothing. Scaling the threshold to 15% of the mask peak keeps the
+    # active region ≈ constant fraction of the band across severities.
+    mask_max = float(mask.max().item())
+    if mask_max < 0.02:
+        return out
+    active_thr = max(0.02, mask_max * 0.15)
+    seed_thr = max(0.02, mask_max * 0.50)  # sample start near band ridge
 
-    # Base orientation for clustering: all scratches drift toward this angle
-    base_angle = torch.rand(1, generator=generator).item() * math.pi
+    active_mask = mask >= active_thr
+    if not active_mask.any():
+        return out
+    ys_active, xs_active = active_mask.nonzero(as_tuple=True)
+    y_lo, y_hi = int(ys_active.min()), int(ys_active.max())
+    x_lo, x_hi = int(xs_active.min()), int(xs_active.max())
+    bbox_diag = float(((y_hi - y_lo) ** 2 + (x_hi - x_lo) ** 2) ** 0.5)
+    max_dim = max(H, W)
+    # Step budget proportional to region size, but capped by image size.
+    budget_full = int(max_dim * (0.10 + torch.rand(1, generator=generator).item() * 0.40))
+    budget_local = max(20, int(bbox_diag * 1.2))
+    scratch_len_base = min(budget_full, budget_local)
 
-    # Substrate color for reveal
+    # At least one scratch per mask component so every mask blob gets a
+    # visible scratch. Previous active-area-based count could round to
+    # zero for thin low-sev bands and leave a blob empty.
+    components = _mask_component_centers(mask, min_val=active_thr)
+    active_frac = float(active_mask.sum().item()) / float(H * W)
+    num_scratches = max(len(components), int(round(active_frac * 170)))
+    # Small variability so not every render has identical count.
+    num_scratches += int(torch.randint(0, 2, (1,), generator=generator).item())
+    if max_count is not None:
+        num_scratches = min(num_scratches, max(1, int(max_count)))
+    num_scratches = max(1, num_scratches)
+
+    # Align base scratch direction with the mask's principal axis so
+    # scratches run ALONG the band. Individual scratches still get
+    # ±15° of jitter via the `+ (rand-0.5)*pi*0.16` term below, so
+    # parallel-looking bands still have visual variety.
+    base_angle = _mask_principal_angle(mask, min_val=active_thr)
     cr, cg, cb = _sample_canvas_color(image)
 
+    # Luminance-aware boost: on dark content, a subtle scratch alpha is
+    # invisible, so increase it when the region is dark overall.
+    lum_boost = _local_lum_boost(image, mask, min_val=active_thr, max_boost=1.7)
+
     for _ in range(num_scratches):
-        # Clustered angle: base_angle +/- up to 45 degrees
-        angle = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.5
+        start = _sample_point_in_mask(mask, generator, min_val=0.05)
+        if start is None:
+            continue
+        sx, sy = start
 
-        # Start point: random within image
-        sx = int(torch.randint(0, W, (1,), generator=generator).item())
-        sy = int(torch.randint(0, H, (1,), generator=generator).item())
-
-        # Scratch length: 10-50% of max dimension
-        max_dim = max(H, W)
-        scratch_len = int(max_dim * (0.10 + torch.rand(1, generator=generator).item() * 0.40))
-
-        # Width: 1-2px
-        width = 1 + int(torch.rand(1, generator=generator).item() * 1.5)
+        # Narrow the per-scratch angle spread to ±15° so individual
+        # scratches stay ALONG the (possibly thin) mask band and look
+        # like a coherent scratch cluster rather than a scribble.
+        angle = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.16
+        scratch_len = max(12, int(scratch_len_base * (0.6 + torch.rand(1, generator=generator).item() * 0.8)))
+        # Widths 1-2 px. Real scratches in varnish are hairlines; wide
+        # gouges would read as paint loss, not scratches.
+        width = 1 if torch.rand(1, generator=generator).item() < 0.7 else 2
         half_w = width // 2
+        # Scratch opacity sampled in 0.35-0.70. Range widened and floor
+        # raised so even the unluckiest low-sev draw is clearly visible
+        # (previous 0.25-0.55 produced hairlines lost in JPEG noise on
+        # low-contrast backgrounds).
+        scratch_str = 0.35 + torch.rand(1, generator=generator).item() * 0.35
 
-        # Scratch intensity: how much to lighten
-        scratch_str = 0.15 + torch.rand(1, generator=generator).item() * 0.25
+        # Small chance of a brighter (burnished) scratch — light reflects
+        # off a fresh abrasion. This is stylistically distinct from the
+        # dark substrate-reveal scratch and adds realism variety.
+        use_bright = torch.rand(1, generator=generator).item() < 0.18
+        if use_bright:
+            scratch_r, scratch_g, scratch_b = 0.94, 0.92, 0.86
+        else:
+            scratch_r, scratch_g, scratch_b = cr, cg, cb
 
-        # Walk along scratch with slight curvature
+        # Random micro-breaks: real scratches often read as discontinuous
+        # due to the drag of the scratching object skipping across uneven
+        # paint. 0-2 break ranges (each 2-4 steps long) per scratch.
+        n_breaks = int(torch.randint(0, 3, (1,), generator=generator).item())
+        breaks = []
+        for _b in range(n_breaks):
+            bs = int(torch.rand(1, generator=generator).item() * max(1, scratch_len - 5))
+            be = bs + 2 + int(torch.rand(1, generator=generator).item() * 3)
+            breaks.append((bs, be))
+
         px, py = float(sx), float(sy)
         step_size = 1.5
-        curvature = (torch.rand(1, generator=generator).item() - 0.5) * 0.05
+        # Per-step curvature capped so total angular drift over the whole
+        # scratch stays well below half a circle — previously this
+        # produced near-perfect rings. Halved from 0.45 so scratches
+        # read as nearly-straight slashes (real scratches are not
+        # curly); combined with the ±15° angle jitter this still gives
+        # enough variety between scratches.
+        max_step_curve = 0.20 / max(40.0, float(scratch_len))
+        curvature = (torch.rand(1, generator=generator).item() - 0.5) * max_step_curve
 
-        for step in range(scratch_len):
+        for step_i in range(scratch_len):
             angle += curvature
             px += math.cos(angle) * step_size
             py += math.sin(angle) * step_size
@@ -896,9 +987,23 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             if ix < 0 or ix >= W or iy < 0 or iy >= H:
                 break
 
-            m_val = mask[iy, ix].item()
-            if m_val < 0.05:
+            if mask[iy, ix].item() < 0.05:
                 continue
+
+            # Skip painting if we're inside a micro-break.
+            in_break = False
+            for (bs, be) in breaks:
+                if bs <= step_i < be:
+                    in_break = True
+                    break
+            if in_break:
+                continue
+
+            # Parabolic taper: alpha peaks mid-scratch, fades at the
+            # ends. Real scratches start and end softly where the tool
+            # lifts off the surface.
+            t = step_i / max(1, scratch_len - 1)
+            length_taper = max(0.25, 1.0 - (2.0 * t - 1.0) ** 2)
 
             for dy in range(-half_w, half_w + 1):
                 for dx in range(-half_w, half_w + 1):
@@ -907,24 +1012,15 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                         local_m = mask[ny, nx].item()
                         if local_m < 0.05:
                             continue
-                        a = scratch_str * local_m
-                        # Lighten toward substrate (reveal)
-                        out[0, ny, nx] = out[0, ny, nx] * (1 - a) + cr * a
-                        out[1, ny, nx] = out[1, ny, nx] * (1 - a) + cg * a
-                        out[2, ny, nx] = out[2, ny, nx] * (1 - a) + cb * a
+                        # Severity-dependent alpha. Floor raised from
+                        # 0.15 to 0.35 so sev=0.01 (m≈0.30) yields a
+                        # visible hairline (coeff ≈ 0.50) rather than a
+                        # near-invisible smudge (coeff ≈ 0.33 before).
+                        # sev=1.0 (m≈1.0) still saturates at 1.0.
+                        coeff = 0.35 + 0.65 * (local_m ** 1.1)
+                        a = min(1.0, scratch_str * coeff * lum_boost * length_taper)
+                        out[0, ny, nx] = out[0, ny, nx] * (1 - a) + scratch_r * a
+                        out[1, ny, nx] = out[1, ny, nx] * (1 - a) + scratch_g * a
+                        out[2, ny, nx] = out[2, ny, nx] * (1 - a) + scratch_b * a
 
     return out.clamp(0, 1)
-
-
-def _sample_canvas_color(image: torch.Tensor) -> Tuple[float, float, float]:
-    """Sample substrate/canvas color from image.
-
-    Average color blended 15%/85% with light canvas tone [215, 200, 175]/255.
-    """
-    # Sample every 40th pixel
-    flat = image.view(3, -1)[:, ::40]  # (3, N)
-    mr, mg, mb = flat[0].mean().item(), flat[1].mean().item(), flat[2].mean().item()
-    cr = min(1.0, mr * 0.15 + (215/255) * 0.85)
-    cg = min(1.0, mg * 0.15 + (200/255) * 0.85)
-    cb = min(1.0, mb * 0.15 + (175/255) * 0.85)
-    return cr, cg, cb

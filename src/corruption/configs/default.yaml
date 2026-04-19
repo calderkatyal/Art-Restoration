@@ -1,49 +1,122 @@
-# Corruption types
-damage_types:
-  - cracks
-  - paint_loss
-  - yellowing
-  - stains
-  - fading
-  - bloom
-  - deposits
-  - scratches
-num_channels: 8
+# Corruption pipeline configuration.
+#
+# Each sample: a random subset of `num_simultaneous.[min, max]` types is
+# selected using per-type weights. For each selected type, the mask is
+# generated in either "local" (scattered irregular shapes) or "global"
+# (uniform fill) mode, uniformly at random among the modes enabled for
+# that type. Severity is drawn uniformly in [min_severity, max_severity].
+#
+# Severity is remapped internally: s=0.01 -> ~0.3 effective intensity
+# (faint but visible); s=1.0 -> 1.0. See
+# src/corruption/presets.py::_effective_severity.
+#
+# Local shape family (per-channel; hard-coded in presets.py):
+#   craquelure / paint_loss / yellowing / fading / deposits
+#       -> 'generic'  : random irregular elongated blob. Severity-INVARIANT
+#                       in shape; severity only modulates the soft mask.
+#   rip_tear   -> 'rip_tear'  : elongated curved band. Half-width scales
+#                              with severity (thin at low sev, wide at
+#                              high sev).
+#   scratches  -> 'scratches' : narrow elongated band. Half-width scales
+#                              with severity.
 
-# Preset selection
-individual_prob: 0.4  # prob of individual vs multi
+channels:
+  - craquelure      # 0  Voronoi tessellation cracks from paint shrinkage
+  - rip_tear        # 1  physical canvas tear with exposed substrate — local only
+  - paint_loss      # 2  blob-shaped paint loss with substrate reveal — local only
+  - yellowing       # 3  varnish yellowing (CIELAB a/b shift)
+  - fading          # 4  photochemical desaturation / bleach
+  - deposits        # 6  grime / soot darkening veil
+  - scratches       # 7  thin linear abrasion marks — local only
 
-# Which individual presets are enabled + relative weights (uniform by default)
-individual_presets:
-  cracks: 1.0
-  paint_loss: 1.0
-  yellowing: 1.0
-  stains: 1.0
-  fading: 1.0
-  bloom: 1.0
-  deposits: 1.0
-  scratches: 1.0
+num_channels: 7
 
-# Which multi presets are enabled + relative weights (uniform by default)
-multi_presets:
-  light_aging: 1.0
-  heavy_craquelure: 1.0
-  water_damage: 1.0
-  sun_faded: 1.0
-  smoke_damage: 1.0
-  neglected_storage: 1.0
-  heat_damage: 1.0
-  flood_damage: 1.0
-  museum_wear: 1.0
-  salt_efflorescence: 1.0
+# Range of how many distinct types are active per image.
+num_simultaneous:
+  min: 1
+  max: 3
 
-# Per-channel severity multiplier (for curriculum learning)
-severity_scale:
-  cracks: 1.0
-  paint_loss: 1.0
-  yellowing: 1.0
-  stains: 1.0
-  fading: 1.0
-  bloom: 1.0
-  deposits: 0
-  scratches: 1.0
+# Per-type mask generation parameters.
+#   weight:            Relative probability of this type being selected.
+#   local_enabled:     Allow local (scattered-shape) masks.
+#   global_enabled:    Allow uniform global-fill masks.
+#   min_severity:      Lower bound on per-pixel mask intensity (user-facing).
+#                      Ignored for `base` (no severity attribute).
+#   max_severity:      Upper bound on per-pixel mask intensity (user-facing).
+#                      Ignored for `base`.
+#   local_min_num:     Min # of local-mode instances per image (>=1).
+#   local_max_num:     Max # of local-mode instances per image. Per-image
+#                      count sampled uniformly in [local_min_num, local_max_num].
+#   local_area_frac:   [min, max] — per-instance surface area as a
+#                      fraction of the image area (H*W). Each instance's
+#                      target area is sampled uniformly in this range.
+types:
+  craquelure:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: true
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 1
+    local_max_num: 3
+    local_area_frac: [0.02, 0.25]
+
+  rip_tear:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: false
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 1
+    local_max_num: 2
+    local_area_frac: [0.003, 0.06]
+
+  paint_loss:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: false
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 2
+    local_max_num: 5
+    local_area_frac: [0.0005, 0.006]
+
+  yellowing:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: true
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 1
+    local_max_num: 3
+    local_area_frac: [0.03, 0.30]
+
+  fading:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: true
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 1
+    local_max_num: 3
+    local_area_frac: [0.03, 0.30]
+
+  deposits:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: true
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 1
+    local_max_num: 3
+    local_area_frac: [0.02, 0.20]
+
+  scratches:
+    weight: 1.0
+    local_enabled: true
+    global_enabled: false
+    min_severity: 0.01
+    max_severity: 1.0
+    local_min_num: 2
+    local_max_num: 5
+    local_area_frac: [0.003, 0.05]
