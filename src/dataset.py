@@ -8,8 +8,7 @@ All RGB tensors are ``(3, H, W)`` ``float32`` in ``[0, 1]`` after center-crop to
 square and resize to ``cfg.train.resolution``.
 
 Masks are ``(K, H, W)`` ``float32`` at **pixel** resolution. The training loop
-downsamples them to latent resolution with :func:`~src.corruption.downsample_mask`;
-``K`` must match ``cfg.model.mask_channels`` / ``cfg.corruption.num_channels``.
+downsamples them to latent resolution with :func:`~src.corruption.downsample_mask`.
 """
 
 from pathlib import Path

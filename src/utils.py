@@ -14,8 +14,7 @@ from typing import List, Optional
 from omegaconf import DictConfig, OmegaConf
 
 # Defaults merged under user YAML so older configs still run. Values here are the
-# low-level knobs expected by ``deepspeed.initialize``; ``train.py`` overwrites
-# ``train_micro_batch_size_per_gpu`` from ``cfg.train.batch_size`` at runtime.
+# low-level knobs expected by ``deepspeed.initialize``.
 _DEEPSPEED_DEFAULTS = OmegaConf.create(
     {
         "train_batch_size": "auto",
@@ -87,7 +86,8 @@ def load_config(yaml_path: str, overrides: Optional[List[str]] = None) -> DictCo
 
     Args:
         yaml_path: Path to YAML, typically ``train/configs/train.yaml``.
-        overrides: Dotlist strings such as ``["train.batch_size=16"]``; ``None`` means none.
+        overrides: Dotlist strings such as
+                   ``["ds_config.train_micro_batch_size_per_gpu=16"]``; ``None`` means none.
 
     Returns:
         A resolved :class:`omegaconf.DictConfig` ready for ``src.train.main``.

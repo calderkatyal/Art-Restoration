@@ -136,8 +136,6 @@ class CorruptionModule:
 
     Args:
         config: DictConfig or dict with keys:
-            num_channels (int)
-            channels (list[str])
             num_simultaneous: {min, max}
             types: dict mapping channel name -> {
                 weight, local_enabled, global_enabled,

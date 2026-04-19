@@ -115,7 +115,7 @@ class RestorationDiT(nn.Module):
         """Replace img_in with a new randomly-initialized Linear layer.
 
         Args:
-            in_channels: 128 + 128 + K (mask); K must match ``cfg.mask_channels``.
+            in_channels: 128 + 128 + K (mask channels).
             hidden_size: 3072 (Klein 4B).
         """
         new_in = nn.Linear(in_channels, hidden_size, bias=False, device=device, dtype=dtype)
