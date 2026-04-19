@@ -27,16 +27,18 @@ Distributed training:
     logging, validation DataLoader, and WandB run on global rank 0 only.
 
 Checkpointing:
-    DeepSpeed checkpoints live under ``{train.output_dir}/deepspeed_ckpt/<tag>/``.
+    DeepSpeed checkpoints live under ``{train.checkpoint_dir}/deepspeed_ckpt/<tag>/``.
     ``train.save_every`` triggers saves every N **optimizer** steps;
     ``train.save_every_images`` triggers after approximately that many **global** images
-    (``batch_size × world_size × gradient_accumulation_steps`` per optimizer step).
+    (``train_micro_batch_size_per_gpu × world_size × gradient_accumulation_steps``
+    per optimizer step).
     Resume with ``train.resume_from`` pointing at a tag directory, e.g.
-    ``./checkpoints/deepspeed_ckpt/step_1000``.
+    ``./checkpoints/step_1000``.
 
 Validation:
-    Rank 0 runs full-image and masked PSNR on the val split (same synthetic corruption
-    pipeline as training) via Euler sampling in ``src.inference.sample``.
+    All ranks run distributed held-out velocity-loss evaluation on the val split using
+    the same corruption pipeline as training; the aggregated result is logged to WandB
+    on rank 0.
 
 Usage:
     python -m src.train [--config train/configs/train.yaml] [overrides...]
@@ -44,7 +46,7 @@ Usage:
 Arguments:
     --config    Path to YAML (default: ``train/configs/train.yaml``).
     overrides   Dot-notation overrides, e.g. ``train.stage=full``,
-                ``train.batch_size=8``,
+                ``ds_config.train_micro_batch_size_per_gpu=8``,
                 ``train.resume_from=./checkpoints/deepspeed_ckpt/step_1000``.
 """
 
@@ -60,6 +62,7 @@ from typing import Any, Optional
 
 import deepspeed
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -69,7 +72,6 @@ from tqdm import tqdm
 from .corruption import downsample_mask
 from .dataset import ArtRestorationDataset
 from .distributed import get_device, get_global_rank, get_world_size, is_main_process
-from .evaluations import compute_psnr
 from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
@@ -286,6 +288,20 @@ def _worker_init_fn(worker_id: int, base_seed: int, rank: int) -> None:
     torch.manual_seed(seed)
 
 
+def _micro_batch_size(cfg: DictConfig) -> int:
+    """Return the per-GPU micro-batch size from DeepSpeed config."""
+    value = cfg.ds_config.get("train_micro_batch_size_per_gpu")
+    if value in (None, "auto"):
+        raise ValueError("ds_config.train_micro_batch_size_per_gpu must be set explicitly")
+    return int(value)
+
+
+def _distributed_barrier() -> None:
+    """Synchronize all ranks when distributed training is initialized."""
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
 def setup_dataloader(
     cfg: DictConfig,
     max_simultaneous: int | None = None,
@@ -300,7 +316,7 @@ def setup_dataloader(
     loader (the sampler owns shuffling via ``set_epoch``).
 
     Args:
-        cfg:              Full config (paths, resolution, batch size, ``num_workers``).
+        cfg:              Full config (paths, resolution, micro-batch size, ``num_workers``).
         max_simultaneous: Optional curriculum override forwarded to the dataset / corruption.
         split:            ``"train"`` or ``"val"`` selecting the image root directory.
         sampler:          Optional ``DistributedSampler`` for DDP / DeepSpeed multi-GPU.
@@ -319,7 +335,7 @@ def setup_dataloader(
     nw = int(getattr(cfg.train, "num_workers", 4))
     loader = DataLoader(
         ds,
-        batch_size=int(cfg.train.batch_size),
+        batch_size=_micro_batch_size(cfg),
         sampler=sampler,
         shuffle=(sampler is None and split == "train"),
         num_workers=nw,
@@ -384,7 +400,6 @@ def compute_flow_loss(
     return F.mse_loss(vel.float(), target)
 
 
-@torch.no_grad()
 def validate(
     model_engine: Any,
     vae: FluxVAE,
@@ -393,49 +408,60 @@ def validate(
     cfg: DictConfig,
     device: torch.device,
 ) -> dict[str, float]:
-    """Run sampling on the validation set and report average PSNR metrics.
+    """Compute distributed held-out velocity loss on the validation set.
 
-    For each batch, runs :func:`~src.inference.sample` (Euler ODE + latent data
-    consistency) then :func:`~src.evaluations.compute_psnr` in full-image and
-    masked modes. Restores the model's previous ``train()`` / ``eval()`` state.
+    This mirrors training-time loss evaluation: for each validation batch, it calls
+    :func:`compute_flow_loss` with the same synthetic corruption inputs but does not
+    backpropagate or step the optimizer. Losses are aggregated across all ranks via
+    ``all_reduce`` and returned as a single global average.
 
     Args:
         model_engine: Wrapped or bare ``RestorationDiT``.
         vae:          Frozen VAE.
         val_loader:   Batches of ``clean``, ``corrupted``, ``mask``.
         null_emb:     Null text embedding.
-        cfg:          Uses ``cfg.inference.num_steps`` when present.
+        cfg:          Uses ``cfg.model.spatial_compression``.
         device:       CUDA device.
 
     Returns:
-        Dict with float keys ``"psnr_full"`` and ``"psnr_masked"`` (batch-averaged).
+        Dict with float key ``"velocity_loss"`` aggregated across all validation samples.
     """
     mdl = _unwrap_model(model_engine)
     was_training = mdl.training
-    mdl.eval()
-    steps = int(getattr(cfg.inference, "num_steps", cfg.model.get("num_steps", 50)))
-    full_scores: list[float] = []
-    mask_scores: list[float] = []
-    for batch in val_loader:
-        clean = batch["clean"].to(device, non_blocking=True)
-        corrupted = batch["corrupted"].to(device, non_blocking=True)
-        mask = batch["mask"].to(device, non_blocking=True)
-        restored = sample(
-            mdl,
-            vae,
-            corrupted,
-            mask,
-            null_emb,
-            num_steps=steps,
-            device=str(device),
-        )
-        full_scores.append(compute_psnr(restored, clean, mask=None))
-        mask_scores.append(compute_psnr(restored, clean, mask=mask))
+    if hasattr(model_engine, "eval"):
+        model_engine.eval()
+    else:
+        mdl.eval()
+
+    loss_sum = torch.zeros(1, device=device, dtype=torch.float64)
+    sample_count = torch.zeros(1, device=device, dtype=torch.float64)
+    with torch.no_grad():
+        for batch in val_loader:
+            loss = compute_flow_loss(
+                model_engine,
+                vae,
+                batch,
+                null_emb,
+                int(cfg.model.spatial_compression),
+                device,
+            )
+            batch_size = int(batch["clean"].shape[0])
+            loss_sum += float(loss.item()) * batch_size
+            sample_count += batch_size
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(sample_count, op=dist.ReduceOp.SUM)
+
     if was_training:
-        mdl.train()
+        if hasattr(model_engine, "train"):
+            model_engine.train()
+        else:
+            mdl.train()
+
+    denom = max(sample_count.item(), 1.0)
     return {
-        "psnr_full": float(sum(full_scores) / max(len(full_scores), 1)),
-        "psnr_masked": float(sum(mask_scores) / max(len(mask_scores), 1)),
+        "velocity_loss": float((loss_sum / denom).item()),
     }
 
 
@@ -471,13 +497,13 @@ def maybe_save_deepspeed_checkpoint(
 
     Args:
         engine:        DeepSpeed-wrapped model.
-        cfg:           Provides ``train.output_dir``.
+        cfg:           Provides ``train.checkpoint_dir``.
         client_state:  Metadata forwarded to DeepSpeed (also embedded in the checkpoint).
         do_save:       When False, returns immediately without touching the filesystem.
     """
     if not do_save:
         return
-    out = Path(cfg.train.output_dir) / "deepspeed_ckpt"
+    out = Path(cfg.train.checkpoint_dir) / "deepspeed_ckpt"
     tag = f"step_{int(client_state['step'])}"
     engine.save_checkpoint(str(out), tag=tag, client_state=client_state)
     if is_main_process():
@@ -539,9 +565,39 @@ def _build_train_loader(
     nw = int(getattr(cfg.train, "num_workers", 4))
     loader = DataLoader(
         ds,
-        batch_size=int(cfg.train.batch_size),
+        batch_size=_micro_batch_size(cfg),
         sampler=sampler,
         shuffle=(sampler is None),
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=nw > 0,
+        worker_init_fn=lambda wid: _worker_init_fn(wid, int(cfg.train.seed), get_global_rank()),
+        drop_last=False,
+    )
+    return loader, ds, sampler
+
+
+def _build_val_loader(
+    cfg: DictConfig,
+    corrupt_cfg: DictConfig,
+    world_size: int,
+) -> tuple[DataLoader, ArtRestorationDataset, Optional[DistributedSampler]]:
+    """Build validation ``DataLoader`` and optional ``DistributedSampler``."""
+    ds = ArtRestorationDataset(
+        data_dir=cfg.train.val_dir,
+        resolution=int(cfg.train.resolution),
+        corruption_config=corrupt_cfg,
+        max_simultaneous=None,
+    )
+    sampler: Optional[DistributedSampler] = None
+    if world_size > 1:
+        sampler = DistributedSampler(ds, shuffle=False, drop_last=False)
+    nw = int(getattr(cfg.train, "num_workers", 4))
+    loader = DataLoader(
+        ds,
+        batch_size=_micro_batch_size(cfg),
+        sampler=sampler,
+        shuffle=False,
         num_workers=nw,
         pin_memory=True,
         persistent_workers=nw > 0,
@@ -576,7 +632,7 @@ def _resolve_checkpoint_strategy(cfg: DictConfig) -> tuple[str | None, str | Non
         rp = Path(str(resume_from))
         return str(rp.parent), rp.name
 
-    ckpt_dir = Path(str(cfg.train.get("checkpoint_dir", Path(cfg.train.output_dir) / "deepspeed_ckpt")))
+    ckpt_dir = Path(str(cfg.train.checkpoint_dir))
     tag = _latest_checkpoint_tag(ckpt_dir)
     if tag is None:
         return None, None
@@ -588,13 +644,13 @@ def main(cfg: DictConfig) -> None:
 
     Pipeline overview:
         1. ``deepspeed.init_distributed`` (NCCL).
-        2. Build model / VAE / null embedding; assert mask width matches ``img_in``.
+        2. Build model / VAE / null embedding.
         3. Build train & val dataloaders (DistributedSampler on train if multi-GPU).
         4. AdamW + LambdaLR, then ``deepspeed.initialize`` (ZeRO-2 + bf16 from YAML).
         5. Optional ``load_checkpoint`` resume.
         6. Epoch loop: curriculum may rebuild the train loader; each step runs
            :func:`compute_flow_loss`, ``backward``, ``step``; periodic WandB logging,
-           validation on rank 0, and DeepSpeed saves on all ranks.
+           distributed validation loss evaluation, and DeepSpeed saves on all ranks.
 
     Args:
         cfg: Merged ``DictConfig`` from :func:`src.utils.load_config`.
@@ -606,7 +662,7 @@ def main(cfg: DictConfig) -> None:
     rank = get_global_rank()
 
     if is_main_process():
-        Path(cfg.train.output_dir).mkdir(parents=True, exist_ok=True)
+        Path(cfg.train.checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
     # Per-rank RNG offsets so each GPU sees different corruption / noise unless seeded identically.
     torch.manual_seed(int(cfg.train.seed) + rank)
@@ -626,14 +682,7 @@ def main(cfg: DictConfig) -> None:
     )
     vae = vae.to(device).requires_grad_(False).eval()
 
-    # --- Consistency guard: corruption YAML K must match img_in width 128+128+K ---
     corrupt_cfg = cfg.corruption
-    k_mask = int(corrupt_cfg.num_channels)
-    if int(cfg.model.mask_channels) != k_mask or int(cfg.model.in_channels) != 128 + 128 + k_mask:
-        raise ValueError(
-            f"model.mask_channels / in_channels must match corruption (K={k_mask}): "
-            f"model has mask_channels={cfg.model.mask_channels}, in_channels={cfg.model.in_channels}"
-        )
 
     # --- Data: train (possibly curriculum); val only on rank 0 to avoid duplicate work ---
     start_epoch = 0
@@ -642,9 +691,7 @@ def main(cfg: DictConfig) -> None:
         cfg, corrupt_cfg, max_sim, world_size
     )
 
-    val_loader: Optional[DataLoader] = None
-    if is_main_process():
-        val_loader, _ = setup_dataloader(cfg, max_simultaneous=None, split="val", sampler=None)
+    val_loader, _, val_sampler = _build_val_loader(cfg, corrupt_cfg, world_size)
 
     steps_per_epoch = max(len(train_loader), 1)
     grad_accum = int(cfg.ds_config.get("gradient_accumulation_steps", 1))
@@ -657,7 +704,7 @@ def main(cfg: DictConfig) -> None:
     scheduler = build_scheduler(optimizer, cfg, total_optimizer_steps)
 
     ds_cfg = OmegaConf.to_container(cfg.ds_config, resolve=True)
-    ds_cfg["train_micro_batch_size_per_gpu"] = int(cfg.train.batch_size)
+    ds_cfg["train_micro_batch_size_per_gpu"] = _micro_batch_size(cfg)
     ds_cfg["gradient_accumulation_steps"] = grad_accum
 
     engine, optimizer, _, _ = deepspeed.initialize(
@@ -702,6 +749,7 @@ def main(cfg: DictConfig) -> None:
             global_step = 0
             images_since_save = 0
             last_save_step = 0
+    _distributed_barrier()
 
     engine.train()
 
@@ -712,13 +760,15 @@ def main(cfg: DictConfig) -> None:
     log_every = int(cfg.train.log_every)
     log_images_every = int(cfg.wandb.get("log_images_every", 500)) if cfg.get("wandb") else 10**9
 
-    micro_batch = int(cfg.train.batch_size)
+    micro_batch = _micro_batch_size(cfg)
     # Global images (all GPUs) per *optimizer* step ≈ micro_batch × world_size × grad_accumulation.
     images_per_opt_step = micro_batch * world_size * grad_accum
 
     for epoch in range(start_epoch, int(cfg.train.num_epochs)):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        if val_sampler is not None:
+            val_sampler.set_epoch(epoch)
 
         curriculum_max_sim = _curriculum_max_sim(cfg, epoch)
         if curriculum_max_sim != max_sim:
@@ -807,18 +857,19 @@ def main(cfg: DictConfig) -> None:
                 maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True)
                 last_save_step = global_step
 
-            if (
-                is_main_process()
-                and val_loader is not None
-                and val_every > 0
+            should_validate = (
+                val_every > 0
                 and global_step % val_every == 0
                 and global_step > 0
-            ):
+            )
+            if should_validate:
                 metrics = validate(engine, vae, val_loader, null_emb, cfg, device)
-                wandb_log(
-                    {"val/psnr_full": metrics["psnr_full"], "val/psnr_masked": metrics["psnr_masked"]},
-                    step=global_step,
-                )
+                if is_main_process():
+                    wandb_log(
+                        {"val/velocity_loss": metrics["velocity_loss"]},
+                        step=global_step,
+                    )
+                _distributed_barrier()
 
     client_state = {
         "step": global_step,
@@ -832,11 +883,12 @@ def main(cfg: DictConfig) -> None:
 
 if __name__ == "__main__":
     # Run training from the command line. Unknown CLI tokens are treated as OmegaConf
-    # dotlist overrides (same style as Hydra), e.g. ``train.batch_size=8``.
+    # dotlist overrides (same style as Hydra), e.g.
+    # ``ds_config.train_micro_batch_size_per_gpu=8``.
     #
     # Examples:
     #   python -m src.train --config train/configs/train.yaml train.stage=warmup
-    #   python -m src.train train.stage=full train.batch_size=8
+    #   python -m src.train train.stage=full ds_config.train_micro_batch_size_per_gpu=8
     #   python -m src.train train.resume_from=./checkpoints/deepspeed_ckpt/step_10000
     parser = argparse.ArgumentParser(description="Art restoration DiT training")
     parser.add_argument(

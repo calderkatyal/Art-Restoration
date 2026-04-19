@@ -1,19 +1,15 @@
 # Master training config.
 #
 # Loaded via OmegaConf. CLI dot-notation overrides supported, e.g.
-#     python -m src.train train.stage=full train.batch_size=8
+#     python -m src.train train.stage=full ds_config.train_micro_batch_size_per_gpu=8
 #
 # Separate corruption config at `corruption.config_path` is merged in.
 
 model:
   flux_model_name: "flux.2-klein-base-4b"
-  latent_channels: 128         # VAE z_channels=32 * patchify 2x2
   spatial_compression: 16      # 8x encoder downsample * 2x patchify
-  mask_channels: 7             # K damage channels
   in_channels: 263             # 128 (z_t) + 128 (z_y) + 7 (mask)
   hidden_size: 3072
-  context_in_dim: 7680         # 3 Qwen3-4B layers * 2560
-  text_encoder_variant: "4B"
   null_emb_path: "null_text_emb.pt"
 
 train:
@@ -24,7 +20,6 @@ train:
   val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
   checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
-  batch_size: 4
   num_epochs: 50
   seed: 42
   save_every: 1000
@@ -32,18 +27,14 @@ train:
   resume_from: null
 
   optimizer:
-    name: "adamw"
-    lr: 1e-4
     weight_decay: 0.01
     betas: [0.9, 0.999]
 
   scheduler:
-    name: "cosine"
     warmup_steps: 500
     min_lr: 1e-6
 
   warmup:
-    epochs: 5
     lr: 1e-4
 
   full:
@@ -62,7 +53,6 @@ corruption:
 # Inference settings for periodic validation sampling during training.
 inference:
   num_steps: 50
-  guidance: 4.0
 
 wandb:
   enabled: true

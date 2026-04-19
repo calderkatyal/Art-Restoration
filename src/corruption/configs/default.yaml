@@ -20,17 +20,6 @@
 #   scratches  -> 'scratches' : narrow elongated band. Half-width scales
 #                              with severity.
 
-channels:
-  - craquelure      # 0  Voronoi tessellation cracks from paint shrinkage
-  - rip_tear        # 1  physical canvas tear with exposed substrate — local only
-  - paint_loss      # 2  blob-shaped paint loss with substrate reveal — local only
-  - yellowing       # 3  varnish yellowing (CIELAB a/b shift)
-  - fading          # 4  photochemical desaturation / bleach
-  - deposits        # 6  grime / soot darkening veil
-  - scratches       # 7  thin linear abrasion marks — local only
-
-num_channels: 7
-
 # Range of how many distinct types are active per image.
 num_simultaneous:
   min: 1
