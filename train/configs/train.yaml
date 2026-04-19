@@ -16,10 +16,17 @@ train:
   # "warmup": backbone frozen, only img_in trained
   # "full":   all layers trained with per-group LRs
   stage: "warmup"
-  data_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
+  train_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
   val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
   checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
+  batch_size: 4
+  num_workers: 4
+  sampler_seed: 42
+  corruption_seed: 42
+  pin_memory: true
+  persistent_workers: true
+  snapshot_every_n_steps: 1
   num_epochs: 50
   seed: 42
   save_every: 1000
