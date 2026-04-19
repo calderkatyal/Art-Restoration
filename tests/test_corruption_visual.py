@@ -41,6 +41,7 @@ from src.corruption.effects import (
 from src.corruption.presets import (
     generate_global_mask, generate_local_mask, SHAPE_KIND_BY_CHANNEL,
 )
+from src.corruption.module import _affected_pixels, _per_component_hull_mask
 
 
 EFFECT_FNS = {
@@ -185,11 +186,16 @@ def apply_single(
     extra = {}
     if corruption == "scratches":
         extra["max_count"] = int(type_cfg.get("local_max_num", 8))
-    # Effects consume the soft mask for intensity modulation; the BINARY
-    # region mask (severity-invariant ROI) is what the ML model sees as
-    # ground truth.
+    # Compute the actual affected-pixel hull mask, matching what the training
+    # pipeline produces (module.py uses the same before/after diff approach).
+    # This gives a tight mask around the actual damage rather than the wider
+    # input band, which is particularly important for scratches.
+    before = image.clone()
     out_img = fn(image, soft_mask, generator=generator, **extra)
-    return out_img, region_mask
+    diff_bool = _affected_pixels(before, out_img, threshold=0.008)
+    H2, W2 = image.shape[-2:]
+    actual_mask = _per_component_hull_mask(diff_bool, H2, W2, merge_radius=3)
+    return out_img, actual_mask
 
 
 def build_cells(corruption_cfg) -> List[Tuple[str, str]]:

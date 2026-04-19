@@ -68,7 +68,7 @@ types:
     max_severity: 1.0
     local_min_num: 2
     local_max_num: 5
-    local_area_frac: [0.0005, 0.006]
+    local_area_frac: [0.003, 0.03]
 
   yellowing:
     weight: 1.0

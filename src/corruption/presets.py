@@ -223,7 +223,9 @@ def _paint_scratches_band(region: torch.Tensor, cx: int, cy: int,
              proportionate even for very thin scratches.
     """
     H, W = region.shape
-    half_w = 3.0 + 6.0 * float(severity)
+    # Minimum 8px half-width so the walker (step_size=1.5, jitter ±7°) stays
+    # inside the band for long enough to draw a visible scratch at any severity.
+    half_w = max(8.0, 3.0 + 6.0 * float(severity))
     half_len_area = target_area / (math.pi * half_w)
     half_len = min(half_len_area, half_w * 12.0)
     half_len = max(half_len, half_w * 3.0)
