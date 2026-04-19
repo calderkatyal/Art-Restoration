@@ -27,7 +27,7 @@ Distributed training:
     logging, validation DataLoader, and WandB run on global rank 0 only.
 
 Checkpointing:
-    DeepSpeed checkpoints live under ``{train.checkpoint_dir}/deepspeed_ckpt/<tag>/``.
+    DeepSpeed checkpoints live under ``{train.checkpoint_dir}/<tag>/``.
     ``train.save_every`` triggers saves every N **optimizer** steps;
     ``train.save_every_images`` triggers after approximately that many **global** images
     (``train_micro_batch_size_per_gpu × world_size × gradient_accumulation_steps``
@@ -47,7 +47,7 @@ Arguments:
     --config    Path to YAML (default: ``train/configs/train.yaml``).
     overrides   Dot-notation overrides, e.g. ``train.stage=full``,
                 ``ds_config.train_micro_batch_size_per_gpu=8``,
-                ``train.resume_from=./checkpoints/deepspeed_ckpt/step_1000``.
+                ``train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000``.
 """
 
 from __future__ import annotations
@@ -472,7 +472,7 @@ def _write_checkpoint_metadata(output_dir: Path, tag: str, client_state: dict) -
     file is a human-readable duplicate for HPC inspection and bookkeeping.
 
     Args:
-        output_dir:   Root ``.../deepspeed_ckpt`` directory.
+        output_dir:   Root directory.
         tag:          Checkpoint tag, e.g. ``step_1000``.
         client_state: Pickle-friendly dict (``step``, ``epoch``, ``stage``, etc.).
     """
@@ -503,7 +503,7 @@ def maybe_save_deepspeed_checkpoint(
     """
     if not do_save:
         return
-    out = Path(cfg.train.checkpoint_dir) / "deepspeed_ckpt"
+    out = Path(cfg.train.checkpoint_dir)
     tag = f"step_{int(client_state['step'])}"
     engine.save_checkpoint(str(out), tag=tag, client_state=client_state)
     if is_main_process():
@@ -889,7 +889,7 @@ if __name__ == "__main__":
     # Examples:
     #   python -m src.train --config train/configs/train.yaml train.stage=warmup
     #   python -m src.train train.stage=full ds_config.train_micro_batch_size_per_gpu=8
-    #   python -m src.train train.resume_from=./checkpoints/deepspeed_ckpt/step_10000
+    #   python -m src.train train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000
     parser = argparse.ArgumentParser(description="Art restoration DiT training")
     parser.add_argument(
         "--config",
