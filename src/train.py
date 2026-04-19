@@ -66,11 +66,10 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from .corruption import downsample_mask
-from .dataset import ArtRestorationDataset
+from .dataset import ArtRestorationDataset, build_wikiart_dataloader
 from .distributed import get_device, get_global_rank, get_world_size, is_main_process
 from .inference import sample
 from .model import RestorationDiT
@@ -277,23 +276,46 @@ def build_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda, last_epoch=-1)
 
 
-def _worker_init_fn(worker_id: int, base_seed: int, rank: int) -> None:
-    """Deterministic-ish seeding for DataLoader workers (``worker_init_fn``).
+def _train_dir(cfg: DictConfig) -> str:
+    value = cfg.train.get("train_dir", cfg.train.get("data_dir"))
+    if value in (None, ""):
+        raise ValueError("Config must define train.train_dir")
+    return str(value)
 
-    Combines the global training seed, dataloader worker index, and process rank so
-    different ranks and workers do not replay identical corruption noise.
-    """
-    seed = base_seed + worker_id + rank * 1000
-    random.seed(seed)
-    torch.manual_seed(seed)
+
+def _val_dir(cfg: DictConfig) -> str:
+    value = cfg.train.get("val_dir")
+    if value in (None, ""):
+        raise ValueError("Config must define train.val_dir")
+    return str(value)
 
 
 def _micro_batch_size(cfg: DictConfig) -> int:
-    """Return the per-GPU micro-batch size from DeepSpeed config."""
-    value = cfg.ds_config.get("train_micro_batch_size_per_gpu")
-    if value in (None, "auto"):
-        raise ValueError("ds_config.train_micro_batch_size_per_gpu must be set explicitly")
-    return int(value)
+    """Return the per-GPU batch size and enforce config consistency."""
+    train_batch = cfg.train.get("batch_size")
+    ds_micro = cfg.ds_config.get("train_micro_batch_size_per_gpu")
+
+    if train_batch in (None, "auto") and ds_micro in (None, "auto"):
+        raise ValueError(
+            "Set either train.batch_size or ds_config.train_micro_batch_size_per_gpu."
+        )
+
+    if train_batch in (None, "auto"):
+        batch_size = int(ds_micro)
+        cfg.train.batch_size = batch_size
+        return batch_size
+
+    batch_size = int(train_batch)
+    if ds_micro in (None, "auto"):
+        cfg.ds_config.train_micro_batch_size_per_gpu = batch_size
+        return batch_size
+
+    if int(ds_micro) != batch_size:
+        raise ValueError(
+            "train.batch_size must match ds_config.train_micro_batch_size_per_gpu "
+            f"(got {batch_size} vs {int(ds_micro)})."
+        )
+    return batch_size
 
 
 def _distributed_barrier() -> None:
@@ -306,45 +328,27 @@ def setup_dataloader(
     cfg: DictConfig,
     max_simultaneous: int | None = None,
     split: str = "train",
-    sampler: Optional[DistributedSampler] = None,
 ) -> tuple[DataLoader, ArtRestorationDataset]:
-    """Create a ``DataLoader`` over :class:`~src.dataset.ArtRestorationDataset`.
-
-    Uses ``cfg.train.data_dir`` for ``split=="train"`` and ``cfg.train.val_dir`` for
-    validation. When ``sampler`` is ``None`` and ``split=="train"``, ``shuffle=True``;
-    when a ``DistributedSampler`` is supplied, ``shuffle`` must be ``False`` on the
-    loader (the sampler owns shuffling via ``set_epoch``).
-
-    Args:
-        cfg:              Full config (paths, resolution, micro-batch size, ``num_workers``).
-        max_simultaneous: Optional curriculum override forwarded to the dataset / corruption.
-        split:            ``"train"`` or ``"val"`` selecting the image root directory.
-        sampler:          Optional ``DistributedSampler`` for DDP / DeepSpeed multi-GPU.
-
-    Returns:
-        ``(dataloader, dataset)`` — the dataset is returned so callers can attach a
-        sampler that references the **same** object instance if they rebuild the loader.
-    """
-    data_dir = cfg.train.data_dir if split == "train" else cfg.train.val_dir
-    ds = ArtRestorationDataset(
-        data_dir=data_dir,
+    """Create a train or val dataloader using the resumable dataset helpers."""
+    dataset, loader, _ = build_wikiart_dataloader(
+        train_dir=_train_dir(cfg),
+        val_dir=_val_dir(cfg),
         resolution=int(cfg.train.resolution),
         corruption_config=cfg.corruption,
-        max_simultaneous=max_simultaneous,
-    )
-    nw = int(getattr(cfg.train, "num_workers", 4))
-    loader = DataLoader(
-        ds,
         batch_size=_micro_batch_size(cfg),
-        sampler=sampler,
-        shuffle=(sampler is None and split == "train"),
-        num_workers=nw,
-        pin_memory=True,
-        persistent_workers=nw > 0,
-        worker_init_fn=lambda wid: _worker_init_fn(wid, int(cfg.train.seed), get_global_rank()),
+        split=split,
+        max_simultaneous=max_simultaneous,
+        num_workers=int(getattr(cfg.train, "num_workers", 4)),
+        sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
+        corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
+        pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
+        persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
+        distributed=False,
         drop_last=False,
+        return_metadata=False,
     )
-    return loader, ds
+    return loader, dataset
 
 
 def compute_flow_loss(
@@ -532,79 +536,99 @@ def _curriculum_max_sim(cfg: DictConfig, epoch: int) -> int | None:
     return None
 
 
+def _capture_train_loader_state(
+    train_loader: DataLoader,
+    train_dataset: ArtRestorationDataset,
+    train_sampler: Any,
+) -> dict[str, Any]:
+    if hasattr(train_loader, "state_dict"):
+        return {
+            "mode": "loader",
+            "loader": train_loader.state_dict(),
+        }
+    state: dict[str, Any] = {"mode": "manual"}
+    if hasattr(train_sampler, "state_dict"):
+        state["sampler"] = train_sampler.state_dict()
+    if hasattr(train_dataset, "state_dict"):
+        state["dataset"] = train_dataset.state_dict()
+    return state
+
+
+def _restore_train_loader_state(
+    train_loader: DataLoader,
+    train_dataset: ArtRestorationDataset,
+    train_sampler: Any,
+    state: Any,
+) -> bool:
+    if not state:
+        return False
+    if state.get("mode") == "loader" and hasattr(train_loader, "load_state_dict"):
+        train_loader.load_state_dict(state["loader"])
+        return True
+    if "sampler" in state and hasattr(train_sampler, "load_state_dict"):
+        train_sampler.load_state_dict(state["sampler"])
+    if "dataset" in state and hasattr(train_dataset, "load_state_dict"):
+        train_dataset.load_state_dict(state["dataset"])
+    return True
+
+
 def _build_train_loader(
     cfg: DictConfig,
     corrupt_cfg: DictConfig,
     max_sim: int | None,
     world_size: int,
-) -> tuple[DataLoader, ArtRestorationDataset, Optional[DistributedSampler]]:
-    """Build train ``DataLoader``, backing dataset, and optional ``DistributedSampler``.
-
-    Centralizes the pattern: construct ``ArtRestorationDataset`` from ``cfg.train``,
-    wrap with ``DistributedSampler`` when ``world_size > 1``, and apply ``DataLoader``
-    knobs (``num_workers``, ``pin_memory``, ``persistent_workers``, worker seeding).
-
-    Args:
-        cfg:          Full config.
-        corrupt_cfg:  Loaded corruption config from ``cfg.corruption`` (shared, not mutated).
-        max_sim:      Curriculum override (``1`` or ``None``).
-        world_size:   ``torch.distributed`` world size (1 means single-process).
-
-    Returns:
-        Tuple ``(train_loader, train_dataset, sampler_or_none)``.
-    """
-    ds = ArtRestorationDataset(
-        data_dir=cfg.train.data_dir,
+) -> tuple[DataLoader, ArtRestorationDataset, Any]:
+    """Build the training dataloader plus its dataset and sampler."""
+    dataset, loader, sampler = build_wikiart_dataloader(
+        train_dir=_train_dir(cfg),
+        val_dir=_val_dir(cfg),
         resolution=int(cfg.train.resolution),
         corruption_config=corrupt_cfg,
-        max_simultaneous=max_sim,
-    )
-    sampler: Optional[DistributedSampler] = None
-    if world_size > 1:
-        sampler = DistributedSampler(ds, shuffle=True, drop_last=False)
-    nw = int(getattr(cfg.train, "num_workers", 4))
-    loader = DataLoader(
-        ds,
         batch_size=_micro_batch_size(cfg),
-        sampler=sampler,
-        shuffle=(sampler is None),
-        num_workers=nw,
-        pin_memory=True,
-        persistent_workers=nw > 0,
-        worker_init_fn=lambda wid: _worker_init_fn(wid, int(cfg.train.seed), get_global_rank()),
+        split="train",
+        max_simultaneous=max_sim,
+        num_workers=int(getattr(cfg.train, "num_workers", 4)),
+        sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
+        corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
+        pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
+        persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
+        distributed=world_size > 1,
+        num_replicas=world_size if world_size > 1 else None,
+        rank=get_global_rank() if world_size > 1 else None,
         drop_last=False,
+        return_metadata=False,
     )
-    return loader, ds, sampler
+    return loader, dataset, sampler
 
 
 def _build_val_loader(
     cfg: DictConfig,
     corrupt_cfg: DictConfig,
     world_size: int,
-) -> tuple[DataLoader, ArtRestorationDataset, Optional[DistributedSampler]]:
+) -> tuple[DataLoader, ArtRestorationDataset, Any]:
     """Build validation ``DataLoader`` and optional ``DistributedSampler``."""
-    ds = ArtRestorationDataset(
-        data_dir=cfg.train.val_dir,
+    dataset, loader, sampler = build_wikiart_dataloader(
+        train_dir=_train_dir(cfg),
+        val_dir=_val_dir(cfg),
         resolution=int(cfg.train.resolution),
         corruption_config=corrupt_cfg,
-        max_simultaneous=None,
-    )
-    sampler: Optional[DistributedSampler] = None
-    if world_size > 1:
-        sampler = DistributedSampler(ds, shuffle=False, drop_last=False)
-    nw = int(getattr(cfg.train, "num_workers", 4))
-    loader = DataLoader(
-        ds,
         batch_size=_micro_batch_size(cfg),
-        sampler=sampler,
-        shuffle=False,
-        num_workers=nw,
-        pin_memory=True,
-        persistent_workers=nw > 0,
-        worker_init_fn=lambda wid: _worker_init_fn(wid, int(cfg.train.seed), get_global_rank()),
+        split="val",
+        max_simultaneous=None,
+        num_workers=int(getattr(cfg.train, "num_workers", 4)),
+        sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
+        corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
+        pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
+        persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
+        distributed=world_size > 1,
+        num_replicas=world_size if world_size > 1 else None,
+        rank=get_global_rank() if world_size > 1 else None,
         drop_last=False,
+        return_metadata=False,
     )
-    return loader, ds, sampler
+    return loader, dataset, sampler
 
 
 def _latest_checkpoint_tag(checkpoint_dir: Path) -> str | None:
@@ -687,10 +711,9 @@ def main(cfg: DictConfig) -> None:
     # --- Data: train (possibly curriculum); val only on rank 0 to avoid duplicate work ---
     start_epoch = 0
     max_sim = _curriculum_max_sim(cfg, start_epoch)
-    train_loader, _, train_sampler = _build_train_loader(
+    train_loader, train_dataset, train_sampler = _build_train_loader(
         cfg, corrupt_cfg, max_sim, world_size
     )
-
     val_loader, _, val_sampler = _build_val_loader(cfg, corrupt_cfg, world_size)
 
     steps_per_epoch = max(len(train_loader), 1)
@@ -717,6 +740,7 @@ def main(cfg: DictConfig) -> None:
     global_step = 0
     images_since_save = 0
     last_save_step = 0
+    restored_train_state = False
 
     # --- Single-source load policy: checkpoint OR pretrained; fallback to pretrained on errors ---
     if should_try_checkpoint:
@@ -730,9 +754,15 @@ def main(cfg: DictConfig) -> None:
                 new_max = _curriculum_max_sim(cfg, start_epoch)
                 if new_max != max_sim:
                     max_sim = new_max
-                    train_loader, _, train_sampler = _build_train_loader(
+                    train_loader, train_dataset, train_sampler = _build_train_loader(
                         cfg, corrupt_cfg, max_sim, world_size
                     )
+                restored_train_state = _restore_train_loader_state(
+                    train_loader,
+                    train_dataset,
+                    train_sampler,
+                    client.get("train_loader_state"),
+                )
                 if is_main_process():
                     print(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
             else:
@@ -749,6 +779,7 @@ def main(cfg: DictConfig) -> None:
             global_step = 0
             images_since_save = 0
             last_save_step = 0
+            restored_train_state = False
     _distributed_barrier()
 
     engine.train()
@@ -765,15 +796,17 @@ def main(cfg: DictConfig) -> None:
     images_per_opt_step = micro_batch * world_size * grad_accum
 
     for epoch in range(start_epoch, int(cfg.train.num_epochs)):
-        if train_sampler is not None:
+        resumed_epoch = restored_train_state and epoch == start_epoch
+
+        if not resumed_epoch and train_sampler is not None:
             train_sampler.set_epoch(epoch)
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
 
         curriculum_max_sim = _curriculum_max_sim(cfg, epoch)
-        if curriculum_max_sim != max_sim:
+        if not resumed_epoch and curriculum_max_sim != max_sim:
             max_sim = curriculum_max_sim
-            train_loader, _, train_sampler = _build_train_loader(
+            train_loader, train_dataset, train_sampler = _build_train_loader(
                 cfg, corrupt_cfg, max_sim, world_size
             )
 
@@ -853,6 +886,11 @@ def main(cfg: DictConfig) -> None:
                     "epoch": epoch,
                     "stage": str(cfg.train.stage),
                     "images_since_save": images_since_save,
+                    "train_loader_state": _capture_train_loader_state(
+                        train_loader,
+                        train_dataset,
+                        train_sampler,
+                    ),
                 }
                 maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True)
                 last_save_step = global_step
@@ -871,11 +909,18 @@ def main(cfg: DictConfig) -> None:
                     )
                 _distributed_barrier()
 
+        restored_train_state = False
+
     client_state = {
         "step": global_step,
         "epoch": int(cfg.train.num_epochs),
         "stage": str(cfg.train.stage),
         "images_since_save": images_since_save,
+        "train_loader_state": _capture_train_loader_state(
+            train_loader,
+            train_dataset,
+            train_sampler,
+        ),
     }
     maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True)
     wandb_finish()
