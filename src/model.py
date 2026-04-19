@@ -36,6 +36,7 @@ import torch.nn as nn
 from einops import rearrange
 from torch import Tensor
 from typing import Any, List
+from typing import Any, List
 
 from .flux2.model import Flux2, Klein4BParams
 from .flux2.sampling import batched_prc_img, batched_prc_txt
