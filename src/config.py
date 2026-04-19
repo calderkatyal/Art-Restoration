@@ -189,14 +189,13 @@ class TrainConfig:
     Attributes:
         stage:        "warmup" → freeze backbone, train img_in only.
                       "full"   → train all layers with separate per-group LRs.
-        data_dir:     Root dir of clean WikiArt images. dataset.py derives the
-                      train/eval split from this single directory.
+        train_dir:    Root dir of clean WikiArt training images.
+        val_dir:      Root dir of clean WikiArt validation images.
         output_dir:   Directory for checkpoints.
         resolution:   Square crop resolution (H = W = resolution).
         batch_size:   Per-GPU batch size.
         num_workers:  DataLoader worker count.
-        train_ratio:  Fraction of WikiArt used for the train split.
-        split_seed:   Seed for the deterministic train/eval split and shuffling.
+        sampler_seed: Seed for DataLoader shuffle order.
         corruption_seed:
                       Base seed for the corruption RNG stream.
         pin_memory:   Whether DataLoader should pin host memory.
@@ -217,13 +216,13 @@ class TrainConfig:
         wandb:        WandbConfig.
     """
     stage: str = "warmup"
-    data_dir: str = "./data/wikiart"
+    train_dir: str = "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
+    val_dir: str = "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
     output_dir: str = "./checkpoints"
     resolution: int = 512
     batch_size: int = 4
     num_workers: int = 4
-    train_ratio: float = 0.8
-    split_seed: int = 42
+    sampler_seed: int = 42
     corruption_seed: int = 42
     pin_memory: bool = True
     persistent_workers: bool = True

@@ -13,13 +13,13 @@ train:
   # stage: "warmup" trains only img_in (backbone frozen)
   #        "full"   trains all layers
   stage: "warmup"
-  data_dir: "./data/wikiart"   # single WikiArt root; train/eval split happens in dataset.py
+  train_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
+  val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
   output_dir: "./checkpoints"
   resolution: 512
   batch_size: 4
   num_workers: 4
-  train_ratio: 0.99
-  split_seed: 42
+  sampler_seed: 42
   corruption_seed: 42
   pin_memory: true
   persistent_workers: true
