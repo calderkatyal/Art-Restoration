@@ -23,7 +23,7 @@
 
 # Probability that exactly N degradation types are active, for N = 1..7.
 # Entries are normalized internally, so they only need to be non-negative.
-active_count_probs: [0.333333, 0.333333, 0.333334, 0.0, 0.0, 0.0, 0.0]
+active_count_probs: [0.35, 0.25, 0.15, 0.1, 0.075, 0.05, 0.025]
 
 # Training only: zero per-type mask channels with this probability (union channel kept).
 # Overridden by `corruption.dropout_prob` in the training YAML when merged.
