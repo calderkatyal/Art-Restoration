@@ -30,6 +30,7 @@ train:
   num_epochs: 50
   seed: 42
   save_every: 1000
+  val_every: 80
   log_every: 100
   # Weight on velocity MSE inside the (latent) damage mask vs outside; see compute_flow_loss.
   loss_weight_mask: 0.7
@@ -68,8 +69,8 @@ inference:
 
 wandb:
   enabled: true
-  project: "art-restoration"
-  entity: null            # set to your wandb username or team, or null
+  project: "V1 Training"
+  entity: "katyalcalder-research"
   run_name: null          # null = auto-generated
   tags: []                # e.g. ["warmup", "klein-4b"]
   log_images: true
@@ -80,7 +81,7 @@ wandb:
 # above); DeepSpeed handles ZeRO-2 partitioning, bf16, gradient clipping.
 ds_config:
   train_micro_batch_size_per_gpu: 4
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 4
   gradient_clipping: 1.0
   steps_per_print: 100
   bf16:
