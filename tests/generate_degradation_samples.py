@@ -134,6 +134,49 @@ def try_get_font(size: int = 14):
     return ImageFont.load_default()
 
 
+def overlay_red_mask(
+    image: Image.Image,
+    actual_mask: torch.Tensor,
+    soft_mask: torch.Tensor,
+    width: int = 2,
+) -> Image.Image:
+    """Draw a thin red boundary using actual_mask; fall back to soft_mask if empty."""
+    candidate = actual_mask.detach().cpu()
+    if candidate.max().item() < 0.05:
+        # actual_mask empty (e.g. subtle craquelure) — use soft_mask instead
+        candidate = soft_mask.detach().cpu()
+
+    m = candidate > 0.05
+    if not m.any():
+        return image.copy()
+
+    up    = torch.zeros_like(m); up[1:]      = m[:-1]
+    down  = torch.zeros_like(m); down[:-1]   = m[1:]
+    left  = torch.zeros_like(m); left[:, 1:] = m[:, :-1]
+    right = torch.zeros_like(m); right[:, :-1] = m[:, 1:]
+    boundary = m & ~(m & up & down & left & right)
+
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    ys, xs = torch.nonzero(boundary, as_tuple=True)
+    if width <= 1:
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            draw.point((x, y), fill=(255, 0, 0))
+    else:
+        r = width // 2
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0))
+    return out
+
+
+def count_instances(mask: torch.Tensor, threshold: float = 0.02) -> int:
+    """Count connected components (degradation instances) in a mask."""
+    from scipy.ndimage import label as _cc_label
+    binary = (mask >= threshold).cpu().numpy()
+    _, n = _cc_label(binary)
+    return int(n)
+
+
 def apply_corruption(
     image: torch.Tensor,
     corruption: str,
@@ -142,7 +185,7 @@ def apply_corruption(
     type_cfg,
     generator: torch.Generator,
 ) -> tuple:
-    """Returns (corrupted_image, soft_mask)."""
+    """Returns (corrupted_image, soft_mask, actual_mask, num_instances)."""
     H, W = image.shape[-2:]
     device = image.device
 
@@ -174,7 +217,8 @@ def apply_corruption(
     diff_bool = _affected_pixels(before, out_img, threshold=0.008)
     H2, W2 = image.shape[-2:]
     actual_mask = _per_component_hull_mask(diff_bool, H2, W2, merge_radius=3)
-    return out_img, actual_mask
+    n_instances = count_instances(actual_mask)
+    return out_img, soft_mask, actual_mask, n_instances
 
 
 def mask_to_pil(m: torch.Tensor, resolution: int) -> Image.Image:
@@ -312,19 +356,20 @@ def main():
                 severity = min_s + random.random() * (max_s - min_s)
 
                 try:
-                    out, soft_mask = apply_corruption(image, corruption, mode, severity, type_cfg, gen)
+                    out, soft_mask, actual_mask, n_inst = apply_corruption(image, corruption, mode, severity, type_cfg, gen)
                 except Exception as e:
                     print(f"  ERROR on {stem} sev={severity:.2f}: {e}")
                     continue
 
                 sev_str = f"{severity:.2f}"
-                fname = f"{stem}_{mode}_sev{sev_str}_seed{seed_i}.jpg"
+                fname = f"{corruption}_{stem}_sev{sev_str}_n{n_inst}.jpg"
                 fpath = os.path.join(type_dir, fname)
-                tensor_to_pil(out).save(fpath, quality=90)
+                out_pil = overlay_red_mask(tensor_to_pil(out), actual_mask, soft_mask)
+                out_pil.save(fpath, quality=90)
 
-                thumbs.append(tensor_to_pil(out))
-                mask_thumbs.append(mask_to_pil(soft_mask, args.resolution))
-                labels.append(f"{stem[:10]} s={sev_str}")
+                thumbs.append(out_pil)
+                mask_thumbs.append(mask_to_pil(actual_mask, args.resolution))
+                labels.append(f"{stem[:10]} s={sev_str} n={n_inst}")
                 saved += 1
 
         cols = 6
