@@ -1,7 +1,8 @@
 # Corruption pipeline configuration.
 #
-# Each sample: a random subset of `num_simultaneous.[min, max]` types is
-# selected using per-type weights. For each selected type, the mask is
+# Each sample: the number of active degradation types is drawn from
+# `active_count_probs`, then that many types are selected using per-type weights.
+# For each selected type, the mask is
 # generated in either "local" (scattered irregular shapes) or "global"
 # (uniform fill) mode, uniformly at random among the modes enabled for
 # that type. Severity is drawn uniformly in [min_severity, max_severity].
@@ -20,10 +21,9 @@
 #   scratches  -> 'scratches' : narrow elongated band. Half-width scales
 #                              with severity.
 
-# Range of how many distinct types are active per image.
-num_simultaneous:
-  min: 1
-  max: 3
+# Probability that exactly N degradation types are active, for N = 1..7.
+# Entries are normalized internally, so they only need to be non-negative.
+active_count_probs: [0.333333, 0.333333, 0.333334, 0.0, 0.0, 0.0, 0.0]
 
 # Training only: zero per-type mask channels with this probability (union channel kept).
 # Overridden by `corruption.dropout_prob` in the training YAML when merged.

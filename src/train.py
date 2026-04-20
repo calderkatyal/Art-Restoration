@@ -12,15 +12,11 @@ Rectified flow objective per training step:
        union-mask vs outside; see :func:`compute_flow_loss`.
     8. ``engine.backward`` / ``engine.step`` (DeepSpeed); LR scheduler stepped by DeepSpeed.
 
-Training stages (``cfg.train.stage``):
-    ``"warmup"``: backbone frozen; only ``img_in`` trained at ``cfg.train.warmup.lr``.
-    ``"full"``:   all layers trainable; backbone at ``cfg.train.full.backbone_lr``,
-                  ``img_in`` at ``cfg.train.full.img_in_lr``.
-
-Curriculum (``cfg.train.curriculum.enabled``):
-    For the first ``curriculum.warmup_epochs`` epochs, ``max_simultaneous=1`` is applied
-    by forcing ``individual_prob = 1.0`` in a copy of the corruption config so the
-    dataloader favours single-degradation corruptions.
+Warm-up:
+    For the first ``cfg.train.warmup_iterations`` optimizer steps, backbone weights stay
+    frozen and only ``img_in`` is trained at ``cfg.train.warmup.lr``. After that,
+    all layers are trainable and the optimizer switches to
+    ``cfg.train.full.backbone_lr`` / ``cfg.train.full.img_in_lr``.
 
 Distributed training:
     Launch with ``torchrun`` / DeepSpeed so ``RANK``, ``LOCAL_RANK``, and ``WORLD_SIZE``
@@ -46,7 +42,7 @@ Usage:
 
 Arguments:
     --config    Path to YAML (default: ``train/configs/train.yaml``).
-    overrides   Dot-notation overrides, e.g. ``train.stage=full``,
+    overrides   Dot-notation overrides, e.g. ``train.warmup_iterations=1000``,
                 ``ds_config.train_micro_batch_size_per_gpu=8``,
                 ``train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000``.
 """
@@ -162,17 +158,19 @@ def setup_model(
     cfg: DictConfig,
     device: torch.device,
     rank: int,
+    warmup_only: bool,
     load_pretrained: bool = True,
 ) -> tuple[RestorationDiT, FluxVAE, torch.Tensor]:
     """Construct the restoration DiT, frozen FLUX VAE, and cached null text embedding.
 
-    Calls ``model.set_stage(cfg.train.stage)`` so only the intended parameters require
-    gradients before the optimizer is built.
+    Calls ``model.set_trainability(warmup_only)`` so only the intended parameters
+    require gradients before the optimizer is built.
 
     Args:
-        cfg:    Full OmegaConf ``DictConfig`` (uses ``cfg.model`` and ``cfg.train.stage``).
+        cfg:    Full OmegaConf ``DictConfig`` (uses ``cfg.model`` and ``cfg.train``).
         device: CUDA device for this process (typically ``cuda:LOCAL_RANK``).
         rank:   Global rank, forwarded to weight download logging and VAE init.
+        warmup_only: Whether training should start in img_in-only warm-up mode.
         load_pretrained: Whether to load FLUX pretrained weights before widening ``img_in``.
 
     Returns:
@@ -186,7 +184,7 @@ def setup_model(
         load_pretrained=load_pretrained,
         rank=rank,
     )
-    flow_model.set_stage(cfg.train.stage)
+    flow_model.set_trainability(warmup_only)
 
     vae = FluxVAE(
         flux_model_name=cfg.model.flux_model_name,
@@ -201,34 +199,35 @@ def setup_model(
     return flow_model, vae, null_emb
 
 
-def build_optimizer(model: RestorationDiT, cfg: DictConfig) -> torch.optim.Optimizer:
-    """Build AdamW with learning rates appropriate for the current training stage.
+def build_optimizer(
+    model: RestorationDiT,
+    cfg: DictConfig,
+    warmup_only: bool,
+) -> torch.optim.Optimizer:
+    """Build AdamW for either warm-up or full training.
 
-    Warmup stage → single param group: all trainable ``img_in`` weights at
-    ``cfg.train.warmup.lr`` (backbone should already be frozen via ``set_stage``).
-
-    Full stage → two groups from ``model.get_trainable_params()``:
-        ``img_in`` at ``cfg.train.full.img_in_lr``, backbone at ``cfg.train.full.backbone_lr``.
+    Warm-up keeps the backbone frozen and sets its optimizer LR to zero. After warm-up,
+    ``img_in`` and backbone use their full-training learning rates.
 
     Weight decay and Adam ``betas`` come from ``cfg.train.optimizer``.
 
     Args:
-        model: ``RestorationDiT`` with ``requires_grad`` flags already set for the stage.
+        model: ``RestorationDiT`` with ``requires_grad`` flags already set for the phase.
         cfg:   Full config.
+        warmup_only: Whether to start in img_in-only warm-up mode.
 
     Returns:
         A ``torch.optim.AdamW`` instance suitable for passing to ``deepspeed.initialize``.
     """
     wd = cfg.train.optimizer.weight_decay
     betas = tuple(cfg.train.optimizer.betas)
-    if cfg.train.stage == "warmup":
-        params = [p for p in model.flow_model.img_in.parameters() if p.requires_grad]
-        return torch.optim.AdamW(params, lr=cfg.train.warmup.lr, betas=betas, weight_decay=wd)
     groups = model.get_trainable_params()
+    img_in_lr = float(cfg.train.warmup.lr) if warmup_only else float(cfg.train.full.img_in_lr)
+    backbone_lr = 0.0 if warmup_only else float(cfg.train.full.backbone_lr)
     return torch.optim.AdamW(
         [
-            {"params": groups[0]["params"], "lr": cfg.train.full.img_in_lr, "name": "img_in"},
-            {"params": groups[1]["params"], "lr": cfg.train.full.backbone_lr, "name": "backbone"},
+            {"params": groups[0]["params"], "lr": img_in_lr, "name": "img_in"},
+            {"params": groups[1]["params"], "lr": backbone_lr, "name": "backbone"},
         ],
         betas=betas,
         weight_decay=wd,
@@ -243,7 +242,7 @@ def build_scheduler(
     """Cosine decay with linear warmup, implemented as a single ``LambdaLR`` multiplier.
 
     The multiplier applies equally to all param groups; their *absolute* LRs differ
-    if the optimizer used different base rates per group (full stage).
+    if the optimizer used different base rates per group.
 
     Warmup ramps the multiplier linearly from ``1/warmup_steps`` to ``1`` over
     ``warmup_steps``. Afterward a cosine drops the multiplier from ``1`` down to
@@ -325,9 +324,53 @@ def _distributed_barrier() -> None:
         dist.barrier()
 
 
+def _warmup_iterations(cfg: DictConfig) -> int:
+    return max(0, int(getattr(cfg.train, "warmup_iterations", 0)))
+
+
+def _warmup_only_for_step(cfg: DictConfig, step: int) -> bool:
+    return int(step) < _warmup_iterations(cfg)
+
+
+def _step_from_tag(tag: str | None) -> int:
+    if not tag:
+        return 0
+    try:
+        return max(0, int(str(tag).split("_", 1)[1]))
+    except (IndexError, ValueError):
+        return 0
+
+
+def _phase_lrs(cfg: DictConfig, warmup_only: bool) -> dict[str, float]:
+    return {
+        "img_in": float(cfg.train.warmup.lr) if warmup_only else float(cfg.train.full.img_in_lr),
+        "backbone": 0.0 if warmup_only else float(cfg.train.full.backbone_lr),
+    }
+
+
+def _apply_training_phase(
+    model: RestorationDiT,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Any,
+    cfg: DictConfig,
+    step: int,
+) -> bool:
+    warmup_only = _warmup_only_for_step(cfg, step)
+    model.set_trainability(warmup_only)
+    lrs = _phase_lrs(cfg, warmup_only)
+    base_lrs: list[float] = []
+    for group in optimizer.param_groups:
+        lr = lrs.get(group.get("name", ""), float(group["lr"]))
+        group["lr"] = lr
+        group["initial_lr"] = lr
+        base_lrs.append(lr)
+    if scheduler is not None and hasattr(scheduler, "base_lrs"):
+        scheduler.base_lrs = list(base_lrs)
+    return warmup_only
+
+
 def setup_dataloader(
     cfg: DictConfig,
-    max_simultaneous: int | None = None,
     split: str = "train",
 ) -> tuple[DataLoader, ArtRestorationDataset]:
     """Create a train or val dataloader using the resumable dataset helpers."""
@@ -338,7 +381,6 @@ def setup_dataloader(
         corruption_config=cfg.corruption,
         batch_size=_micro_batch_size(cfg),
         split=split,
-        max_simultaneous=max_simultaneous,
         num_workers=int(getattr(cfg.train, "num_workers", 4)),
         sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
@@ -499,7 +541,7 @@ def _write_checkpoint_metadata(output_dir: Path, tag: str, client_state: dict) -
     Args:
         output_dir:   Root directory.
         tag:          Checkpoint tag, e.g. ``step_1000``.
-        client_state: Pickle-friendly dict (``step``, ``epoch``, ``stage``, etc.).
+        client_state: Pickle-friendly dict (``step``, ``epoch``, etc.).
     """
     if not is_main_process():
         return
@@ -543,20 +585,6 @@ def train(cfg: DictConfig) -> None:
     main(cfg)
 
 
-def _curriculum_max_sim(cfg: DictConfig, epoch: int) -> int | None:
-    """Return ``max_simultaneous`` mask for the dataset at ``epoch``, or ``None`` if disabled.
-
-    When curriculum is enabled and ``epoch < curriculum.warmup_epochs``, returns ``1``
-    so :class:`~src.dataset.ArtRestorationDataset` biases toward single-degradation
-    corruptions. Otherwise returns ``None`` (full preset statistics from YAML).
-    """
-    if not cfg.train.curriculum.get("enabled", False):
-        return None
-    if epoch < int(cfg.train.curriculum.warmup_epochs):
-        return 1
-    return None
-
-
 def _capture_train_loader_state(
     train_loader: DataLoader,
     train_dataset: ArtRestorationDataset,
@@ -596,7 +624,6 @@ def _restore_train_loader_state(
 def _build_train_loader(
     cfg: DictConfig,
     corrupt_cfg: DictConfig,
-    max_sim: int | None,
     world_size: int,
 ) -> tuple[DataLoader, ArtRestorationDataset, Any]:
     """Build the training dataloader plus its dataset and sampler."""
@@ -607,7 +634,6 @@ def _build_train_loader(
         corruption_config=corrupt_cfg,
         batch_size=_micro_batch_size(cfg),
         split="train",
-        max_simultaneous=max_sim,
         num_workers=int(getattr(cfg.train, "num_workers", 4)),
         sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
@@ -636,7 +662,6 @@ def _build_val_loader(
         corruption_config=corrupt_cfg,
         batch_size=_micro_batch_size(cfg),
         split="val",
-        max_simultaneous=None,
         num_workers=int(getattr(cfg.train, "num_workers", 4)),
         sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
@@ -693,9 +718,10 @@ def main(cfg: DictConfig) -> None:
         3. Build train & val dataloaders (DistributedSampler on train if multi-GPU).
         4. AdamW + LambdaLR, then ``deepspeed.initialize`` (ZeRO-2 + bf16 from YAML).
         5. Optional ``load_checkpoint`` resume.
-        6. Epoch loop: curriculum may rebuild the train loader; each step runs
+        6. Epoch loop: each step runs
            :func:`compute_flow_loss`, ``backward``, ``step``; periodic WandB logging,
-           distributed validation loss evaluation, and DeepSpeed saves on all ranks.
+           distributed validation loss evaluation, warm-up unfreeze when
+           ``train.warmup_iterations`` is reached, and DeepSpeed saves on all ranks.
 
     Args:
         cfg: Merged ``DictConfig`` from :func:`src.utils.load_config`.
@@ -717,24 +743,24 @@ def main(cfg: DictConfig) -> None:
 
     load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
     should_try_checkpoint = load_dir is not None and load_tag is not None
+    initial_step_hint = _step_from_tag(load_tag)
+    warmup_only = _warmup_only_for_step(cfg, initial_step_hint)
 
     # --- Models: either checkpoint-first init (no pretrained) or pretrained fallback path ---
     flow_model, vae, null_emb = setup_model(
         cfg,
         device,
         rank,
+        warmup_only=warmup_only,
         load_pretrained=not should_try_checkpoint,
     )
     vae = vae.to(device).requires_grad_(False).eval()
 
     corrupt_cfg = cfg.corruption
 
-    # --- Data: train (possibly curriculum); val only on rank 0 to avoid duplicate work ---
+    # --- Data: train + val ---
     start_epoch = 0
-    max_sim = _curriculum_max_sim(cfg, start_epoch)
-    train_loader, train_dataset, train_sampler = _build_train_loader(
-        cfg, corrupt_cfg, max_sim, world_size
-    )
+    train_loader, train_dataset, train_sampler = _build_train_loader(cfg, corrupt_cfg, world_size)
     val_loader, _, val_sampler = _build_val_loader(cfg, corrupt_cfg, world_size)
 
     steps_per_epoch = max(len(train_loader), 1)
@@ -744,7 +770,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     # --- Optimizer / scheduler / DeepSpeed engine (ZeRO partitioning lives here) ---
-    optimizer = build_optimizer(flow_model, cfg)
+    optimizer = build_optimizer(flow_model, cfg, warmup_only=warmup_only)
     scheduler = build_scheduler(optimizer, cfg, total_optimizer_steps)
 
     ds_cfg = OmegaConf.to_container(cfg.ds_config, resolve=True)
@@ -763,6 +789,7 @@ def main(cfg: DictConfig) -> None:
     last_save_step = 0
     restored_train_state = False
     last_logged_step = 0
+    warmup_only = _apply_training_phase(flow_model, optimizer, scheduler, cfg, step=global_step)
 
     # --- Single-source load policy: checkpoint OR pretrained; fallback to pretrained on errors ---
     if should_try_checkpoint:
@@ -773,12 +800,6 @@ def main(cfg: DictConfig) -> None:
                 global_step = int(client.get("step", 0))
                 images_since_save = int(client.get("images_since_save", 0))
                 last_save_step = global_step
-                new_max = _curriculum_max_sim(cfg, start_epoch)
-                if new_max != max_sim:
-                    max_sim = new_max
-                    train_loader, train_dataset, train_sampler = _build_train_loader(
-                        cfg, corrupt_cfg, max_sim, world_size
-                    )
                 restored_train_state = _restore_train_loader_state(
                     train_loader,
                     train_dataset,
@@ -802,6 +823,13 @@ def main(cfg: DictConfig) -> None:
             images_since_save = 0
             last_save_step = 0
             restored_train_state = False
+    warmup_only = _apply_training_phase(
+        _unwrap_model(engine),
+        engine.optimizer,
+        engine.lr_scheduler if hasattr(engine, "lr_scheduler") else scheduler,
+        cfg,
+        step=global_step,
+    )
     last_logged_step = global_step
     _distributed_barrier()
 
@@ -826,13 +854,6 @@ def main(cfg: DictConfig) -> None:
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
 
-        curriculum_max_sim = _curriculum_max_sim(cfg, epoch)
-        if not resumed_epoch and curriculum_max_sim != max_sim:
-            max_sim = curriculum_max_sim
-            train_loader, train_dataset, train_sampler = _build_train_loader(
-                cfg, corrupt_cfg, max_sim, world_size
-            )
-
         pbar = tqdm(train_loader, disable=not is_main_process(), desc=f"epoch {epoch}")
         t_last = time.perf_counter()
         for batch in pbar:
@@ -851,6 +872,14 @@ def main(cfg: DictConfig) -> None:
             prev_step = global_step
             global_step = int(getattr(engine, "global_steps", prev_step + 1))
             images_since_save += images_per_opt_step
+            if warmup_only and not _warmup_only_for_step(cfg, global_step):
+                warmup_only = _apply_training_phase(
+                    _unwrap_model(engine),
+                    engine.optimizer,
+                    engine.lr_scheduler if hasattr(engine, "lr_scheduler") else scheduler,
+                    cfg,
+                    step=global_step,
+                )
 
             if is_main_process():
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -911,7 +940,6 @@ def main(cfg: DictConfig) -> None:
                 client_state = {
                     "step": global_step,
                     "epoch": epoch,
-                    "stage": str(cfg.train.stage),
                     "images_since_save": images_since_save,
                     "train_loader_state": _capture_train_loader_state(
                         train_loader,
@@ -941,7 +969,6 @@ def main(cfg: DictConfig) -> None:
     client_state = {
         "step": global_step,
         "epoch": int(cfg.train.num_epochs),
-        "stage": str(cfg.train.stage),
         "images_since_save": images_since_save,
         "train_loader_state": _capture_train_loader_state(
             train_loader,
@@ -959,8 +986,8 @@ if __name__ == "__main__":
     # ``ds_config.train_micro_batch_size_per_gpu=8``.
     #
     # Examples:
-    #   python -m src.train --config train/configs/train.yaml train.stage=warmup
-    #   python -m src.train train.stage=full ds_config.train_micro_batch_size_per_gpu=8
+    #   python -m src.train --config train/configs/train.yaml train.warmup_iterations=1000
+    #   python -m src.train ds_config.train_micro_batch_size_per_gpu=8
     #   python -m src.train train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000
     parser = argparse.ArgumentParser(description="Art restoration DiT training")
     parser.add_argument(

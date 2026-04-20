@@ -26,9 +26,9 @@ Forward input/output:
     null_emb: (1, 512, 7680)     precomputed null text embedding
     output:   (B, 128, H', W')   predicted velocity v_θ
 
-Training stages (controlled via set_stage):
-    "warmup": backbone frozen, only img_in.requires_grad = True
-    "full":   all parameters trainable
+Warm-up mode:
+    For the first configured training iterations, backbone weights stay frozen and
+    only ``img_in`` is trainable. After that, all parameters are trainable.
 """
 
 import torch
@@ -37,7 +37,7 @@ from einops import rearrange
 from torch import Tensor
 from typing import Any, List
 
-from .flux2.model import Flux2, Klein4BParams
+from .flux2.model import Flux2
 from .flux2.sampling import batched_prc_img, batched_prc_txt
 from .flux2.util import init_flow_model, load_pretrained_flow_weights
 
@@ -179,21 +179,14 @@ class RestorationDiT(nn.Module):
         return vel.to(dtype=z_t.dtype)
         
             
-    def set_stage(self, stage: str) -> None:
-        """Freeze or unfreeze parameters for the given training stage.
-
-        Args:
-            stage: "warmup" → freeze all except img_in.
-                   "full"   → unfreeze all parameters.
-        """
-        if stage == "warmup": 
-            for name, p in self.flow_model.named_parameters(): 
+    def set_trainability(self, warmup_only: bool) -> None:
+        """Freeze backbone params during warm-up, or unfreeze everything afterward."""
+        if warmup_only:
+            for name, p in self.flow_model.named_parameters():
                 p.requires_grad = name.startswith("img_in")
-        elif stage == "full":
-            for p in self.flow_model.parameters(): 
-                p.requires_grad_(True)
-        else: 
-            raise ValueError(f"Unknown stage {stage!r}; expected 'warmup' or 'full'")
+            return
+        for p in self.flow_model.parameters():
+            p.requires_grad_(True)
 
     def get_trainable_params(self) -> List[dict]:
         """Return optimizer param groups with 'params' and 'name' keys.
@@ -202,7 +195,7 @@ class RestorationDiT(nn.Module):
             {"params": img_in_params,   "name": "img_in"}
             {"params": backbone_params, "name": "backbone"}
 
-        The caller sets per-group LRs based on the training stage.
+        The caller sets per-group LRs based on the current warm-up/full phase.
 
         Returns:
             List of two param group dicts.

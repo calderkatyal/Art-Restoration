@@ -1,5 +1,6 @@
 #!/bin/bash
-# Stage 1 training: freeze backbone, train only img_in.
+# Training from scratch. The first `train.warmup_iterations` optimizer steps
+# train `img_in` only; afterward the backbone is unfrozen automatically.
 #
 # Usage:
 #   sbatch train/scripts/warmup.sh
@@ -23,5 +24,4 @@ mkdir -p logs
 # Precompute null text embedding if not already cached
 python -m src.null_emb --config train/configs/train.yaml
 
-# Run warmup stage
-python -m src.train --config train/configs/train.yaml train.stage=warmup
+python -m src.train --config train/configs/train.yaml
