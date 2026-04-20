@@ -11,7 +11,9 @@ Per-sample stochastic pipeline:
   3. Apply effects in fixed pipeline order, each consuming its own mask.
   4. For each channel, derive the OUTPUT binary mask as the convex hull
      of pixels the effect actually modified (before/after diff).
-  5. Return corrupted image and stacked (K, H, W) binary mask tensor.
+  5. Stack per-type hull masks (7 channels), append an 8th channel = pixel-wise max
+     (union) of those masks, optionally apply training-only channel dropout, then
+     return corrupted image and (8, H, W) binary mask tensor.
 """
 
 import numpy as np
@@ -32,9 +34,15 @@ from .effects import (
     apply_scratches,
 )
 from .presets import (
-    CHANNEL_NAMES, NUM_CHANNELS, SHAPE_KIND_BY_CHANNEL,
-    generate_global_mask, generate_local_mask,
+    CHANNEL_NAMES,
+    NUM_CHANNELS,
+    SHAPE_KIND_BY_CHANNEL,
+    generate_global_mask,
+    generate_local_mask,
 )
+
+# Per-type hull masks (len(CHANNEL_NAMES)) plus one union channel (max over types).
+OUTPUT_MASK_CHANNELS = NUM_CHANNELS + 1
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +165,7 @@ class CorruptionModule:
                 f"Config channel order must match CHANNEL_NAMES: {CHANNEL_NAMES}, got {channels}"
             )
         self.types = config['types']
+        self._dropout_prob = float(config.get("dropout_prob", 0.2))
 
     # -- internal helpers ---------------------------------------------------
 
@@ -220,20 +229,26 @@ class CorruptionModule:
 
     # -- main entry points --------------------------------------------------
 
-    def __call__(self, image: torch.Tensor,
-                 seed: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self,
+        image: torch.Tensor,
+        seed: Optional[int] = None,
+        training: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply random corruption to one clean image.
 
         Args:
             image: (3, H, W) float32 in [0, 1].
             seed:  Optional int seed for reproducibility.
+            training: If True, may apply ``dropout_prob`` mask dropout (train only).
 
         Returns:
             corrupted: (3, H, W) float32 in [0, 1].
-            mask:      (K, H, W) float32 BINARY {0, 1} with K = NUM_CHANNELS.
-                       Each channel is the ROI that a human annotator would
-                       paint over this damage — filled, no holes, severity-
-                       invariant. Channels may overlap.
+            mask:      (8, H, W) float32 BINARY {0, 1}. Channels ``0:NUM_CHANNELS`` are
+                       per-effect hull ROIs (may overlap). Channel ``NUM_CHANNELS`` is the
+                       union (pixel-wise max) of those masks. With probability
+                       ``dropout_prob`` (training only), channels ``0:NUM_CHANNELS`` are
+                       zeroed but the union channel is left unchanged.
         """
         C, H, W = image.shape
         assert C == 3, f"Expected 3-channel image, got {C}"
@@ -289,11 +304,22 @@ class CorruptionModule:
             [_per_component_hull_mask(affected[name], H, W) for name in CHANNEL_NAMES],
             dim=0,
         )
+        union = mask_tensor.max(dim=0, keepdim=True).values
+        mask_tensor = torch.cat([mask_tensor, union], dim=0)
+
+        if training and self._dropout_prob > 0.0:
+            if float(torch.rand(()).item()) < self._dropout_prob:
+                mask_tensor = mask_tensor.clone()
+                mask_tensor[:NUM_CHANNELS] = 0.0
+
         return out.clamp(0, 1), mask_tensor
 
-    def corrupt_batch(self, images: torch.Tensor,
-                      seeds: Optional[List[int]] = None
-                      ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def corrupt_batch(
+        self,
+        images: torch.Tensor,
+        seeds: Optional[List[int]] = None,
+        training: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply corruption to a batch of images.
 
         Args:
@@ -301,13 +327,13 @@ class CorruptionModule:
             seeds:  Optional list of B seeds.
 
         Returns:
-            (B, 3, H, W), (B, K, H, W).
+            ``(B, 3, H, W)``, ``(B, 8, H, W)`` — eight mask channels as in :meth:`__call__`.
         """
         B = images.shape[0]
         corrupted_list, mask_list = [], []
         for i in range(B):
             seed = seeds[i] if seeds is not None else None
-            c, m = self(images[i], seed=seed)
+            c, m = self(images[i], seed=seed, training=training)
             corrupted_list.append(c)
             mask_list.append(m)
         return torch.stack(corrupted_list), torch.stack(mask_list)

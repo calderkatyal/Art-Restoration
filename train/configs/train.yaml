@@ -8,7 +8,7 @@
 model:
   flux_model_name: "flux.2-klein-base-4b"
   spatial_compression: 16      # 8x encoder downsample * 2x patchify
-  in_channels: 263             # 128 (z_t) + 128 (z_y) + 7 (mask)
+  in_channels: 264             # 128 (z_t) + 128 (z_y) + 8 (mask: 7 types + union)
   hidden_size: 3072
   null_emb_path: "null_text_emb.pt"
 
@@ -31,6 +31,8 @@ train:
   seed: 42
   save_every: 1000
   log_every: 100
+  # Weight on velocity MSE inside the (latent) damage mask vs outside; see compute_flow_loss.
+  loss_weight_mask: 0.7
   resume_from: null
 
   optimizer:
@@ -56,6 +58,9 @@ train:
 # into cfg.corruption at load time.
 corruption:
   config_path: "src/corruption/configs/default.yaml"
+  # Training only: with this probability, zero per-type mask channels 0..6 but keep
+  # channel 7 (union of those masks) so the DiT still sees a coarse damage region.
+  dropout_prob: 0.2
 
 # Inference settings for periodic validation sampling during training.
 inference:
