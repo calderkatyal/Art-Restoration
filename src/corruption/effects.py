@@ -286,7 +286,7 @@ def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
     # regions of the painting (Mona Lisa backgrounds, etc.). Kept mild
     # here because cracks already cover a wide area — strong boosts
     # cause cracks to dominate the composition on darker paintings.
-    lum_boost = _local_lum_boost(image, mask, min_val=0.02, max_boost=2.2)
+    lum_boost = _local_lum_boost(image, mask, min_val=0.02, max_boost=3.0)
 
     # Adaptive crack colour: on dark-background regions the standard near-black
     # crack (0.06, 0.05, 0.04) is invisible against the paint. Real cracks expose
@@ -299,9 +299,11 @@ def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
         mean_lum = float((lum_field * active_w).sum().item() / active_w.sum().item())
     else:
         mean_lum = 0.5
-    if mean_lum < 0.35:
-        # Interpolate from near-black toward warm cream (aged gesso/canvas primer)
-        t = max(0.0, (0.35 - mean_lum) / 0.35)  # 0 at lum=0.35, 1 at lum=0
+    if mean_lum < 0.50:
+        # Interpolate from near-black toward warm cream (aged gesso/canvas primer).
+        # Threshold raised to 0.50 so mid-dark backgrounds (dark forests, night
+        # skies) also get the lighter crack colour, not just nearly-black regions.
+        t = max(0.0, (0.50 - mean_lum) / 0.50)  # 0 at lum=0.50, 1 at lum=0
         cr = 0.06 + t * 0.56   # up to 0.62
         cg = 0.05 + t * 0.51   # up to 0.56
         cb = 0.04 + t * 0.42   # up to 0.46

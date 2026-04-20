@@ -78,6 +78,42 @@ def load_image(path: Path, resolution: int = 512) -> torch.Tensor:
     return T.ToTensor()(img)
 
 
+def image_luminance(path: Path, thumb: int = 64) -> float:
+    """Fast mean luminance of a painting (0=black, 1=white)."""
+    try:
+        img = Image.open(path).convert("RGB").resize((thumb, thumb), Image.BILINEAR)
+        t = T.ToTensor()(img)
+        return float((t[0] * 0.299 + t[1] * 0.587 + t[2] * 0.114).mean().item())
+    except Exception:
+        return 0.5
+
+
+def stratified_sample(paths: List[Path], n: int, seed: int) -> List[Path]:
+    """Pick n paintings spread across dark / mid / bright luminance bands.
+
+    Guarantees roughly 1/3 of samples come from each band so dark paintings
+    (where crack / tear visibility is hardest) are always represented.
+    """
+    rng = random.Random(seed)
+    scored = sorted(paths, key=image_luminance)
+    third = max(1, len(scored) // 3)
+    dark   = scored[:third]
+    mid    = scored[third: 2 * third]
+    bright = scored[2 * third:]
+
+    n_dark   = max(1, n // 3)
+    n_bright = max(1, n // 3)
+    n_mid    = max(1, n - n_dark - n_bright)
+
+    def pick(bucket, k):
+        rng.shuffle(bucket)
+        return bucket[:k]
+
+    selected = pick(dark, n_dark) + pick(mid, n_mid) + pick(bright, n_bright)
+    rng.shuffle(selected)
+    return selected[:n]
+
+
 def tensor_to_pil(t: torch.Tensor) -> Image.Image:
     return T.ToPILImage()(t.clamp(0, 1))
 
@@ -215,11 +251,12 @@ def main():
     if not all_images:
         print(f"ERROR: No images found in {args.data_dir}")
         sys.exit(1)
-    random.shuffle(all_images)
-    painting_paths = all_images[: args.n_paintings]
-    print(f"Using {len(painting_paths)} painting(s):")
+    print(f"Scoring luminance for {min(len(all_images), 5000)} candidates...")
+    painting_paths = stratified_sample(all_images, args.n_paintings, args.seed)
+    print(f"Using {len(painting_paths)} painting(s) (dark/mid/bright stratified):")
     for p in painting_paths:
-        print(f"  {p.name}")
+        lum = image_luminance(p)
+        print(f"  {p.name}  lum={lum:.2f}")
 
     print(f"\nLoading images at {args.resolution}px...")
     paintings = []
