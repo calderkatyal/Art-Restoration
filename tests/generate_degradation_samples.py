@@ -78,42 +78,6 @@ def load_image(path: Path, resolution: int = 512) -> torch.Tensor:
     return T.ToTensor()(img)
 
 
-def image_luminance(path: Path, thumb: int = 64) -> float:
-    """Fast mean luminance of a painting (0=black, 1=white)."""
-    try:
-        img = Image.open(path).convert("RGB").resize((thumb, thumb), Image.BILINEAR)
-        t = T.ToTensor()(img)
-        return float((t[0] * 0.299 + t[1] * 0.587 + t[2] * 0.114).mean().item())
-    except Exception:
-        return 0.5
-
-
-def stratified_sample(paths: List[Path], n: int, seed: int) -> List[Path]:
-    """Pick n paintings spread across dark / mid / bright luminance bands.
-
-    Guarantees roughly 1/3 of samples come from each band so dark paintings
-    (where crack / tear visibility is hardest) are always represented.
-    """
-    rng = random.Random(seed)
-    scored = sorted(paths, key=image_luminance)
-    third = max(1, len(scored) // 3)
-    dark   = scored[:third]
-    mid    = scored[third: 2 * third]
-    bright = scored[2 * third:]
-
-    n_dark   = max(1, n // 3)
-    n_bright = max(1, n // 3)
-    n_mid    = max(1, n - n_dark - n_bright)
-
-    def pick(bucket, k):
-        rng.shuffle(bucket)
-        return bucket[:k]
-
-    selected = pick(dark, n_dark) + pick(mid, n_mid) + pick(bright, n_bright)
-    rng.shuffle(selected)
-    return selected[:n]
-
-
 def tensor_to_pil(t: torch.Tensor) -> Image.Image:
     return T.ToPILImage()(t.clamp(0, 1))
 
@@ -134,49 +98,6 @@ def try_get_font(size: int = 14):
     return ImageFont.load_default()
 
 
-def overlay_red_mask(
-    image: Image.Image,
-    actual_mask: torch.Tensor,
-    soft_mask: torch.Tensor,
-    width: int = 2,
-) -> Image.Image:
-    """Draw a thin red boundary using actual_mask; fall back to soft_mask if empty."""
-    candidate = actual_mask.detach().cpu()
-    if candidate.max().item() < 0.05:
-        # actual_mask empty (e.g. subtle craquelure) — use soft_mask instead
-        candidate = soft_mask.detach().cpu()
-
-    m = candidate > 0.05
-    if not m.any():
-        return image.copy()
-
-    up    = torch.zeros_like(m); up[1:]      = m[:-1]
-    down  = torch.zeros_like(m); down[:-1]   = m[1:]
-    left  = torch.zeros_like(m); left[:, 1:] = m[:, :-1]
-    right = torch.zeros_like(m); right[:, :-1] = m[:, 1:]
-    boundary = m & ~(m & up & down & left & right)
-
-    out = image.copy()
-    draw = ImageDraw.Draw(out)
-    ys, xs = torch.nonzero(boundary, as_tuple=True)
-    if width <= 1:
-        for y, x in zip(ys.tolist(), xs.tolist()):
-            draw.point((x, y), fill=(255, 0, 0))
-    else:
-        r = width // 2
-        for y, x in zip(ys.tolist(), xs.tolist()):
-            draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0))
-    return out
-
-
-def count_instances(mask: torch.Tensor, threshold: float = 0.02) -> int:
-    """Count connected components (degradation instances) in a mask."""
-    from scipy.ndimage import label as _cc_label
-    binary = (mask >= threshold).cpu().numpy()
-    _, n = _cc_label(binary)
-    return int(n)
-
-
 def apply_corruption(
     image: torch.Tensor,
     corruption: str,
@@ -185,7 +106,7 @@ def apply_corruption(
     type_cfg,
     generator: torch.Generator,
 ) -> tuple:
-    """Returns (corrupted_image, soft_mask, actual_mask, num_instances)."""
+    """Returns (corrupted_image, soft_mask)."""
     H, W = image.shape[-2:]
     device = image.device
 
@@ -217,8 +138,7 @@ def apply_corruption(
     diff_bool = _affected_pixels(before, out_img, threshold=0.008)
     H2, W2 = image.shape[-2:]
     actual_mask = _per_component_hull_mask(diff_bool, H2, W2, merge_radius=3)
-    n_instances = count_instances(actual_mask)
-    return out_img, soft_mask, actual_mask, n_instances
+    return out_img, actual_mask
 
 
 def mask_to_pil(m: torch.Tensor, resolution: int) -> Image.Image:
@@ -295,12 +215,11 @@ def main():
     if not all_images:
         print(f"ERROR: No images found in {args.data_dir}")
         sys.exit(1)
-    print(f"Scoring luminance for {min(len(all_images), 5000)} candidates...")
-    painting_paths = stratified_sample(all_images, args.n_paintings, args.seed)
-    print(f"Using {len(painting_paths)} painting(s) (dark/mid/bright stratified):")
+    random.shuffle(all_images)
+    painting_paths = all_images[: args.n_paintings]
+    print(f"Using {len(painting_paths)} painting(s):")
     for p in painting_paths:
-        lum = image_luminance(p)
-        print(f"  {p.name}  lum={lum:.2f}")
+        print(f"  {p.name}")
 
     print(f"\nLoading images at {args.resolution}px...")
     paintings = []
@@ -356,20 +275,19 @@ def main():
                 severity = min_s + random.random() * (max_s - min_s)
 
                 try:
-                    out, soft_mask, actual_mask, n_inst = apply_corruption(image, corruption, mode, severity, type_cfg, gen)
+                    out, soft_mask = apply_corruption(image, corruption, mode, severity, type_cfg, gen)
                 except Exception as e:
                     print(f"  ERROR on {stem} sev={severity:.2f}: {e}")
                     continue
 
                 sev_str = f"{severity:.2f}"
-                fname = f"{corruption}_{stem}_sev{sev_str}_n{n_inst}.jpg"
+                fname = f"{stem}_{mode}_sev{sev_str}_seed{seed_i}.jpg"
                 fpath = os.path.join(type_dir, fname)
-                out_pil = overlay_red_mask(tensor_to_pil(out), actual_mask, soft_mask)
-                out_pil.save(fpath, quality=90)
+                tensor_to_pil(out).save(fpath, quality=90)
 
-                thumbs.append(out_pil)
-                mask_thumbs.append(mask_to_pil(actual_mask, args.resolution))
-                labels.append(f"{stem[:10]} s={sev_str} n={n_inst}")
+                thumbs.append(tensor_to_pil(out))
+                mask_thumbs.append(mask_to_pil(soft_mask, args.resolution))
+                labels.append(f"{stem[:10]} s={sev_str}")
                 saved += 1
 
         cols = 6

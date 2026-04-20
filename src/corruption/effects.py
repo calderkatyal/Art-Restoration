@@ -954,17 +954,29 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
 
     sev_opacity = max(0.65, mask_max)
 
+    # Precompute per-pixel luminance for adaptive scratch colour.
+    lum_field = image[0] * 0.299 + image[1] * 0.587 + image[2] * 0.114
+
     for comp_ys, comp_xs, local_angle in comp_data:
         n_pixels = comp_ys.shape[0]
         n_here = max(1, int(round(base_count * n_pixels / total_region)))
 
-        # Scratch colour: a consistent warm off-white that represents the
-        # exposed ground/gesso layer beneath the paint. Real scratches
-        # always reveal the lighter substrate regardless of the paint colour
-        # on top. Using one fixed tone avoids the black-vs-white
-        # inconsistency that happened when we adapted per-pixel or
-        # per-component to luminance.
-        comp_scratch_r, comp_scratch_g, comp_scratch_b = 0.88, 0.84, 0.76
+        # Adaptive scratch colour mirroring craquelure logic:
+        # dark regions get a light warm scratch (exposed gesso/primer);
+        # bright regions get a dark warm scratch (exposed substrate).
+        mean_lum = float(lum_field[comp_ys, comp_xs].mean().item())
+        if mean_lum < 0.50:
+            # Interpolate toward bright warm cream as background darkens.
+            t = max(0.0, (0.50 - mean_lum) / 0.50)  # 0 at lum=0.50, 1 at lum=0
+            comp_scratch_r = 0.62 + t * 0.26  # up to 0.88
+            comp_scratch_g = 0.58 + t * 0.26  # up to 0.84
+            comp_scratch_b = 0.50 + t * 0.26  # up to 0.76
+        else:
+            # Bright painting: dark warm scratch (exposed darker substrate).
+            t = min(1.0, (mean_lum - 0.50) / 0.50)  # 0 at lum=0.50, 1 at lum=1.0
+            comp_scratch_r = 0.30 - t * 0.05
+            comp_scratch_g = 0.22 - t * 0.04
+            comp_scratch_b = 0.18 - t * 0.03
 
         for _ in range(n_here):
             idx = int(torch.randint(0, n_pixels, (1,), generator=generator).item())
@@ -982,9 +994,9 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             half_w = width // 2
             alpha = 0.60 + torch.rand(1, generator=generator).item() * 0.30
 
-            # Small chance of a burnished (bright) scratch for variety,
-            # otherwise use the component-level colour.
-            use_bright = torch.rand(1, generator=generator).item() < 0.15
+            # Burnished variant only on dark backgrounds where a bright
+            # highlight makes sense; skip on bright paintings.
+            use_bright = mean_lum < 0.50 and torch.rand(1, generator=generator).item() < 0.15
             if use_bright:
                 scratch_r, scratch_g, scratch_b = 0.95, 0.93, 0.88
             else:
