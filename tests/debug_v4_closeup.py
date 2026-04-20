@@ -69,7 +69,7 @@ def overlay(img, mask, color=(255, 60, 60), alpha=0.45):
 def forced_config(base_cfg, channel: str, mode: str, severity: float):
     """Return a cfg forcing exactly one channel, one mode, fixed severity."""
     cfg = deepcopy(base_cfg)
-    cfg.num_simultaneous = {'min': 1, 'max': 1}
+    cfg.active_count_probs = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     for name in CHANNEL_NAMES:
         t = cfg.types[name]
         t.weight = 1.0 if name == channel else 0.0

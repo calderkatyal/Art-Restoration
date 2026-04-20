@@ -1,12 +1,13 @@
 #!/bin/bash
-# Stage 2 training: fine-tune all layers with separate LRs for backbone and img_in.
-# Run after warmup.sh completes and set WARMUP_CKPT to the saved checkpoint path.
+# Resume training from an existing DeepSpeed checkpoint tag directory.
+# If the checkpoint was saved after warm-up, the backbone will already be unfrozen
+# automatically based on `train.warmup_iterations` and the saved global step.
 #
 # Usage:
 #   sbatch train/scripts/full.sh
 #
 # Overrides (append to python command as dot-notation, e.g.):
-#   train.full.backbone_lr=5e-6
+#   train.warmup_iterations=0
 #   train.batch_size=4
 
 #SBATCH --job-name=art-restore-full
@@ -20,9 +21,8 @@
 
 mkdir -p logs
 
-WARMUP_CKPT="checkpoints/warmup_final.pt"
+RESUME_CKPT="checkpoints/step_1000"
 
 python -m src.train \
     --config train/configs/train.yaml \
-    train.stage=full \
-    train.resume_from=${WARMUP_CKPT}
+    train.resume_from=${RESUME_CKPT}
