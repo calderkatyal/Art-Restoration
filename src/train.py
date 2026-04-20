@@ -8,7 +8,8 @@ Rectified flow objective per training step:
     5. ``z_t = (1 - t) * z_0 + t * z_1`` — note ``z_t`` interpolates **noise ↔ clean**;
        the damaged reference ``z_y`` is **separate conditioning**, not part of this mix.
     6. ``vel = v_θ(z_t, t | z_y, M', null_emb)``.
-    7. ``loss = || vel - (z_1 - z_0) ||²`` (MSE in float32 for numerical stability).
+    7. Mask-weighted velocity MSE (``train.loss_weight_mask``, default ``0.7``) over latent
+       union-mask vs outside; see :func:`compute_flow_loss`.
     8. ``engine.backward`` / ``engine.step`` (DeepSpeed); LR scheduler stepped by DeepSpeed.
 
 Training stages (``cfg.train.stage``):
@@ -68,7 +69,7 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from .corruption import downsample_mask
+from .corruption import OUTPUT_MASK_CHANNELS, downsample_mask
 from .dataset import ArtRestorationDataset, build_wikiart_dataloader
 from .distributed import get_device, get_global_rank, get_world_size, is_main_process
 from .inference import sample
@@ -358,6 +359,7 @@ def compute_flow_loss(
     null_emb: torch.Tensor,
     spatial_compression: int,
     device: torch.device,
+    loss_weight_mask: float,
 ) -> torch.Tensor:
     """Compute rectified-flow MSE loss for one micro-batch.
 
@@ -365,6 +367,11 @@ def compute_flow_loss(
     :class:`~src.dataset.ArtRestorationDataset`. Encodings use the frozen VAE in
     ``float32``; the velocity target ``(z_1 - z_0)`` is ``float32``; model predictions
     are cast to ``float32`` for the MSE so bf16 forward does not underflow the loss.
+
+    The MSE is split by the **latent** union mask (last mask channel after pooling):
+    ``loss_weight_mask * mse_inside + (1 - loss_weight_mask) * mse_outside``, where
+    inside/outside are averaged over all elements of ``(vel - target)^2`` where the
+    union mask is active (>= 0.5) or inactive, respectively.
 
     ``model_engine`` may be a DeepSpeed ``DeepSpeedEngine`` (``__call__`` forwards to
     ``RestorationDiT.forward``) or a bare ``RestorationDiT`` for tests.
@@ -376,6 +383,7 @@ def compute_flow_loss(
         null_emb:            Cached text embedding ``(1, 512, 7680)`` on ``device``.
         spatial_compression: VAE spatial factor (16) for ``downsample_mask``.
         device:              Device to run the loss on.
+        loss_weight_mask:    Scalar in ``[0, 1]`` weighting inside-mask vs outside-mask MSE.
 
     Returns:
         Scalar loss tensor with ``grad_fn`` through ``model_engine`` parameters.
@@ -389,9 +397,10 @@ def compute_flow_loss(
         z_y = vae.encode(corrupted.float())
 
     m_prime = downsample_mask(mask, factor=spatial_compression)
-    if m_prime.shape[1] != mask.shape[1]:
+    if mask.shape[1] != OUTPUT_MASK_CHANNELS or m_prime.shape[1] != OUTPUT_MASK_CHANNELS:
         raise ValueError(
-            f"Mask channel count {mask.shape[1]} vs downsampled {m_prime.shape[1]}"
+            f"Expected mask with {OUTPUT_MASK_CHANNELS} channels "
+            f"(7 per-type + union), got pixel {mask.shape[1]} latent {m_prime.shape[1]}"
         )
 
     z_0 = torch.randn_like(z_1)
@@ -401,7 +410,18 @@ def compute_flow_loss(
 
     vel = model_engine(z_t, t, z_y, m_prime, null_emb)
     target = (z_1 - z_0).float()
-    return F.mse_loss(vel.float(), target)
+    sq = (vel.float() - target).pow(2)
+    # Last mask channel is union of per-type masks at latent resolution.
+    dam = (m_prime[:, -1:] >= 0.5).to(dtype=sq.dtype).expand_as(sq)
+    eps = 1e-8
+    sse_in = (sq * dam).sum()
+    sse_out = (sq * (1.0 - dam)).sum()
+    den_in = dam.sum() + eps
+    den_out = (1.0 - dam).sum() + eps
+    loss_in = sse_in / den_in
+    loss_out = sse_out / den_out
+    lw = max(0.0, min(1.0, float(loss_weight_mask)))
+    return lw * loss_in + (1.0 - lw) * loss_out
 
 
 def validate(
@@ -448,6 +468,7 @@ def validate(
                 null_emb,
                 int(cfg.model.spatial_compression),
                 device,
+                float(getattr(cfg.train, "loss_weight_mask", 0.7)),
             )
             batch_size = int(batch["clean"].shape[0])
             loss_sum += float(loss.item()) * batch_size
@@ -820,6 +841,7 @@ def main(cfg: DictConfig) -> None:
                 null_emb,
                 int(cfg.model.spatial_compression),
                 device,
+                float(getattr(cfg.train, "loss_weight_mask", 0.7)),
             )
             engine.backward(loss)
             engine.step()

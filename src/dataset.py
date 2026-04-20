@@ -85,7 +85,11 @@ class ArtRestorationDataset(Dataset):
         else:
             corruption_seed = self._next_corruption_seed()
 
-        corrupted, mask = self.corruptor(clean.clone(), seed=corruption_seed)
+        corrupted, mask = self.corruptor(
+            clean.clone(),
+            seed=corruption_seed,
+            training=(self.split == "train"),
+        )
         sample: Dict[str, Any] = {
             "clean": clean,
             "corrupted": corrupted,
