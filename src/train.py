@@ -762,6 +762,7 @@ def main(cfg: DictConfig) -> None:
     images_since_save = 0
     last_save_step = 0
     restored_train_state = False
+    last_logged_step = 0
 
     # --- Single-source load policy: checkpoint OR pretrained; fallback to pretrained on errors ---
     if should_try_checkpoint:
@@ -801,6 +802,7 @@ def main(cfg: DictConfig) -> None:
             images_since_save = 0
             last_save_step = 0
             restored_train_state = False
+    last_logged_step = global_step
     _distributed_barrier()
 
     engine.train()
@@ -808,7 +810,7 @@ def main(cfg: DictConfig) -> None:
     # Interval knobs: step-based save, image-approximate save, val cadence, WandB image logging
     save_every = int(cfg.train.save_every)
     save_every_images = cfg.train.get("save_every_images")
-    val_every = int(getattr(cfg.train, "val_every", 10**9))
+    val_every = int(getattr(cfg.train, "val_every", 80))
     log_every = int(cfg.train.log_every)
     log_images_every = int(cfg.wandb.get("log_images_every", 500)) if cfg.get("wandb") else 10**9
 
@@ -856,16 +858,19 @@ def main(cfg: DictConfig) -> None:
             if is_main_process() and global_step % log_every == 0:
                 dt = time.perf_counter() - t_last
                 t_last = time.perf_counter()
-                img_per_sec = (micro_batch * world_size) / max(dt, 1e-6)
+                steps_since_log = max(global_step - last_logged_step, 1)
+                img_per_sec = (steps_since_log * images_per_opt_step) / max(dt, 1e-6)
                 lrs = [pg["lr"] for pg in engine.optimizer.param_groups]
                 metrics = {
                     "train/loss": loss.item(),
                     "train/images_per_sec": img_per_sec,
                     "train/epoch": epoch,
+                    "train/global_step": global_step,
                 }
                 for i, lr in enumerate(lrs):
                     metrics[f"train/lr_group_{i}"] = lr
                 wandb_log(metrics, step=global_step)
+                last_logged_step = global_step
 
                 if cfg.get("wandb") and cfg.wandb.get("log_images", False):
                     if global_step % log_images_every == 0:
