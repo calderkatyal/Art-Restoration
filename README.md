@@ -59,7 +59,7 @@ src/
 ├── null_emb.py        # Precompute and cache null text embedding
 ├── inference.py       # ODE sampling + data consistency
 ├── evaluations.py     # PSNR and stratified per-damage-type metrics
-├── train.py           # Training loop (warmup + full stage)
+├── train.py           # Training loop with iteration-based warm-up
 └── flux2/             # Verbatim source from black-forest-labs/flux2
 
 tools/
@@ -72,8 +72,8 @@ train/
 ├── configs/
 │   └── train.yaml     # Training hyperparameters
 └── scripts/
-    ├── warmup.sh      # SLURM: stage 1 (img_in only)
-    └── full.sh        # SLURM: stage 2 (all layers)
+    ├── warmup.sh      # SLURM: start training from scratch
+    └── full.sh        # SLURM: resume from a saved checkpoint
 
 inference/
 ├── configs/
@@ -99,12 +99,16 @@ Download datasets and place them at the paths set in `train/configs/train.yaml`:
 
 ## Training
 
-Training has two stages controlled by `train.stage` in `train/configs/train.yaml`:
+Training starts with `img_in`-only warm-up for `train.warmup_iterations` optimizer steps,
+then automatically unfreezes the backbone and switches to the full-training learning rates.
+`train.warmup_iterations` is evaluated when training starts or resumes from checkpoint.
+If you change it mid-run, the live process will not notice; stop and resume from a checkpoint
+to apply the new value.
 
-| Stage | What trains | LR key |
-|-------|-------------|--------|
-| `warmup` | `img_in` only (backbone frozen) | `train.warmup.lr` |
-| `full` | All layers | `train.full.backbone_lr` / `train.full.img_in_lr` |
+| Phase | What trains | Config key |
+|-------|-------------|------------|
+| Warm-up | `img_in` only (backbone frozen) | `train.warmup_iterations`, `train.warmup.lr` |
+| Full training | All layers | `train.full.backbone_lr` / `train.full.img_in_lr` |
 
 See `train/scripts/warmup.sh` and `train/scripts/full.sh`.
 

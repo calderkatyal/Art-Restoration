@@ -2,8 +2,9 @@
 
 Per-sample stochastic pipeline:
 
-  1. Pick N ~ Uniform[cfg.num_simultaneous.min, cfg.num_simultaneous.max]
-     distinct channel names, weighted by each channel's `weight`.
+  1. Pick N according to ``cfg.active_count_probs`` (or legacy
+     ``cfg.num_simultaneous``), then sample that many distinct channel names
+     weighted by each channel's ``weight``.
   2. For each chosen channel c:
         - Pick mode ∈ {local, global} among enabled modes (uniform).
         - Pick severity ~ Uniform[c.min_severity, c.max_severity].
@@ -144,7 +145,8 @@ class CorruptionModule:
 
     Args:
         config: DictConfig or dict with keys:
-            num_simultaneous: {min, max}
+            active_count_probs: list of 7 non-negative weights for selecting
+                exactly 1..7 active degradations
             types: dict mapping channel name -> {
                 weight, local_enabled, global_enabled,
                 min_severity, max_severity,
@@ -171,10 +173,25 @@ class CorruptionModule:
 
     def _sample_active_channels(self, generator: torch.Generator) -> List[str]:
         """Pick N distinct channel names with probability proportional to weight."""
-        ns = self.config['num_simultaneous']
-        n_lo, n_hi = int(ns['min']), int(ns['max'])
-        n_hi = max(n_lo, min(n_hi, NUM_CHANNELS))
-        n = n_lo + int(torch.randint(0, n_hi - n_lo + 1, (1,), generator=generator).item())
+        count_probs = self.config.get("active_count_probs")
+        if count_probs is not None:
+            probs = torch.tensor(list(count_probs), dtype=torch.float32)
+            if probs.numel() != NUM_CHANNELS:
+                raise ValueError(
+                    f"active_count_probs must have exactly {NUM_CHANNELS} entries, "
+                    f"got {probs.numel()}."
+                )
+            probs = probs.clamp(min=0)
+            total = float(probs.sum().item())
+            if total <= 0.0:
+                raise ValueError("active_count_probs must contain at least one positive value.")
+            probs = probs / total
+            n = int(torch.multinomial(probs, 1, generator=generator).item()) + 1
+        else:
+            ns = self.config['num_simultaneous']
+            n_lo, n_hi = int(ns['min']), int(ns['max'])
+            n_hi = max(n_lo, min(n_hi, NUM_CHANNELS))
+            n = n_lo + int(torch.randint(0, n_hi - n_lo + 1, (1,), generator=generator).item())
         if n <= 0:
             return []
 
