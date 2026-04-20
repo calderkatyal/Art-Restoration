@@ -36,7 +36,6 @@ class ArtRestorationDataset(Dataset):
         data_dir: str,
         resolution: int,
         corruption_config: Any,
-        max_simultaneous: Optional[int] = None,
         split: str = "train",
         corruption_seed: int = 42,
         deterministic_corruption: Optional[bool] = None,
@@ -55,10 +54,7 @@ class ArtRestorationDataset(Dataset):
             else bool(deterministic_corruption)
         )
 
-        cfg = copy.deepcopy(corruption_config)
-        if max_simultaneous == 1:
-            cfg.individual_prob = 1.0
-        self.corruptor = CorruptionModule(cfg)
+        self.corruptor = CorruptionModule(copy.deepcopy(corruption_config))
 
         self.image_paths = _find_images(self.data_dir)
         self._base_corruption_seed = int(corruption_seed)
@@ -397,7 +393,6 @@ def build_wikiart_dataloader(
     corruption_config: Any,
     batch_size: int,
     split: str = "train",
-    max_simultaneous: Optional[int] = None,
     num_workers: int = 0,
     sampler_seed: int = 42,
     corruption_seed: int = 42,
@@ -428,7 +423,6 @@ def build_wikiart_dataloader(
         data_dir=image_dir,
         resolution=resolution,
         corruption_config=corruption_config,
-        max_simultaneous=max_simultaneous,
         split=canonical_split,
         corruption_seed=_offset_seed_for_rank(corruption_seed, resolved_rank),
         deterministic_corruption=deterministic_corruption,
