@@ -18,6 +18,7 @@ train:
   checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
   batch_size: 4
+  gradient_checkpointing: true
   num_workers: 4
   sampler_seed: 42
   corruption_seed: 42

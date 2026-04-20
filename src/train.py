@@ -179,6 +179,7 @@ def setup_model(
     """
     flow_model = RestorationDiT(
         cfg=cfg.model,
+        gradient_checkpointing=bool(getattr(cfg.train, "gradient_checkpointing", False)),
         device=device,
         img_in_dtype=torch.bfloat16,
         load_pretrained=load_pretrained,
