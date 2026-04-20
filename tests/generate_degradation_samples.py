@@ -141,6 +141,27 @@ def apply_corruption(
     return out_img, actual_mask
 
 
+_NO_OUTLINE = {"scratches", "rip_tear"}
+
+
+def overlay_red_mask(image: Image.Image, mask: torch.Tensor, width: int = 2) -> Image.Image:
+    """Draw a thin red boundary around the mask region."""
+    m = (mask.detach().cpu() > 0.05)
+    if not m.any():
+        return image.copy()
+    up    = torch.zeros_like(m); up[1:]      = m[:-1]
+    down  = torch.zeros_like(m); down[:-1]   = m[1:]
+    left  = torch.zeros_like(m); left[:, 1:] = m[:, :-1]
+    right = torch.zeros_like(m); right[:, :-1] = m[:, 1:]
+    boundary = m & ~(m & up & down & left & right)
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    r = width // 2
+    for y, x in zip(*torch.nonzero(boundary, as_tuple=True)):
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0))
+    return out
+
+
 def mask_to_pil(m: torch.Tensor, resolution: int) -> Image.Image:
     """Render a (H, W) mask as a grayscale image, normalized to full range."""
     g = m.detach().cpu().clamp(0, 1)
@@ -283,9 +304,12 @@ def main():
                 sev_str = f"{severity:.2f}"
                 fname = f"{stem}_{mode}_sev{sev_str}_seed{seed_i}.jpg"
                 fpath = os.path.join(type_dir, fname)
-                tensor_to_pil(out).save(fpath, quality=90)
+                out_pil = tensor_to_pil(out)
+                if corruption not in _NO_OUTLINE:
+                    out_pil = overlay_red_mask(out_pil, soft_mask)
+                out_pil.save(fpath, quality=90)
 
-                thumbs.append(tensor_to_pil(out))
+                thumbs.append(out_pil)
                 mask_thumbs.append(mask_to_pil(soft_mask, args.resolution))
                 labels.append(f"{stem[:10]} s={sev_str}")
                 saved += 1

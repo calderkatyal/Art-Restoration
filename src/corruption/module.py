@@ -331,30 +331,6 @@ class CorruptionModule:
 
         return out.clamp(0, 1), mask_tensor
 
-    def corrupt_batch(
-        self,
-        images: torch.Tensor,
-        seeds: Optional[List[int]] = None,
-        training: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply corruption to a batch of images.
-
-        Args:
-            images: (B, 3, H, W) float32 in [0, 1].
-            seeds:  Optional list of B seeds.
-
-        Returns:
-            ``(B, 3, H, W)``, ``(B, 8, H, W)`` — eight mask channels as in :meth:`__call__`.
-        """
-        B = images.shape[0]
-        corrupted_list, mask_list = [], []
-        for i in range(B):
-            seed = seeds[i] if seeds is not None else None
-            c, m = self(images[i], seed=seed, training=training)
-            corrupted_list.append(c)
-            mask_list.append(m)
-        return torch.stack(corrupted_list), torch.stack(mask_list)
-
 
 def downsample_mask(mask: torch.Tensor, factor: int = 16) -> torch.Tensor:
     """Max-pool pixel-resolution mask to latent resolution.

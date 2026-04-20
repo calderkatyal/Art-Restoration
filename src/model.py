@@ -52,6 +52,7 @@ class RestorationDiT(nn.Module):
     def __init__(
         self,
         cfg: Any,
+        gradient_checkpointing: bool = False,
         device: str | torch.device = "cuda",
         img_in_dtype=torch.bfloat16,
         load_pretrained: bool = True,
@@ -81,6 +82,7 @@ class RestorationDiT(nn.Module):
             load_pretrained_flow_weights(
                 self.flow_model, cfg.flux_model_name, rank=rank, device=device
             )
+        self.flow_model.gradient_checkpointing = gradient_checkpointing
         self._reinit_img_in(cfg.in_channels, cfg.hidden_size, device=device, dtype=img_in_dtype)
 
     def load_pretrained_backbone(
