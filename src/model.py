@@ -108,6 +108,10 @@ class RestorationDiT(nn.Module):
                 rank=rank,
                 device=device,
             )
+        else:
+            # Checkpoint-first init skips pretrained weights, so we still need to
+            # materialize parameters off the meta device before DeepSpeed moves the module.
+            flow_model = flow_model.to_empty(device=device)
         flow_model.gradient_checkpointing = gradient_checkpointing
         return flow_model
 
