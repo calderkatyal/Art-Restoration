@@ -6,6 +6,7 @@ from typing import Any
 from openai import OpenAI
 from PIL import Image
 
+from ..utils import log_message
 from .system_messages import SYSTEM_MESSAGE_UPSAMPLING_I2I, SYSTEM_MESSAGE_UPSAMPLING_T2I
 from .util import image_to_base64
 
@@ -123,7 +124,7 @@ class OpenRouterAPIClient:
                 upsampled = response.choices[0].message.content.strip()
                 upsampled_prompts.append(upsampled)
             except Exception as e:
-                print(f"Error upsampling prompt via OpenRouter API: {e}, returning original prompt")
+                log_message(f"Error upsampling prompt via OpenRouter API: {e}, returning original prompt")
                 upsampled_prompts.append(prompt)
 
         return upsampled_prompts

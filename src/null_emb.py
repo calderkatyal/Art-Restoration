@@ -18,11 +18,16 @@ In distributed mode, rank 0 computes (if missing) and saves; all ranks synchroni
 import argparse
 import gc
 from pathlib import Path
+import time
 
 import torch
 
 from .flux2.util import load_text_encoder
-from .utils import load_config
+from .utils import load_config, log_message
+
+
+def _log_null_embedding(message: str) -> None:
+    log_message(f"[null_emb] {message}")
 
 
 def _cleanup_text_encoder(enc: object, device: str | torch.device) -> None:
@@ -60,14 +65,33 @@ def compute_null_embedding(
     Returns:
         Tensor shaped ``(1, 512, 7680)``, dtype ``bfloat16``.
     """
+    _log_null_embedding(f"rank0 loading text encoder for {flux_model_name} on {device}")
     enc = load_text_encoder(flux_model_name, device=device)
     try:
         enc.eval()
+        _log_null_embedding("rank0 running empty-prompt text encoder forward")
         with torch.no_grad():
             emb = enc([""])
+        _log_null_embedding(
+            f"rank0 finished text encoder forward with shape={tuple(emb.shape)} dtype={emb.dtype}"
+        )
         return emb.to(dtype=torch.bfloat16)
     finally:
         _cleanup_text_encoder(enc, device)
+
+
+def _load_embedding_tensor(path: Path, device: torch.device) -> torch.Tensor:
+    try:
+        emb = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        emb = torch.load(path, map_location=device)
+    return emb.to(device=device, dtype=torch.bfloat16)
+
+
+def _save_embedding_tensor(path: Path, emb: torch.Tensor) -> None:
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    torch.save(emb.cpu(), tmp_path)
+    tmp_path.replace(path)
 
 
 def load_or_compute_null_embedding(
@@ -95,28 +119,38 @@ def load_or_compute_null_embedding(
         device = torch.device(device)
 
     if path.is_file():
-        try:
-            emb = torch.load(path, map_location=device, weights_only=True)
-        except TypeError:
-            emb = torch.load(path, map_location=device)
-        return emb.to(device=device, dtype=torch.bfloat16)
+        _log_null_embedding(f"cache hit at {path}")
+        return _load_embedding_tensor(path, device)
 
     import torch.distributed as dist
 
     path.parent.mkdir(parents=True, exist_ok=True)
     if dist.is_available() and dist.is_initialized():
-        if dist.get_rank() == 0:
+        rank = dist.get_rank()
+        if rank == 0:
             emb = compute_null_embedding(flux_model_name, device=str(device))
-            torch.save(emb.cpu(), path)
-        dist.barrier()
-        try:
-            emb = torch.load(path, map_location=device, weights_only=True)
-        except TypeError:
-            emb = torch.load(path, map_location=device)
-        return emb.to(device=device, dtype=torch.bfloat16)
+            _log_null_embedding(f"rank0 saving null embedding to {path}")
+            _save_embedding_tensor(path, emb)
+            _log_null_embedding(f"rank0 saved null embedding to {path}")
+            return emb.to(device=device, dtype=torch.bfloat16)
+
+        _log_null_embedding(f"rank{rank} waiting for null embedding cache at {path}")
+        deadline = time.monotonic() + 60 * 60
+        next_log = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if path.is_file() and path.stat().st_size > 0:
+                _log_null_embedding(f"rank{rank} detected null embedding cache at {path}")
+                return _load_embedding_tensor(path, device)
+            if time.monotonic() >= next_log:
+                _log_null_embedding(f"rank{rank} still waiting for null embedding cache at {path}")
+                next_log = time.monotonic() + 60
+            time.sleep(2.0)
+        raise TimeoutError(f"Timed out waiting for null embedding cache at {path}")
 
     emb = compute_null_embedding(flux_model_name, device=str(device))
-    torch.save(emb.cpu(), path)
+    _log_null_embedding(f"saving null embedding to {path}")
+    _save_embedding_tensor(path, emb)
+    _log_null_embedding(f"saved null embedding to {path}")
     return emb.to(device=device, dtype=torch.bfloat16)
 
 
@@ -142,4 +176,6 @@ if __name__ == "__main__":
         flux_model_name=cfg.model.flux_model_name,
         device=args.device,
     )
-    print(f"Null embedding shape={tuple(out.shape)} dtype={out.dtype} path={cfg.model.null_emb_path}")
+    log_message(
+        f"Null embedding shape={tuple(out.shape)} dtype={out.dtype} path={cfg.model.null_emb_path}"
+    )

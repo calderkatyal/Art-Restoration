@@ -9,6 +9,7 @@ import torch
 from PIL import Image
 from safetensors.torch import load_file as load_sft
 
+from ..utils import log_message
 from .autoencoder import AutoEncoder, AutoEncoderParams
 from .model import Flux2, Flux2Params, Klein4BParams, Klein9BParams
 from .text_encoder import load_mistral_small_embedder, load_qwen3_embedder
@@ -114,7 +115,7 @@ def _resolve_pretrained_flow_weight_path(model_name: str) -> str:
                 repo_type="model",
             )
         except huggingface_hub.errors.RepositoryNotFoundError:
-            print(
+            log_message(
                 f"Failed to access the model repository. Please check your internet "
                 f"connection and make sure you've access to {config['repo_id']}."
                 "Stopping."
@@ -131,7 +132,7 @@ def load_pretrained_flow_state_dict(
     if isinstance(device, str):
         device = torch.device(device)
     weight_path = _resolve_pretrained_flow_weight_path(model_name)
-    print(f"[rank {rank}] Loading {weight_path} for FLUX.2 weights")
+    log_message(f"[rank {rank}] Loading {weight_path} for FLUX.2 weights")
     return load_sft(weight_path, device=str(device))
 
 
@@ -167,7 +168,7 @@ def load_ae(model_name: str, rank: int = 0, device: str | torch.device = "cuda")
                 repo_type="model",
             )
         except huggingface_hub.errors.RepositoryNotFoundError:
-            print(
+            log_message(
                 f"Failed to access the model repository. Please check your internet "
                 f"connection and make sure you've access to {config['repo_id']}."
                 "Stopping."
@@ -179,7 +180,7 @@ def load_ae(model_name: str, rank: int = 0, device: str | torch.device = "cuda")
     with torch.device("meta"):
         ae = AutoEncoder(AutoEncoderParams())
 
-    print(f"[rank {rank}] Loading {weight_path} for the AutoEncoder weights")
+    log_message(f"[rank {rank}] Loading {weight_path} for the AutoEncoder weights")
     sd = load_sft(weight_path, device=str(device))
     ae.load_state_dict(sd, strict=True, assign=True)
 

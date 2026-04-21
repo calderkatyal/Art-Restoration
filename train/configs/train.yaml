@@ -15,7 +15,7 @@ model:
 train:
   train_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
   val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
-  checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
+  checkpoint_root: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
   batch_size: 32
   gradient_checkpointing: true
@@ -68,7 +68,7 @@ inference:
 wandb:
   enabled: true
   project: "V1 Training"
-  entity: "katyalcalder-research"
+  entity: "cpsc4520_final_project"
   run_name: "first_run"          # null = auto-generated
   tags: []                
   log_images: true

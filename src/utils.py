@@ -10,11 +10,12 @@ Provides:
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
 
-from omegaconf import DictConfig, OmegaConf
 import torch
+from omegaconf import DictConfig, OmegaConf
 
 from .distributed import is_main_process
 
@@ -41,6 +42,12 @@ _DEEPSPEED_DEFAULTS = OmegaConf.create(
 )
 
 
+def log_message(message: str) -> None:
+    """Print a timestamped log line."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
 def _trainable_group_names(model: Any) -> list[str]:
     names: list[str] = []
     for group in model.get_trainable_params():
@@ -57,7 +64,7 @@ def print_training_phase(model: Any, warmup_only: bool, step: int) -> None:
     groups = _trainable_group_names(model)
     phase = "warmup" if warmup_only else "full training"
     trained = ", ".join(groups) if groups else "none"
-    print(f"[train] Step {step}: {phase} active. Training layers: {trained}")
+    log_message(f"[train] Step {step}: {phase} active. Training layers: {trained}")
 
 
 def print_vram_debug(
@@ -83,12 +90,13 @@ def print_vram_debug(
 
     idx = device.index if device.index is not None else torch.cuda.current_device()
     torch.cuda.synchronize(idx)
-    print(
+    gb = 1024**3
+    log_message(
         f"[vram] {label}: "
-        f"torch.cuda.memory_allocated()={torch.cuda.memory_allocated(idx)} "
-        f"torch.cuda.max_memory_allocated()={torch.cuda.max_memory_allocated(idx)} "
-        f"torch.cuda.memory_reserved()={torch.cuda.memory_reserved(idx)} "
-        f"torch.cuda.max_memory_reserved()={torch.cuda.max_memory_reserved(idx)}"
+        f"allocated={torch.cuda.memory_allocated(idx) / gb:.2f}GB "
+        f"max_allocated={torch.cuda.max_memory_allocated(idx) / gb:.2f}GB "
+        f"reserved={torch.cuda.memory_reserved(idx) / gb:.2f}GB "
+        f"max_reserved={torch.cuda.max_memory_reserved(idx) / gb:.2f}GB"
     )
 
 def _resolve_config_path(config_path: str, config_dir: Optional[Path] = None) -> Path:

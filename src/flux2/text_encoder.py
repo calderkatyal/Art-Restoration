@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import torch
@@ -8,10 +9,10 @@ from transformers import (
     AutoModelForCausalLM,
     AutoProcessor,
     AutoTokenizer,
-    Mistral3ForConditionalGeneration,
     pipeline,
 )
 
+from ..utils import log_message
 from .sampling import cap_pixels, concatenate_images
 from .system_messages import (
     PROMPT_IMAGE_INTEGRITY,
@@ -39,7 +40,11 @@ class Mistral3SmallEmbedder(nn.Module):
     ):
         super().__init__()
 
-        self.model: Mistral3ForConditionalGeneration = Mistral3ForConditionalGeneration.from_pretrained(
+        # Import lazily so environments that only use the Qwen text encoder
+        # do not need Mistral-specific symbols available at module import time.
+        from transformers import Mistral3ForConditionalGeneration
+
+        self.model: nn.Module = Mistral3ForConditionalGeneration.from_pretrained(
             model_spec,
             torch_dtype=getattr(torch, torch_dtype),
         )
@@ -179,7 +184,7 @@ class Mistral3SmallEmbedder(nn.Module):
                 max_length=2048,
             )
         except ValueError as e:
-            print(
+            log_message(
                 f"Error processing input: {e}, your max length is probably too short, when you have images in the input."
             )
             raise e
@@ -211,7 +216,7 @@ class Mistral3SmallEmbedder(nn.Module):
             )
             return raw_txt
         except Exception as e:
-            print(f"Error generating upsampled prompt: {e}, returning original prompt")
+            log_message(f"Error generating upsampled prompt: {e}, returning original prompt")
             return txt
 
     @torch.no_grad()
@@ -433,4 +438,9 @@ def load_mistral_small_embedder(device: str | torch.device = "cuda") -> Mistral3
 
 
 def load_qwen3_embedder(variant: str, device: str | torch.device = "cuda"):
-    return Qwen3Embedder(model_spec=f"Qwen/Qwen3-{variant}-FP8", device=device)
+    # Default to the non-FP8 checkpoint because the FP8 variant relies on a
+    # Triton kernel path that is not available in our cluster environment.
+    model_spec = os.environ.get("ART_RESTORATION_QWEN3_MODEL_SPEC", f"Qwen/Qwen3-{variant}")
+    if os.environ.get("ART_RESTORATION_USE_QWEN3_FP8", "").lower() in {"1", "true", "yes"}:
+        model_spec = f"Qwen/Qwen3-{variant}-FP8"
+    return Qwen3Embedder(model_spec=model_spec, device=device)
