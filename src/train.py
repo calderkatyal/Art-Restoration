@@ -179,12 +179,14 @@ def setup_model(
     """
     flow_model = RestorationDiT(
         cfg=cfg.model,
-        gradient_checkpointing=bool(getattr(cfg.train, "gradient_checkpointing", False)),
+        gradient_checkpointing=False,
         device=device,
         img_in_dtype=torch.bfloat16,
         load_pretrained=load_pretrained,
         rank=rank,
     )
+    if bool(getattr(cfg.train, "gradient_checkpointing", False)):
+        flow_model.enable_gradient_checkpointing()
     flow_model.set_trainability(warmup_only)
 
     vae = FluxVAE(
@@ -777,6 +779,10 @@ def main(cfg: DictConfig) -> None:
     ds_cfg = OmegaConf.to_container(cfg.ds_config, resolve=True)
     ds_cfg["train_micro_batch_size_per_gpu"] = _micro_batch_size(cfg)
     ds_cfg["gradient_accumulation_steps"] = grad_accum
+    if bool(getattr(cfg.train, "gradient_checkpointing", False)):
+        act_cfg = ds_cfg.setdefault("activation_checkpointing", {})
+        act_cfg["partition_activations"] = True
+        act_cfg["cpu_checkpointing"] = True
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=flow_model,

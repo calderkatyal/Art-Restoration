@@ -114,6 +114,10 @@ class Flux2(nn.Module):
             self.out_channels,
         )
 
+    def gradient_checkpointing_enable(self) -> None:
+        """Enable per-block activation recomputation in ``forward``."""
+        self.gradient_checkpointing = True
+
     def forward(
         self,
         x: Tensor,
@@ -142,15 +146,69 @@ class Flux2(nn.Module):
         pe_ctx = self.pe_embedder(ctx_ids)
 
         for block in self.double_blocks:
-            img, txt, _ = block.forward_kv_extract(
-                img,
-                txt,
-                pe_x,
-                pe_ctx,
-                double_block_mod_img,
-                double_block_mod_txt,
-                num_ref_tokens=0,
-            )
+            if self.training and self.gradient_checkpointing:
+                def _double_block_forward(
+                    img_: Tensor,
+                    txt_: Tensor,
+                    pe_x_: Tensor,
+                    pe_ctx_: Tensor,
+                    img_shift_1: Tensor,
+                    img_scale_1: Tensor,
+                    img_gate_1: Tensor,
+                    img_shift_2: Tensor,
+                    img_scale_2: Tensor,
+                    img_gate_2: Tensor,
+                    txt_shift_1: Tensor,
+                    txt_scale_1: Tensor,
+                    txt_gate_1: Tensor,
+                    txt_shift_2: Tensor,
+                    txt_scale_2: Tensor,
+                    txt_gate_2: Tensor,
+                    *,
+                    _block=block,
+                ) -> tuple[Tensor, Tensor]:
+                    out_img, out_txt, _ = _block.forward_kv_extract(
+                        img_,
+                        txt_,
+                        pe_x_,
+                        pe_ctx_,
+                        (
+                            (img_shift_1, img_scale_1, img_gate_1),
+                            (img_shift_2, img_scale_2, img_gate_2),
+                        ),
+                        (
+                            (txt_shift_1, txt_scale_1, txt_gate_1),
+                            (txt_shift_2, txt_scale_2, txt_gate_2),
+                        ),
+                        num_ref_tokens=0,
+                    )
+                    return out_img, out_txt
+
+                img_mod_1, img_mod_2 = double_block_mod_img
+                txt_mod_1, txt_mod_2 = double_block_mod_txt
+                img = checkpoint(
+                    _double_block_forward,
+                    img,
+                    txt,
+                    pe_x,
+                    pe_ctx,
+                    *img_mod_1,
+                    *img_mod_2,
+                    *txt_mod_1,
+                    *txt_mod_2,
+                    use_reentrant=False,
+                )
+                img, txt = img
+            else:
+                img, txt, _ = block.forward_kv_extract(
+                    img,
+                    txt,
+                    pe_x,
+                    pe_ctx,
+                    double_block_mod_img,
+                    double_block_mod_txt,
+                    num_ref_tokens=0,
+                )
 
         img = torch.cat((txt, img), dim=1)
         pe = torch.cat((pe_ctx, pe_x), dim=2)

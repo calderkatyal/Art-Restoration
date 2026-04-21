@@ -108,8 +108,15 @@ class RestorationDiT(nn.Module):
                 rank=rank,
                 device=device,
             )
-        flow_model.gradient_checkpointing = gradient_checkpointing
+        if gradient_checkpointing:
+            flow_model.gradient_checkpointing_enable()
+        else:
+            flow_model.gradient_checkpointing = False
         return flow_model
+
+    def enable_gradient_checkpointing(self) -> None:
+        """Enable activation checkpointing on the internal FLUX backbone."""
+        self.flow_model.gradient_checkpointing_enable()
 
     def load_pretrained_backbone(
         self,

@@ -79,6 +79,9 @@ ds_config:
   gradient_accumulation_steps: 4
   gradient_clipping: 1.0
   steps_per_print: 100
+  activation_checkpointing:
+    partition_activations: true
+    cpu_checkpointing: true
   bf16:
     enabled: true
   zero_optimization:

@@ -25,6 +25,10 @@ _DEEPSPEED_DEFAULTS = OmegaConf.create(
         "gradient_accumulation_steps": 1,
         "steps_per_print": 100,
         "gradient_clipping": 1.0,
+        "activation_checkpointing": {
+            "partition_activations": False,
+            "cpu_checkpointing": False,
+        },
         "bf16": {"enabled": True},
         "fp16": {"enabled": False},
         "zero_optimization": {
