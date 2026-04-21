@@ -5,6 +5,7 @@ import torch
 from einops import rearrange
 from torch import Tensor, nn
 from torch.nn import functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -64,6 +65,7 @@ class Flux2(nn.Module):
             raise ValueError(f"Got {params.axes_dim} but expected positional dim {pe_dim}")
         self.hidden_size = params.hidden_size
         self.num_heads = params.num_heads
+        self.gradient_checkpointing = False
         self.pe_embedder = EmbedND(dim=pe_dim, theta=params.theta, axes_dim=params.axes_dim)
         self.img_in = nn.Linear(self.in_channels, self.hidden_size, bias=False)
         self.time_in = MLPEmbedder(in_dim=256, hidden_dim=self.hidden_size, disable_bias=True)
@@ -152,15 +154,43 @@ class Flux2(nn.Module):
 
         img = torch.cat((txt, img), dim=1)
         pe = torch.cat((pe_ctx, pe_x), dim=2)
-
+        
         for block in self.single_blocks:
-            img, _ = block.forward_kv_extract(
-                img,
-                pe,
-                single_block_mod,
-                num_txt_tokens,
-                num_ref_tokens=0,
-            )
+            if self.training and self.gradient_checkpointing: 
+                def _single_block_forward(
+                    img_: Tensor, 
+                    pe_: Tensor, 
+                    mod_shift: Tensor, 
+                    mod_scale: Tensor, 
+                    mod_gate: Tensor, 
+                    *, 
+                    _block=block, 
+                    _num_txt_tokens=num_txt_tokens,
+                ) -> Tensor: 
+                    out, _ = _block.forward_kv_extract(
+                        img_, 
+                        pe_, 
+                        (mod_shift, mod_scale, mod_gate), 
+                        _num_txt_tokens, 
+                        num_ref_tokens=0,
+                    )
+                    return out
+                
+                img = checkpoint(
+                    _single_block_forward, 
+                    img, 
+                    pe, 
+                    *single_block_mod, 
+                    use_reentrant=False,
+                )
+            else: 
+                img, _ = block.forward_kv_extract(
+                    img, 
+                    pe, 
+                    single_block_mod, 
+                    num_txt_tokens, 
+                    num_ref_tokens=0,
+                )    
 
         img = img[:, num_txt_tokens:, ...]
 

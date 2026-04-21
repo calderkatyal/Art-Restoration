@@ -853,7 +853,11 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
     C, H, W = image.shape
     out = image.clone()
 
-    field = mask
+    # Rescale deposits severity so new user-facing severity=1.0 matches the
+    # previous deposits look at severity=0.75, while preserving the shared
+    # global severity floor used by mask generation.
+    sev = ((mask - 0.3) / 0.7).clamp(0.0, 1.0)
+    field = 0.3 + 0.7 * (sev * 0.75)
     if field.max() < 0.01:
         return out
 

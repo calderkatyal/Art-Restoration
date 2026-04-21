@@ -71,7 +71,7 @@ from .distributed import get_device, get_global_rank, get_world_size, is_main_pr
 from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
-from .utils import load_config
+from .utils import load_config, print_training_phase
 from .vae import FluxVAE
 
 # True only on rank 0 after ``wandb.init``; other ranks skip WandB entirely.
@@ -179,6 +179,7 @@ def setup_model(
     """
     flow_model = RestorationDiT(
         cfg=cfg.model,
+        gradient_checkpointing=bool(getattr(cfg.train, "gradient_checkpointing", False)),
         device=device,
         img_in_dtype=torch.bfloat16,
         load_pretrained=load_pretrained,
@@ -816,7 +817,7 @@ def main(cfg: DictConfig) -> None:
                     f"[train] Checkpoint load failed ({exc}); falling back to pretrained weights."
                 )
             _unwrap_model(engine).load_pretrained_backbone(
-                cfg.model.flux_model_name, rank=rank, device=device
+                cfg.model.flux_model_name, rank=rank
             )
             start_epoch = 0
             global_step = 0
@@ -831,6 +832,7 @@ def main(cfg: DictConfig) -> None:
         step=global_step,
     )
     last_logged_step = global_step
+    print_training_phase(_unwrap_model(engine), warmup_only, global_step)
     _distributed_barrier()
 
     engine.train()
@@ -880,6 +882,7 @@ def main(cfg: DictConfig) -> None:
                     cfg,
                     step=global_step,
                 )
+                print_training_phase(_unwrap_model(engine), warmup_only, global_step)
 
             if is_main_process():
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -981,14 +984,6 @@ def main(cfg: DictConfig) -> None:
 
 
 if __name__ == "__main__":
-    # Run training from the command line. Unknown CLI tokens are treated as OmegaConf
-    # dotlist overrides (same style as Hydra), e.g.
-    # ``ds_config.train_micro_batch_size_per_gpu=8``.
-    #
-    # Examples:
-    #   python -m src.train --config train/configs/train.yaml train.warmup_iterations=1000
-    #   python -m src.train ds_config.train_micro_batch_size_per_gpu=8
-    #   python -m src.train train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000
     parser = argparse.ArgumentParser(description="Art restoration DiT training")
     parser.add_argument(
         "--config",

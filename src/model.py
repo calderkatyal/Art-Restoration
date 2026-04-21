@@ -39,7 +39,11 @@ from typing import Any, List
 
 from .flux2.model import Flux2
 from .flux2.sampling import batched_prc_img, batched_prc_txt
-from .flux2.util import init_flow_model, load_pretrained_flow_weights
+from .flux2.util import (
+    init_flow_model,
+    load_pretrained_flow_state_dict,
+    load_pretrained_flow_weights,
+)
 
 
 class RestorationDiT(nn.Module):
@@ -52,6 +56,7 @@ class RestorationDiT(nn.Module):
     def __init__(
         self,
         cfg: Any,
+        gradient_checkpointing: bool = False,
         device: str | torch.device = "cuda",
         img_in_dtype=torch.bfloat16,
         load_pretrained: bool = True,
@@ -72,22 +77,44 @@ class RestorationDiT(nn.Module):
             rank: Process rank for logging during weight download/load.
         """
         super().__init__()
-        if isinstance(device, str):
-            device = torch.device(device)
-            
         self.cfg = cfg
-        self.flow_model = init_flow_model(cfg.flux_model_name)
+        device = self._normalize_device(device)
+        self.flow_model = self._build_flow_model(
+            flux_model_name=cfg.flux_model_name,
+            gradient_checkpointing=gradient_checkpointing,
+            load_pretrained=load_pretrained,
+            rank=rank,
+            device=device,
+        )
+        self._reinit_img_in(cfg.in_channels, cfg.hidden_size, device=device, dtype=img_in_dtype)
+
+    @staticmethod
+    def _normalize_device(device: str | torch.device) -> torch.device:
+        return torch.device(device) if isinstance(device, str) else device
+
+    def _build_flow_model(
+        self,
+        flux_model_name: str,
+        gradient_checkpointing: bool,
+        load_pretrained: bool,
+        rank: int,
+        device: torch.device,
+    ) -> Flux2:
+        flow_model = init_flow_model(flux_model_name)
         if load_pretrained:
             load_pretrained_flow_weights(
-                self.flow_model, cfg.flux_model_name, rank=rank, device=device
+                flow_model,
+                flux_model_name,
+                rank=rank,
+                device=device,
             )
-        self._reinit_img_in(cfg.in_channels, cfg.hidden_size, device=device, dtype=img_in_dtype)
+        flow_model.gradient_checkpointing = gradient_checkpointing
+        return flow_model
 
     def load_pretrained_backbone(
         self,
         model_name: str,
         rank: int = 0,
-        device: str | torch.device = "cuda",
     ) -> None:
         """Load pretrained FLUX weights into matching backbone tensors only.
 
@@ -95,28 +122,82 @@ class RestorationDiT(nn.Module):
         current ``img_in`` width differs from the pretrained model's 128-channel
         projection. ``img_in`` is intentionally left unchanged.
         """
-        if isinstance(device, str):
-            device = torch.device(device)
+        source = load_pretrained_flow_state_dict(model_name, rank=rank, device="cpu")
+        filtered, problems = self._filtered_backbone_state_dict(source)
+        incompatible = self.flow_model.load_state_dict(filtered, strict=False)
+        self._raise_on_invalid_backbone_load(incompatible, problems)
 
-        temp_model = init_flow_model(model_name)
-        load_pretrained_flow_weights(temp_model, model_name, rank=rank, device=device)
-
-        target = self.flow_model.state_dict()
-        source = temp_model.state_dict()
-        for key, value in source.items():
+    def _filtered_backbone_state_dict(
+        self,
+        source_state: dict[str, torch.Tensor],
+    ) -> tuple[dict[str, torch.Tensor], dict[str, list]]:
+        target_shapes = {
+            key: tuple(value.shape) for key, value in self.flow_model.state_dict().items()
+        }
+        filtered: dict[str, torch.Tensor] = {}
+        problems = {
+            "unexpected_source_keys": [],
+            "mismatched_shapes": [],
+        }
+        for key, value in source_state.items():
             if key.startswith("img_in"):
                 continue
-            if key in target and target[key].shape == value.shape:
-                target[key] = value
-        self.flow_model.load_state_dict(target, strict=False)
+            if key not in target_shapes:
+                problems["unexpected_source_keys"].append(key)
+                continue
+            if target_shapes[key] != tuple(value.shape):
+                problems["mismatched_shapes"].append(
+                    (key, target_shapes[key], tuple(value.shape))
+                )
+                continue
+            filtered[key] = value
+        return filtered, problems
 
-    def _reinit_img_in(self, in_channels: int, hidden_size: int, device: str | torch.device = "cuda", dtype=torch.bfloat16) -> None:
+    def _raise_on_invalid_backbone_load(self, incompatible: Any, problems: dict[str, list]) -> None:
+        expected_missing = {
+            key for key in self.flow_model.state_dict().keys() if key.startswith("img_in")
+        }
+        unexpected_missing = sorted(
+            key for key in incompatible.missing_keys if key not in expected_missing
+        )
+        if (
+            incompatible.unexpected_keys
+            or problems["unexpected_source_keys"]
+            or problems["mismatched_shapes"]
+            or unexpected_missing
+        ):
+            details = []
+            if incompatible.unexpected_keys:
+                details.append(f"unexpected loaded keys: {incompatible.unexpected_keys}")
+            if problems["unexpected_source_keys"]:
+                details.append(
+                    f"unexpected checkpoint keys: {problems['unexpected_source_keys'][:8]}"
+                )
+            if problems["mismatched_shapes"]:
+                details.append(
+                    f"shape mismatches: {problems['mismatched_shapes'][:4]}"
+                )
+            if unexpected_missing:
+                details.append(f"missing target keys: {unexpected_missing[:8]}")
+            raise RuntimeError(
+                "Pretrained backbone load skipped non-img_in weights unexpectedly: "
+                + "; ".join(details)
+            )
+
+    def _reinit_img_in(
+        self,
+        in_channels: int,
+        hidden_size: int,
+        device: str | torch.device = "cuda",
+        dtype=torch.bfloat16,
+    ) -> None:
         """Replace img_in with a new randomly-initialized Linear layer.
 
         Args:
             in_channels: 128 + 128 + K (mask channels).
             hidden_size: 3072 (Klein 4B).
         """
+        device = self._normalize_device(device)
         new_in = nn.Linear(in_channels, hidden_size, bias=False, device=device, dtype=dtype)
         nn.init.xavier_uniform_(new_in.weight)
         self.flow_model.img_in = new_in
