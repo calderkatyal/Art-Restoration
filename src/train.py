@@ -72,7 +72,7 @@ from .distributed import get_device, get_global_rank, get_world_size, is_main_pr
 from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
-from .utils import load_config, print_training_phase
+from .utils import load_config, print_training_phase, print_vram_debug
 from .vae import FluxVAE
 
 # True only on rank 0 after ``wandb.init``; other ranks skip WandB entirely.
@@ -246,6 +246,7 @@ def setup_model(
         load_pretrained=load_pretrained,
         rank=rank,
     )
+    print_vram_debug(cfg, "after_loading_model_weights", device=device)
     flow_model.set_trainability(warmup_only)
 
     vae = FluxVAE(
@@ -253,12 +254,14 @@ def setup_model(
         rank=rank,
         device=device,
     )
-    
+    print_vram_debug(cfg, "after_loading_vae", device=device)
+
     null_emb = load_or_compute_null_embedding(
         cache_path=cfg.model.null_emb_path,
         flux_model_name=cfg.model.flux_model_name,
         device=device,
     )
+    print_vram_debug(cfg, "after_loading_null_emb", device=device)
     return flow_model, vae, null_emb
 
 
@@ -851,6 +854,7 @@ def main(cfg: DictConfig) -> None:
         lr_scheduler=scheduler,
         config=ds_cfg,
     )
+    print_vram_debug(cfg, "after_deepspeed_initialize", device=device)
 
     global_step = 0
     images_since_save = 0
@@ -935,8 +939,10 @@ def main(cfg: DictConfig) -> None:
                 device,
                 float(getattr(cfg.train, "loss_weight_mask", 0.7)),
             )
+            print_vram_debug(cfg, f"before_backward_step_{global_step + 1}", device=device)
             engine.backward(loss)
             engine.step()
+            print_vram_debug(cfg, f"after_optimizer_step_{global_step + 1}", device=device)
 
             prev_step = global_step
             global_step = int(getattr(engine, "global_steps", prev_step + 1))
@@ -969,6 +975,10 @@ def main(cfg: DictConfig) -> None:
                 }
                 for i, lr in enumerate(lrs):
                     metrics[f"train/lr_group_{i}"] = lr
+                print(
+                    f"[train] epoch={epoch} step={global_step} "
+                    f"loss={loss.item():.4f} img_per_sec={img_per_sec:.2f}"
+                )
                 wandb_log(metrics, step=global_step)
                 last_logged_step = global_step
 
@@ -1027,8 +1037,23 @@ def main(cfg: DictConfig) -> None:
                 and global_step > 0
             )
             if should_validate:
+                val_start_time = None
+                if is_main_process():
+                    val_start_time = time.perf_counter()
+                    print("========STARTING VALIDATION========")
+                    print(f"[val] epoch={epoch} step={global_step}")
                 metrics = validate(engine, vae, val_loader, null_emb, cfg, device)
                 if is_main_process():
+                    print(
+                        f"[val] epoch={epoch} step={global_step} "
+                        f"loss={metrics['velocity_loss']:.4f}"
+                    )
+                    elapsed = 0.0 if val_start_time is None else time.perf_counter() - val_start_time
+                    print("========ENDING VALIDATION========")
+                    print(
+                        f"[val] epoch={epoch} step={global_step} "
+                        f"duration_sec={elapsed:.2f}"
+                    )
                     wandb_log(
                         {"val/velocity_loss": metrics["velocity_loss"]},
                         step=global_step,

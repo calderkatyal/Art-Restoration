@@ -28,6 +28,7 @@ train:
   snapshot_every_n_steps: 1
   num_epochs: 10
   seed: 42
+  debug_vram: true
   warmup_iterations: 317
   save_every: 50
   val_every: 50
