@@ -5,6 +5,7 @@ Provides:
     * :func:`load_corruption_config` for loading the corruption YAML referenced by
       ``cfg.corruption.config_path``.
     * :func:`print_training_phase` for logging active trainable parameter groups.
+    * :func:`print_vram_debug` for optional rank-0 CUDA memory diagnostics.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Any, List, Optional
 
 from omegaconf import DictConfig, OmegaConf
+import torch
 
 from .distributed import is_main_process
 
@@ -56,6 +58,38 @@ def print_training_phase(model: Any, warmup_only: bool, step: int) -> None:
     phase = "warmup" if warmup_only else "full training"
     trained = ", ".join(groups) if groups else "none"
     print(f"[train] Step {step}: {phase} active. Training layers: {trained}")
+
+
+def print_vram_debug(
+    cfg: Any,
+    label: str,
+    device: str | torch.device | None = None,
+) -> None:
+    """Print CUDA memory stats on rank 0 when ``train.debug_vram`` is enabled."""
+    if not is_main_process():
+        return
+    train_cfg = getattr(cfg, "train", None)
+    if train_cfg is None or not bool(train_cfg.get("debug_vram", False)):
+        return
+    if not torch.cuda.is_available():
+        return
+
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif isinstance(device, str):
+        device = torch.device(device)
+    if device.type != "cuda":
+        return
+
+    idx = device.index if device.index is not None else torch.cuda.current_device()
+    torch.cuda.synchronize(idx)
+    print(
+        f"[vram] {label}: "
+        f"torch.cuda.memory_allocated()={torch.cuda.memory_allocated(idx)} "
+        f"torch.cuda.max_memory_allocated()={torch.cuda.max_memory_allocated(idx)} "
+        f"torch.cuda.memory_reserved()={torch.cuda.memory_reserved(idx)} "
+        f"torch.cuda.max_memory_reserved()={torch.cuda.max_memory_reserved(idx)}"
+    )
 
 def _resolve_config_path(config_path: str, config_dir: Optional[Path] = None) -> Path:
     """Resolve a config path against a few sensible roots.
