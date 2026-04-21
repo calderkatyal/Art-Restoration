@@ -453,39 +453,48 @@ def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
                 oy = (ny + 0.5) - py
                 d_par = ox * cos_a + oy * sin_a       # along spine
                 d_perp = ox * cos_p + oy * sin_p      # across spine
-                # Only paint pixels whose along-spine offset is within
-                # ±0.6 step of this spine point — adjacent steps cover
-                # the rest. Keeps strips non-overlapping & solid.
-                if abs(d_par) > 0.6:
+                # Anti-aliased along-spine coverage (sub-pixel taper instead
+                # of a hard ±0.6 cutoff) to reduce stair-step edges.
+                par_cov = max(0.0, 1.0 - abs(d_par) / 1.0)
+                if par_cov <= 0.01:
                     continue
                 ad = abs(d_perp)
                 edge_lim = edge_r_eff if d_perp > 0 else edge_l_eff
-                if ad <= edge_lim:
+                # Soft interior coverage around the edge for anti-aliased
+                # transitions (core + feathered boundary).
+                core_cov = max(0.0, min(1.0, edge_lim + 0.9 - ad)) * par_cov
+                if core_cov > 0.01:
                     # Interior: adaptive colour (canvas/substrate on dark backgrounds,
-                    # near-black on light backgrounds), full opacity.
+                    # near-black on light backgrounds), with slight texture.
                     tex = 0.85 + 0.15 * math.sin(0.20 * d_par + 0.45 * d_perp)
-                    out[0, ny, nx] = max(0.0, min(1.0, int_r * tex))
-                    out[1, ny, nx] = max(0.0, min(1.0, int_g * tex))
-                    out[2, ny, nx] = max(0.0, min(1.0, int_b * tex))
-                elif ad <= edge_lim + 2.0 and edge_lim > 0.5:
+                    tr = max(0.0, min(1.0, int_r * tex))
+                    tg = max(0.0, min(1.0, int_g * tex))
+                    tb = max(0.0, min(1.0, int_b * tex))
+                    inv = 1.0 - core_cov
+                    out[0, ny, nx] = out[0, ny, nx] * inv + tr * core_cov
+                    out[1, ny, nx] = out[1, ny, nx] * inv + tg * core_cov
+                    out[2, ny, nx] = out[2, ny, nx] * inv + tb * core_cov
+                elif ad <= edge_lim + 2.6 and edge_lim > 0.5:
                     # Shadow band — underside of paint that has lifted up
                     # at the tear edge. Multiplicative darken preserves
-                    # underlying hue.
-                    lip_t = (ad - edge_lim) / 2.0
+                    # underlying hue. Use a soft bell profile for anti-alias.
+                    lip_t = (ad - edge_lim) / 2.6
                     side = 1.0 if d_perp >= 0.0 else -1.0
                     side_gain = 1.0 if side == flap_sign else 0.35
-                    darken = 0.18 + (0.55 * side_gain) * lip_t
-                    out[0, ny, nx] = out[0, ny, nx] * darken
-                    out[1, ny, nx] = out[1, ny, nx] * darken
-                    out[2, ny, nx] = out[2, ny, nx] * darken
-                elif ad <= edge_lim + 4.0 and edge_lim > 0.5:
+                    band = max(0.0, 1.0 - abs(lip_t - 0.5) / 0.5) * par_cov
+                    dark_a = band * (0.42 + 0.30 * side_gain)
+                    out[0, ny, nx] = out[0, ny, nx] * (1.0 - dark_a)
+                    out[1, ny, nx] = out[1, ny, nx] * (1.0 - dark_a)
+                    out[2, ny, nx] = out[2, ny, nx] * (1.0 - dark_a)
+                elif ad <= edge_lim + 4.8 and edge_lim > 0.5:
                     # Highlight band — top of the curled-up paint
                     # catching the light. Warm off-white blended with low
                     # alpha, peaking at the inner edge of the band.
-                    hl_t = (ad - (edge_lim + 2.0)) / 2.0   # 0..1
+                    hl_t = (ad - (edge_lim + 2.0)) / 2.8   # 0..1
                     side = 1.0 if d_perp >= 0.0 else -1.0
                     side_gain = 1.0 if side == flap_sign else 0.30
-                    hl_a = 0.24 * side_gain * (1.0 - hl_t)  # peak at inner
+                    hl_band = max(0.0, 1.0 - abs(hl_t - 0.45) / 0.55) * par_cov
+                    hl_a = 0.20 * side_gain * hl_band
                     inv = 1.0 - hl_a
                     out[0, ny, nx] = out[0, ny, nx] * inv + 0.96 * hl_a
                     out[1, ny, nx] = out[1, ny, nx] * inv + 0.93 * hl_a
@@ -1013,10 +1022,15 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             # Brokenness: lower severities tend to have more intermittent, faint
             # abrasions rather than a single fully continuous groove.
             break_p = 0.16 - 0.08 * sev_norm
+            # Low-frequency opacity texture along each stroke (micro-flaking /
+            # varying scratch depth) via a random-walk scalar.
+            depth_tex = 0.7 + 0.3 * torch.rand(1, generator=generator).item()
             outside_streak = 0
 
             for step_i in range(scratch_len):
-                angle += curvature + (torch.rand(1, generator=generator).item() - 0.5) * 0.05
+                # Brownian-like high-frequency jitter so paths catch on
+                # canvas texture instead of reading as smooth digital arcs.
+                angle += curvature + (torch.rand(1, generator=generator).item() - 0.5) * 0.10
                 px += math.cos(angle) * step_size
                 py2 += math.sin(angle) * step_size
 
@@ -1039,10 +1053,12 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
 
                 alpha_now += (torch.rand(1, generator=generator).item() - 0.5) * 0.06
                 alpha_now = max(alpha_min, min(alpha_max, alpha_now))
+                depth_tex += (torch.rand(1, generator=generator).item() - 0.5) * 0.10
+                depth_tex = max(0.45, min(1.0, depth_tex))
 
                 t = step_i / max(1, scratch_len - 1)
                 taper = max(0.35, 1.0 - (2.0 * t - 1.0) ** 2)
-                a = min(1.0, alpha_now * sev_opacity * taper)
+                a = min(1.0, alpha_now * sev_opacity * taper * depth_tex)
                 # Intermittent skip-outs produce realistic broken abrasions.
                 if torch.rand(1, generator=generator).item() < break_p:
                     a *= 0.25
@@ -1054,7 +1070,9 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                     for dx in range(-half_w - 1, half_w + 2):
                         nx, ny = ix + dx, iy + dy
                         if 0 <= nx < W and 0 <= ny < H:
-                            dist = math.hypot(dx, dy)
+                            # Sub-pixel anti-aliasing: evaluate footprint against
+                            # the continuous walk center (px, py2), not integer ix/iy.
+                            dist = math.hypot((nx + 0.5) - px, (ny + 0.5) - py2)
                             if dist > rad:
                                 continue
                             # Soft radial profile to avoid blocky brush footprints.
