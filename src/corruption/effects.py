@@ -288,29 +288,15 @@ def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
     # cause cracks to dominate the composition on darker paintings.
     lum_boost = _local_lum_boost(image, mask, min_val=0.02, max_boost=2.2)
 
-    # Adaptive crack colour: on dark-background regions the standard near-black
-    # crack (0.06, 0.05, 0.04) is invisible against the paint. Real cracks expose
-    # the underlying paint layer or gesso primer, which is typically lighter than
-    # the surface paint. For dark regions we therefore blend toward a warm
-    # off-white so the crack reads as a lighter groove rather than a dark shadow.
+    # Local luminance-aware crack color: compute from each pixel's luminance
+    # (not a single region mean) so dark pockets inside a bright mask still get
+    # lighter cracks that remain visible.
     lum_field = image[0] * 0.299 + image[1] * 0.587 + image[2] * 0.114
-    active_w = (mask >= 0.02).float()
-    if active_w.sum().item() > 0:
-        mean_lum = float((lum_field * active_w).sum().item() / active_w.sum().item())
-    else:
-        mean_lum = 0.5
-    if mean_lum < 0.35:
-        # Interpolate from near-black toward warm cream (aged gesso/canvas primer)
-        t = max(0.0, (0.35 - mean_lum) / 0.35)  # 0 at lum=0.35, 1 at lum=0
-        cr = 0.06 + t * 0.56   # up to 0.62
-        cg = 0.05 + t * 0.51   # up to 0.56
-        cb = 0.04 + t * 0.42   # up to 0.46
-    else:
-        cr, cg, cb = 0.06, 0.05, 0.04
 
     chunk_size = 4096
     out_flat = out.view(3, -1).clone()
     mask_flat = mask.view(-1)
+    lum_flat = lum_field.view(-1)
 
     for start in range(0, H * W, chunk_size):
         end = min(start + chunk_size, H * W)
@@ -349,6 +335,13 @@ def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
             a = m_vals[edge_idx]
             d = diff[is_edge]
             ew = edge_width[is_edge]
+            lum_here = lum_flat[global_idx]
+            # 0 on bright paint (use near-black crack), 1 on very dark paint
+            # (blend toward warm light crack to keep contrast).
+            t_lum = ((0.45 - lum_here) / 0.45).clamp(0.0, 1.0)
+            cr = 0.06 + 0.56 * t_lum
+            cg = 0.05 + 0.51 * t_lum
+            cb = 0.04 + 0.42 * t_lum
             # Strong alpha so cracks are unmissable. Floor 0.35 ensures even
             # low-severity cracks are clearly visible; ceiling 0.55 gives
             # bold lines at high severity. lum_boost adds up to 2.2x on dark.
@@ -367,6 +360,7 @@ def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
                      sx: float, sy: float, start_angle: float,
                      max_w: float, max_steps: int,
                      generator: torch.Generator,
+                     flap_sign: float = 1.0,
                      int_r: float = 0.0, int_g: float = 0.0, int_b: float = 0.0) -> None:
     """Walk a tear spine from (sx, sy) along `start_angle` painting a
     variable-width pure-black opening (canvas separation).
@@ -469,15 +463,18 @@ def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
                 if ad <= edge_lim:
                     # Interior: adaptive colour (canvas/substrate on dark backgrounds,
                     # near-black on light backgrounds), full opacity.
-                    out[0, ny, nx] = int_r
-                    out[1, ny, nx] = int_g
-                    out[2, ny, nx] = int_b
+                    tex = 0.85 + 0.15 * math.sin(0.20 * d_par + 0.45 * d_perp)
+                    out[0, ny, nx] = max(0.0, min(1.0, int_r * tex))
+                    out[1, ny, nx] = max(0.0, min(1.0, int_g * tex))
+                    out[2, ny, nx] = max(0.0, min(1.0, int_b * tex))
                 elif ad <= edge_lim + 2.0 and edge_lim > 0.5:
                     # Shadow band — underside of paint that has lifted up
                     # at the tear edge. Multiplicative darken preserves
                     # underlying hue.
                     lip_t = (ad - edge_lim) / 2.0
-                    darken = 0.18 + 0.55 * lip_t
+                    side = 1.0 if d_perp >= 0.0 else -1.0
+                    side_gain = 1.0 if side == flap_sign else 0.35
+                    darken = 0.18 + (0.55 * side_gain) * lip_t
                     out[0, ny, nx] = out[0, ny, nx] * darken
                     out[1, ny, nx] = out[1, ny, nx] * darken
                     out[2, ny, nx] = out[2, ny, nx] * darken
@@ -486,7 +483,9 @@ def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
                     # catching the light. Warm off-white blended with low
                     # alpha, peaking at the inner edge of the band.
                     hl_t = (ad - (edge_lim + 2.0)) / 2.0   # 0..1
-                    hl_a = 0.22 * (1.0 - hl_t)             # peak at inner
+                    side = 1.0 if d_perp >= 0.0 else -1.0
+                    side_gain = 1.0 if side == flap_sign else 0.30
+                    hl_a = 0.24 * side_gain * (1.0 - hl_t)  # peak at inner
                     inv = 1.0 - hl_a
                     out[0, ny, nx] = out[0, ny, nx] * inv + 0.96 * hl_a
                     out[1, ny, nx] = out[1, ny, nx] * inv + 0.93 * hl_a
@@ -690,11 +689,13 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
         base_angle = mask_axis + (torch.rand(1, generator=generator).item() - 0.5) * 0.50
 
         # Bidirectional main axis.
+        flap_sign = 1.0 if torch.rand(1, generator=generator).item() < 0.5 else -1.0
         for direction in (0.0, math.pi):
             _walk_tear_spine(
                 out, mask,
                 sx, sy, base_angle + direction,
                 max_w, steps_per_dir, generator,
+                flap_sign=flap_sign,
                 int_r=int_r, int_g=int_g, int_b=int_b,
             )
 
@@ -708,6 +709,7 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
                 sx, sy, branch_angle,
                 max_w * 0.65, max(20, steps_per_dir // 2),
                 generator,
+                flap_sign=flap_sign,
                 int_r=int_r, int_g=int_g, int_b=int_b,
             )
 
@@ -989,9 +991,13 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             scratch_len = max(30, int(comp_span * (0.4 + torch.rand(1, generator=generator).item() * 0.6)))
             scratch_len = min(scratch_len, max(H, W))
 
-            width = 2 if torch.rand(1, generator=generator).item() < 0.6 else 3
-            half_w = width // 2
-            alpha = 0.60 + torch.rand(1, generator=generator).item() * 0.30
+            # Initialize per-scratch random-walk states.
+            sev_norm = max(0.0, min(1.0, (mask_max - 0.3) / 0.7))
+            width_now = 1.2 + torch.rand(1, generator=generator).item() * (1.0 + 2.0 * sev_norm)
+            width_min = 0.9
+            width_max = 1.8 + 2.8 * sev_norm
+            alpha_now = 0.38 + torch.rand(1, generator=generator).item() * 0.30
+            alpha_min, alpha_max = 0.25, 0.85
 
             # Small chance of a burnished (bright) scratch for variety,
             # otherwise use the component-level colour.
@@ -1010,10 +1016,13 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             step_size = 1.5
             max_step_curve = 0.15 / max(40.0, float(scratch_len))
             curvature = (torch.rand(1, generator=generator).item() - 0.5) * max_step_curve
+            # Brokenness: lower severities tend to have more intermittent, faint
+            # abrasions rather than a single fully continuous groove.
+            break_p = 0.16 - 0.08 * sev_norm
             outside_streak = 0
 
             for step_i in range(scratch_len):
-                angle += curvature
+                angle += curvature + (torch.rand(1, generator=generator).item() - 0.5) * 0.05
                 px += math.cos(angle) * step_size
                 py2 += math.sin(angle) * step_size
 
@@ -1029,9 +1038,22 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                     continue
                 outside_streak = 0
 
+                # Width/opacity random walks for non-digital, hand-like strokes.
+                width_now += (torch.rand(1, generator=generator).item() - 0.5) * 0.20
+                width_now = max(width_min, min(width_max, width_now))
+                half_w = int(width_now)
+
+                alpha_now += (torch.rand(1, generator=generator).item() - 0.5) * 0.06
+                alpha_now = max(alpha_min, min(alpha_max, alpha_now))
+
                 t = step_i / max(1, scratch_len - 1)
                 taper = max(0.35, 1.0 - (2.0 * t - 1.0) ** 2)
-                a = min(1.0, alpha * sev_opacity * taper)
+                a = min(1.0, alpha_now * sev_opacity * taper)
+                # Intermittent skip-outs produce realistic broken abrasions.
+                if torch.rand(1, generator=generator).item() < break_p:
+                    a *= 0.25
+                if a < 0.05:
+                    continue
 
                 for dy in range(-half_w, half_w + 1):
                     for dx in range(-half_w, half_w + 1):
