@@ -53,6 +53,7 @@ import argparse
 import json
 import math
 import random
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -76,9 +77,10 @@ from .vae import FluxVAE
 
 # True only on rank 0 after ``wandb.init``; other ranks skip WandB entirely.
 _WANDB_ACTIVE = False
+_WANDB_RUN_NAME: Optional[str] = None
 
 
-def wandb_init(cfg: Any, train_cfg: Any) -> None:
+def wandb_init(cfg: Any, train_cfg: Any) -> Optional[str]:
     """Initialize a WandB run if ``cfg.wandb.enabled`` and this is global rank 0.
 
     Non-main ranks and disabled config leave ``_WANDB_ACTIVE`` False so ``wandb_log``
@@ -90,15 +92,16 @@ def wandb_init(cfg: Any, train_cfg: Any) -> None:
         train_cfg: Full training config dict-like object serialized into ``wandb.config``
                    via ``OmegaConf.to_container`` for reproducibility.
     """
-    global _WANDB_ACTIVE
+    global _WANDB_ACTIVE, _WANDB_RUN_NAME
     wb = getattr(cfg, "wandb", None)
     if wb is None or not wb.get("enabled", False) or not is_main_process():
         _WANDB_ACTIVE = False
-        return
+        _WANDB_RUN_NAME = wb.get("run_name") if wb is not None else None
+        return _WANDB_RUN_NAME
     import wandb
 
     tags = list(wb.get("tags") or [])
-    wandb.init(
+    run = wandb.init(
         project=wb.get("project", "art-restoration"),
         entity=wb.get("entity") or None,
         name=wb.get("run_name") or None,
@@ -106,6 +109,8 @@ def wandb_init(cfg: Any, train_cfg: Any) -> None:
         config=OmegaConf.to_container(train_cfg, resolve=True),
     )
     _WANDB_ACTIVE = True
+    _WANDB_RUN_NAME = run.name if run is not None else wb.get("run_name")
+    return _WANDB_RUN_NAME
 
 
 def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
@@ -136,13 +141,69 @@ def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
 
 def wandb_finish() -> None:
     """Call ``wandb.finish()`` on rank 0 and clear ``_WANDB_ACTIVE``."""
-    global _WANDB_ACTIVE
+    global _WANDB_ACTIVE, _WANDB_RUN_NAME
     if not _WANDB_ACTIVE:
         return
     import wandb
 
     wandb.finish()
     _WANDB_ACTIVE = False
+    _WANDB_RUN_NAME = None
+
+
+def _sanitize_run_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("._")
+    return cleaned or "run"
+
+
+def _resolve_inspect_run_name(cfg: DictConfig) -> str:
+    wb = getattr(cfg, "wandb", None)
+    local_name = _WANDB_RUN_NAME
+    if not local_name and wb is not None:
+        local_name = wb.get("run_name")
+    if not local_name:
+        local_name = "run"
+
+    if dist.is_available() and dist.is_initialized():
+        names = [local_name if is_main_process() else None]
+        dist.broadcast_object_list(names, src=0)
+        local_name = names[0] or local_name
+    return _sanitize_run_name(local_name)
+
+
+def _inspect_data_every(cfg: DictConfig) -> int:
+    value = cfg.train.get("inspect_data_every")
+    if value in (None, "", 0):
+        return 0
+    return max(0, int(value))
+
+
+def _maybe_save_inspect_batch(
+    batch: dict[str, torch.Tensor],
+    cfg: DictConfig,
+    run_name: str,
+    global_step: int,
+    rank: int,
+) -> None:
+    inspect_every = _inspect_data_every(cfg)
+    if inspect_every <= 0 or global_step <= 0 or global_step % inspect_every != 0:
+        return
+
+    root = cfg.train.get("inspect_data_root")
+    if root in (None, ""):
+        return
+
+    out_dir = Path(str(root)) / run_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    corrupted = batch.get("corrupted")
+    if corrupted is None or corrupted.shape[0] == 0:
+        return
+
+    from torchvision.utils import save_image
+
+    out_path = out_dir / f"step_{int(global_step):08d}_rank_{int(rank):02d}.png"
+    save_image(corrupted[0].detach().cpu().clamp(0.0, 1.0), out_path)
 
 
 def _unwrap_model(engine: Any) -> RestorationDiT:
@@ -192,6 +253,7 @@ def setup_model(
         rank=rank,
         device=device,
     )
+    
     null_emb = load_or_compute_null_embedding(
         cache_path=cfg.model.null_emb_path,
         flux_model_name=cfg.model.flux_model_name,
@@ -387,6 +449,7 @@ def setup_dataloader(
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
         pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
         persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        prefetch_factor=int(getattr(cfg.train, "prefetch_factor", 4)),
         snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
         distributed=False,
         drop_last=False,
@@ -636,10 +699,12 @@ def _build_train_loader(
         batch_size=_micro_batch_size(cfg),
         split="train",
         num_workers=int(getattr(cfg.train, "num_workers", 4)),
+        deterministic_corruption=False,
         sampler_seed=int(getattr(cfg.train, "sampler_seed", cfg.train.seed)),
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
         pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
         persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        prefetch_factor=int(getattr(cfg.train, "prefetch_factor", 4)),
         snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
         distributed=world_size > 1,
         num_replicas=world_size if world_size > 1 else None,
@@ -668,6 +733,7 @@ def _build_val_loader(
         corruption_seed=int(getattr(cfg.train, "corruption_seed", cfg.train.seed)),
         pin_memory=bool(getattr(cfg.train, "pin_memory", True)),
         persistent_workers=bool(getattr(cfg.train, "persistent_workers", True)),
+        prefetch_factor=int(getattr(cfg.train, "prefetch_factor", 4)),
         snapshot_every_n_steps=int(getattr(cfg.train, "snapshot_every_n_steps", 1)),
         distributed=world_size > 1,
         num_replicas=world_size if world_size > 1 else None,
@@ -741,6 +807,7 @@ def main(cfg: DictConfig) -> None:
     random.seed(int(cfg.train.seed) + rank)
 
     wandb_init(cfg, cfg)
+    inspect_run_name = _resolve_inspect_run_name(cfg)
 
     load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
     should_try_checkpoint = load_dir is not None and load_tag is not None
@@ -874,6 +941,7 @@ def main(cfg: DictConfig) -> None:
             prev_step = global_step
             global_step = int(getattr(engine, "global_steps", prev_step + 1))
             images_since_save += images_per_opt_step
+            _maybe_save_inspect_batch(batch, cfg, inspect_run_name, global_step, rank)
             if warmup_only and not _warmup_only_for_step(cfg, global_step):
                 warmup_only = _apply_training_phase(
                     _unwrap_model(engine),

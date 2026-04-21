@@ -853,13 +853,22 @@ def apply_deposits(image: torch.Tensor, mask: torch.Tensor,
     C, H, W = image.shape
     out = image.clone()
 
-    # Rescale deposits severity so new user-facing severity=1.0 matches the
-    # previous deposits look at severity=0.75, while preserving the shared
-    # global severity floor used by mask generation.
-    sev = ((mask - 0.3) / 0.7).clamp(0.0, 1.0)
-    field = 0.3 + 0.7 * (sev * 0.75)
-    if field.max() < 0.01:
+    mask_max = float(mask.max().item())
+    if mask_max < 0.01:
         return out
+
+    # Deposits were already capped so user severity=1.0 tops out at an effective
+    # field max of 0.825. Lift the low end by remapping the *current* deposits
+    # severity range so 0.01 now behaves like 0.25, while 1.0 stays unchanged.
+    #
+    # We infer the user-facing severity from the shared corruption mask peak,
+    # then scale the whole field uniformly so the spatial shape is preserved and
+    # zeros outside the ROI stay zero.
+    sev = max(0.0, min(1.0, (mask_max - 0.3) / 0.7))
+    sev_t = max(0.0, min(1.0, (sev - 0.01) / 0.99))
+    boosted_sev = 0.25 + 0.75 * sev_t
+    target_peak = 0.3 + 0.525 * boosted_sev
+    field = (mask * (target_peak / max(mask_max, 1e-6))).clamp(0.0, 1.0)
 
     patch_noise = make_noise(H, W, 18.0, generator=generator, device=image.device)
     fine_noise = make_noise(H, W, 2.0, generator=generator, device=image.device)
