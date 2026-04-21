@@ -73,6 +73,7 @@ wandb:
   tags: []                
   log_images: true
   log_images_every: 50
+  log_images_num: 16
 
 # DeepSpeed launcher config. Consumed by deepspeed.initialize(config=cfg.ds_config).
 # Keeping optimizer/scheduler on the Python side (see train.optimizer/scheduler
@@ -90,6 +91,3 @@ ds_config:
     contiguous_gradients: true
     reduce_bucket_size: 500000000
     allgather_bucket_size: 500000000
-    offload_optimizer:
-      device: cpu
-      pin_memory: true

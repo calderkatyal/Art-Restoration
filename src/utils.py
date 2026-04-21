@@ -16,8 +16,12 @@ from typing import Any, List, Optional
 
 import torch
 from omegaconf import DictConfig, OmegaConf
+from PIL import ImageDraw
+import torch.distributed as dist
+from torchvision.transforms import functional as TF
 
-from .distributed import is_main_process
+from .corruption import CHANNEL_NAMES
+from .distributed import get_world_size, is_main_process
 
 # Defaults merged under user YAML so older configs still run. Values here are the
 # low-level knobs expected by ``deepspeed.initialize``.
@@ -40,6 +44,16 @@ _DEEPSPEED_DEFAULTS = OmegaConf.create(
         "wall_clock_breakdown": False,
     }
 )
+
+_MASK_OUTLINE_COLORS: dict[str, tuple[int, int, int]] = {
+    "craquelure": (255, 80, 80),
+    "rip_tear": (255, 170, 70),
+    "paint_loss": (255, 235, 80),
+    "yellowing": (110, 210, 110),
+    "fading": (80, 210, 235),
+    "deposits": (90, 130, 255),
+    "scratches": (220, 110, 255),
+}
 
 
 def log_message(message: str) -> None:
@@ -98,6 +112,77 @@ def print_vram_debug(
         f"reserved={torch.cuda.memory_reserved(idx) / gb:.2f}GB "
         f"max_reserved={torch.cuda.max_memory_reserved(idx) / gb:.2f}GB"
     )
+
+
+def overlay_mask_boundaries(image: torch.Tensor, mask: torch.Tensor) -> Any:
+    out = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
+    draw = ImageDraw.Draw(out)
+    for channel_idx, name in enumerate(CHANNEL_NAMES):
+        boundary = _mask_boundary(mask[channel_idx])
+        if not boundary.any():
+            continue
+        color = _MASK_OUTLINE_COLORS.get(name, (255, 0, 0))
+        ys, xs = torch.nonzero(boundary, as_tuple=True)
+        for y, x in zip(ys.tolist(), xs.tolist()):
+            draw.point((x, y), fill=color)
+    return out
+
+
+def wandb_log_images_num(cfg: DictConfig) -> int:
+    wb = getattr(cfg, "wandb", None)
+    if wb is None:
+        return 0
+    value = wb.get("log_images_num", 0)
+    if value in (None, "", 0):
+        return 0
+    return max(0, int(value))
+
+
+def fixed_inference_indices(cfg: DictConfig, dataset_len: int) -> list[int]:
+    num_images = min(wandb_log_images_num(cfg), int(dataset_len))
+    if num_images <= 0:
+        return []
+    generator = torch.Generator(device="cpu")
+    generator.manual_seed(int(cfg.train.seed) + 20_260_421)
+    order = torch.randperm(int(dataset_len), generator=generator).tolist()
+    return order[:num_images]
+
+
+def gather_inference_panels(
+    local_payload: list[tuple[int, torch.Tensor]],
+    ordered_indices: list[int],
+) -> torch.Tensor | None:
+    payload: list[list[tuple[int, torch.Tensor]]] = [local_payload]
+    if dist.is_available() and dist.is_initialized():
+        payload = [None] * get_world_size()
+        dist.all_gather_object(payload, local_payload)
+    if not is_main_process():
+        return None
+
+    position = {idx: pos for pos, idx in enumerate(ordered_indices)}
+    merged = [item for shard in payload for item in (shard or [])]
+    merged.sort(key=lambda item: position[item[0]])
+    if not merged:
+        return None
+    return torch.stack(
+        [panel.to(dtype=torch.float32) / 255.0 for _, panel in merged],
+        dim=0,
+    )
+
+
+def _mask_boundary(mask: torch.Tensor) -> torch.Tensor:
+    m = mask.detach().cpu() > 0.05
+    if not m.any():
+        return m
+    up = torch.zeros_like(m)
+    up[1:] = m[:-1]
+    down = torch.zeros_like(m)
+    down[:-1] = m[1:]
+    left = torch.zeros_like(m)
+    left[:, 1:] = m[:, :-1]
+    right = torch.zeros_like(m)
+    right[:, :-1] = m[:, 1:]
+    return m & ~(m & up & down & left & right)
 
 def _resolve_config_path(config_path: str, config_dir: Optional[Path] = None) -> Path:
     """Resolve a config path against a few sensible roots.

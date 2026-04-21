@@ -65,6 +65,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
+from torchvision.transforms import functional as TF
 from tqdm import tqdm
 
 from .corruption import OUTPUT_MASK_CHANNELS, downsample_mask
@@ -73,7 +74,16 @@ from .distributed import get_device, get_global_rank, get_world_size, is_main_pr
 from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
-from .utils import load_config, log_message, print_training_phase, print_vram_debug
+from .utils import (
+    fixed_inference_indices,
+    gather_inference_panels,
+    load_config,
+    log_message,
+    overlay_mask_boundaries,
+    print_training_phase,
+    print_vram_debug,
+    wandb_log_images_num,
+)
 from .vae import FluxVAE
 
 # True only on rank 0 after ``wandb.init``; other ranks skip WandB entirely.
@@ -95,9 +105,12 @@ def wandb_init(cfg: Any, train_cfg: Any) -> Optional[str]:
     """
     global _WANDB_ACTIVE, _WANDB_RUN_NAME
     wb = getattr(cfg, "wandb", None)
+    configured_run_name = wb.get("run_name") if wb is not None else None
+    if not configured_run_name:
+        raise ValueError("cfg.wandb.run_name must be set explicitly.")
     if wb is None or not wb.get("enabled", False) or not is_main_process():
         _WANDB_ACTIVE = False
-        _WANDB_RUN_NAME = wb.get("run_name") if wb is not None else None
+        _WANDB_RUN_NAME = configured_run_name
         return _WANDB_RUN_NAME
     import wandb
 
@@ -105,12 +118,12 @@ def wandb_init(cfg: Any, train_cfg: Any) -> Optional[str]:
     run = wandb.init(
         project=wb.get("project", "art-restoration"),
         entity=wb.get("entity") or None,
-        name=wb.get("run_name") or None,
+        name=configured_run_name,
         tags=tags if tags else None,
         config=OmegaConf.to_container(train_cfg, resolve=True),
     )
     _WANDB_ACTIVE = True
-    _WANDB_RUN_NAME = run.name if run is not None else wb.get("run_name")
+    _WANDB_RUN_NAME = configured_run_name
     return _WANDB_RUN_NAME
 
 
@@ -159,17 +172,9 @@ def _sanitize_run_name(name: str) -> str:
 
 def _resolve_inspect_run_name(cfg: DictConfig) -> str:
     wb = getattr(cfg, "wandb", None)
-    local_name = _WANDB_RUN_NAME
-    if not local_name and wb is not None:
-        local_name = wb.get("run_name")
-    if not local_name:
-        local_name = "run"
-
-    if dist.is_available() and dist.is_initialized():
-        names = [local_name if is_main_process() else None]
-        dist.broadcast_object_list(names, src=0)
-        local_name = names[0] or local_name
-    return _sanitize_run_name(local_name)
+    if wb is None or not wb.get("run_name"):
+        raise ValueError("cfg.wandb.run_name must be set explicitly.")
+    return _sanitize_run_name(wb.get("run_name"))
 
 
 def _inspect_data_every(cfg: DictConfig) -> int:
@@ -177,6 +182,69 @@ def _inspect_data_every(cfg: DictConfig) -> int:
     if value in (None, "", 0):
         return 0
     return max(0, int(value))
+
+
+def run_validation_inference(
+    model_engine: Any,
+    vae: FluxVAE,
+    val_dataset: ArtRestorationDataset,
+    null_emb: torch.Tensor,
+    cfg: DictConfig,
+    device: torch.device,
+    global_step: int,
+) -> torch.Tensor | None:
+    indices = fixed_inference_indices(cfg, len(val_dataset))
+    if not indices:
+        return None
+
+    rank = get_global_rank()
+    world_size = get_world_size()
+    local_indices = indices[rank::world_size]
+    local_payload: list[tuple[int, torch.Tensor]] = []
+
+    mdl = _unwrap_model(model_engine)
+    was_training = mdl.training
+    if hasattr(model_engine, "eval"):
+        model_engine.eval()
+    else:
+        mdl.eval()
+
+    with torch.no_grad():
+        if local_indices:
+            samples = [val_dataset[idx] for idx in local_indices]
+            clean = torch.stack([sample["clean"] for sample in samples], dim=0).to(device)
+            corrupted = torch.stack([sample["corrupted"] for sample in samples], dim=0).to(device)
+            mask = torch.stack([sample["mask"] for sample in samples], dim=0).to(device)
+            restored = sample(
+                mdl,
+                vae,
+                corrupted,
+                mask,
+                null_emb,
+                num_steps=int(getattr(cfg.inference, "num_steps", 50)),
+                device=str(device),
+            )
+            for idx, clean_img, corrupt_img, restored_img in zip(
+                local_indices, clean, corrupted, restored
+            ):
+                panel = torch.cat(
+                    [clean_img.detach().cpu(), corrupt_img.detach().cpu(), restored_img.detach().cpu()],
+                    dim=2,
+                ).clamp(0.0, 1.0)
+                local_payload.append((idx, (panel * 255.0).round().to(torch.uint8)))
+
+    if was_training:
+        if hasattr(model_engine, "train"):
+            model_engine.train()
+        else:
+            mdl.train()
+
+    panels = gather_inference_panels(local_payload, indices)
+    if is_main_process() and panels is not None:
+        log_message(
+            f"[inference] prepared {int(panels.shape[0])} validation panels for step={global_step}"
+        )
+    return panels
 
 
 def _maybe_save_inspect_batch(
@@ -201,10 +269,16 @@ def _maybe_save_inspect_batch(
     if corrupted is None or corrupted.shape[0] == 0:
         return
 
-    from torchvision.utils import save_image
-
     out_path = out_dir / f"step_{int(global_step):08d}_rank_{int(rank):02d}.png"
-    save_image(corrupted[0].detach().cpu().clamp(0.0, 1.0), out_path)
+    log_message(f"[inspect] rank={rank} saving training image to {out_path}")
+    image = corrupted[0]
+    mask = batch.get("mask")
+    if mask is not None and mask.shape[0] > 0:
+        pil = overlay_mask_boundaries(image, mask[0])
+    else:
+        pil = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
+    pil.save(out_path)
+    log_message(f"[inspect] rank={rank} saved training image to {out_path}")
 
 
 def _unwrap_model(engine: Any) -> RestorationDiT:
@@ -225,8 +299,9 @@ def setup_model(
 ) -> tuple[RestorationDiT, FluxVAE, torch.Tensor]:
     """Construct the restoration DiT, frozen FLUX VAE, and cached null text embedding.
 
-    Calls ``model.set_trainability(warmup_only)`` so only the intended parameters
-    require gradients before the optimizer is built.
+    Trainability is applied after DeepSpeed initialization, not here. That keeps
+    optimizer param groups non-empty during ZeRO setup while still allowing the
+    warm-up phase to freeze the backbone immediately afterward.
 
     Args:
         cfg:    Full OmegaConf ``DictConfig`` (uses ``cfg.model`` and ``cfg.train``).
@@ -248,7 +323,10 @@ def setup_model(
         rank=rank,
     )
     print_vram_debug(cfg, "after_loading_model_weights", device=device)
-    flow_model.set_trainability(warmup_only)
+    if load_pretrained:
+        log_message(f"[model] finished loading FLUX.2 pretrained weights for {cfg.model.flux_model_name}")
+    else:
+        log_message(f"[model] initialized {cfg.model.flux_model_name} without pretrained FLUX.2 weights")
 
     vae = FluxVAE(
         flux_model_name=cfg.model.flux_model_name,
@@ -289,6 +367,12 @@ def build_optimizer(
     wd = cfg.train.optimizer.weight_decay
     betas = tuple(cfg.train.optimizer.betas)
     groups = model.get_trainable_params()
+    group_stats = []
+    for group in groups:
+        params = list(group["params"])
+        trainable = sum(int(p.requires_grad) for p in params)
+        group_stats.append(f"{group['name']} total={len(params)} trainable={trainable}")
+    log_message(f"[optimizer] building param groups: {', '.join(group_stats)}")
     img_in_lr = float(cfg.train.warmup.lr) if warmup_only else float(cfg.train.full.img_in_lr)
     backbone_lr = 0.0 if warmup_only else float(cfg.train.full.backbone_lr)
     return torch.optim.AdamW(
@@ -628,8 +712,27 @@ def _write_checkpoint_metadata(output_dir: Path, tag: str, client_state: dict) -
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     meta_path = output_dir / f"run_meta_{tag}.json"
+
+    def _json_safe(obj: Any) -> Any:
+        if isinstance(obj, torch.Tensor):
+            tensor = obj.detach().cpu()
+            if tensor.ndim == 0:
+                return tensor.item()
+            return {
+                "type": "tensor",
+                "shape": list(tensor.shape),
+                "dtype": str(tensor.dtype),
+            }
+        if isinstance(obj, Path):
+            return str(obj)
+        if isinstance(obj, dict):
+            return {str(k): _json_safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_json_safe(v) for v in obj]
+        return obj
+
     with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(client_state, f, indent=2)
+        json.dump(_json_safe(client_state), f, indent=2)
 
 
 def maybe_save_deepspeed_checkpoint(
@@ -655,9 +758,11 @@ def maybe_save_deepspeed_checkpoint(
         return
     out = _checkpoint_dir_for_run(cfg, run_name)
     tag = f"step_{int(client_state['step'])}"
+    log_message(f"[checkpoint] starting save for {tag} in {out}")
     engine.save_checkpoint(str(out), tag=tag, client_state=client_state)
     if is_main_process():
         _write_checkpoint_metadata(out, tag, client_state)
+    log_message(f"[checkpoint] finished save for {tag} in {out}")
 
 
 def train(cfg: DictConfig) -> None:
@@ -815,6 +920,8 @@ def main(cfg: DictConfig) -> None:
     # --- Distributed backend (NCCL expects CUDA_VISIBLE_DEVICES / launcher env) ---
     deepspeed.init_distributed(dist_backend="nccl")
     device = get_device()
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
     world_size = get_world_size()
     rank = get_global_rank()
 
@@ -830,6 +937,9 @@ def main(cfg: DictConfig) -> None:
 
     load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
     should_try_checkpoint = load_dir is not None and load_tag is not None
+    checkpoint_path = str(Path(load_dir) / load_tag) if should_try_checkpoint else None
+    if should_try_checkpoint and is_main_process():
+        log_message(f"[model] will restore training state from checkpoint {checkpoint_path}")
     initial_step_hint = _step_from_tag(load_tag)
     warmup_only = _warmup_only_for_step(cfg, initial_step_hint)
 
@@ -849,6 +959,9 @@ def main(cfg: DictConfig) -> None:
     start_epoch = 0
     train_loader, train_dataset, train_sampler = _build_train_loader(cfg, corrupt_cfg, world_size)
     val_loader, _, val_sampler = _build_val_loader(cfg, corrupt_cfg, world_size)
+    inference_indices = fixed_inference_indices(cfg, len(val_loader.dataset))
+    if is_main_process() and inference_indices:
+        log_message(f"[inference] fixed validation indices: {inference_indices}")
 
     steps_per_epoch = max(len(train_loader), 1)
     grad_accum = int(cfg.ds_config.get("gradient_accumulation_steps", 1))
@@ -898,6 +1011,7 @@ def main(cfg: DictConfig) -> None:
                 )
                 if is_main_process():
                     log_message(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
+                    log_message(f"[model] restored model weights from checkpoint {checkpoint_path}")
             else:
                 raise RuntimeError("DeepSpeed returned empty client_state while loading checkpoint.")
         except Exception as exc:
@@ -1000,34 +1114,6 @@ def main(cfg: DictConfig) -> None:
                 wandb_log(metrics, step=global_step)
                 last_logged_step = global_step
 
-                if cfg.get("wandb") and cfg.wandb.get("log_images", False):
-                    if global_step % log_images_every == 0:
-                        with torch.no_grad():
-                            mdl = _unwrap_model(engine)
-                            was_train = mdl.training
-                            mdl.eval()
-                            rb = {k: v[: min(4, v.shape[0])] for k, v in batch.items()}
-                            rest = sample(
-                                mdl,
-                                vae,
-                                rb["corrupted"],
-                                rb["mask"],
-                                null_emb,
-                                num_steps=int(getattr(cfg.inference, "num_steps", 50)),
-                                device=str(device),
-                            )
-                            if was_train:
-                                mdl.train()
-                            wandb_log(
-                                {},
-                                step=global_step,
-                                images={
-                                    "train/grid_clean": rb["clean"],
-                                    "train/grid_corrupt": rb["corrupted"],
-                                    "train/grid_restored": rest,
-                                },
-                            )
-
             # Checkpoint when either step interval hits or enough global images seen.
             do_save = global_step > 0 and (global_step % save_every == 0)
             if save_every_images is not None and int(save_every_images) > 0:
@@ -1056,6 +1142,13 @@ def main(cfg: DictConfig) -> None:
             )
             if should_validate:
                 val_start_time = None
+                should_log_inference = (
+                    cfg.get("wandb")
+                    and cfg.wandb.get("log_images", False)
+                    and global_step % log_images_every == 0
+                    and wandb_log_images_num(cfg) > 0
+                )
+                inference_start_time = None
                 if is_main_process():
                     val_start_time = time.perf_counter()
                     log_message("========STARTING VALIDATION========")
@@ -1076,6 +1169,44 @@ def main(cfg: DictConfig) -> None:
                         {"val/velocity_loss": metrics["velocity_loss"]},
                         step=global_step,
                     )
+                if should_log_inference:
+                    if is_main_process():
+                        inference_start_time = time.perf_counter()
+                        log_message("========STARTING INFERENCE========")
+                        log_message(
+                            f"[inference] epoch={epoch} step={global_step} "
+                            f"num_images={wandb_log_images_num(cfg)}"
+                        )
+                    panels = run_validation_inference(
+                        engine,
+                        vae,
+                        val_loader.dataset,
+                        null_emb,
+                        cfg,
+                        device,
+                        global_step,
+                    )
+                    if is_main_process():
+                        elapsed = (
+                            0.0
+                            if inference_start_time is None
+                            else time.perf_counter() - inference_start_time
+                        )
+                        log_message("========ENDING INFERENCE========")
+                        log_message(
+                            f"[inference] epoch={epoch} step={global_step} "
+                            f"duration_sec={elapsed:.2f}"
+                        )
+                        if panels is not None:
+                            wandb_log(
+                                {},
+                                step=global_step,
+                                images={"inference/panels": panels},
+                            )
+                            log_message(
+                                f"[inference] uploaded {int(panels.shape[0])} panels to wandb "
+                                f"at step={global_step}"
+                            )
                 _distributed_barrier()
 
         restored_train_state = False
