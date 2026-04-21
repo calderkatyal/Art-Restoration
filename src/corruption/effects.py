@@ -971,14 +971,6 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
         n_pixels = comp_ys.shape[0]
         n_here = max(1, int(round(base_count * n_pixels / total_region)))
 
-        # Scratch colour: a consistent warm off-white that represents the
-        # exposed ground/gesso layer beneath the paint. Real scratches
-        # always reveal the lighter substrate regardless of the paint colour
-        # on top. Using one fixed tone avoids the black-vs-white
-        # inconsistency that happened when we adapted per-pixel or
-        # per-component to luminance.
-        comp_scratch_r, comp_scratch_g, comp_scratch_b = 0.88, 0.84, 0.76
-
         for _ in range(n_here):
             idx = int(torch.randint(0, n_pixels, (1,), generator=generator).item())
             sx = int(comp_xs[idx].item())
@@ -999,15 +991,17 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             alpha_now = 0.38 + torch.rand(1, generator=generator).item() * 0.30
             alpha_min, alpha_max = 0.25, 0.85
 
-            # Small chance of a burnished (bright) scratch for variety,
-            # otherwise use the component-level colour.
-            use_bright = torch.rand(1, generator=generator).item() < 0.15
-            if use_bright:
-                scratch_r, scratch_g, scratch_b = 0.95, 0.93, 0.88
-            else:
-                scratch_r = comp_scratch_r
-                scratch_g = comp_scratch_g
-                scratch_b = comp_scratch_b
+            # Scratch appearance mode:
+            # - reveal: brighter exposed ground with a slight dark core
+            # - gouge: darker abrasion groove with a faint bright edge
+            # Mixed modes reduce the "uniform white pen stroke" look.
+            use_gouge = torch.rand(1, generator=generator).item() < 0.35
+            lum0 = float((image[0, sy, sx] * 0.299 + image[1, sy, sx] * 0.587 + image[2, sy, sx] * 0.114).item())
+            # Brighter substrate on dark paint; gentler on bright paint.
+            base_reveal = 0.68 + max(0.0, (0.45 - lum0) / 0.45) * 0.22
+            reveal_r = min(0.96, base_reveal + 0.12)
+            reveal_g = min(0.93, base_reveal + 0.07)
+            reveal_b = min(0.86, base_reveal)
 
             # Walk and paint, constrained to the binary region so the
             # scratch stays inside the mask and the training hull mask
@@ -1055,12 +1049,38 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                 if a < 0.05:
                     continue
 
-                for dy in range(-half_w, half_w + 1):
-                    for dx in range(-half_w, half_w + 1):
+                rad = max(0.75, float(half_w) + 0.35)
+                for dy in range(-half_w - 1, half_w + 2):
+                    for dx in range(-half_w - 1, half_w + 2):
                         nx, ny = ix + dx, iy + dy
                         if 0 <= nx < W and 0 <= ny < H:
-                            out[0, ny, nx] = out[0, ny, nx] * (1 - a) + scratch_r * a
-                            out[1, ny, nx] = out[1, ny, nx] * (1 - a) + scratch_g * a
-                            out[2, ny, nx] = out[2, ny, nx] * (1 - a) + scratch_b * a
+                            dist = math.hypot(dx, dy)
+                            if dist > rad:
+                                continue
+                            # Soft radial profile to avoid blocky brush footprints.
+                            fall = max(0.0, 1.0 - dist / rad)
+                            if fall <= 0.01:
+                                continue
+                            aa = a * fall
+                            if aa <= 0.01:
+                                continue
+
+                            if use_gouge:
+                                # Dark abrasion groove with a subtle bright rim.
+                                dark_a = aa * (0.55 + 0.45 * fall)
+                                light_a = aa * max(0.0, 1.0 - fall) * 0.18
+                                out[0, ny, nx] = out[0, ny, nx] * (1.0 - dark_a) * (1.0 - 0.15 * light_a) + reveal_r * light_a
+                                out[1, ny, nx] = out[1, ny, nx] * (1.0 - dark_a) * (1.0 - 0.15 * light_a) + reveal_g * light_a
+                                out[2, ny, nx] = out[2, ny, nx] * (1.0 - dark_a) * (1.0 - 0.15 * light_a) + reveal_b * light_a
+                            else:
+                                # Exposed ground: bright center with slight dark core.
+                                light_a = aa * (0.45 + 0.55 * fall)
+                                core_dark = aa * (0.10 + 0.18 * fall)
+                                out[0, ny, nx] = out[0, ny, nx] * (1.0 - light_a) + reveal_r * light_a
+                                out[1, ny, nx] = out[1, ny, nx] * (1.0 - light_a) + reveal_g * light_a
+                                out[2, ny, nx] = out[2, ny, nx] * (1.0 - light_a) + reveal_b * light_a
+                                out[0, ny, nx] = out[0, ny, nx] * (1.0 - core_dark)
+                                out[1, ny, nx] = out[1, ny, nx] * (1.0 - core_dark)
+                                out[2, ny, nx] = out[2, ny, nx] * (1.0 - core_dark)
 
     return out.clamp(0, 1)
