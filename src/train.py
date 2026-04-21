@@ -24,13 +24,13 @@ Distributed training:
     logging, validation DataLoader, and WandB run on global rank 0 only.
 
 Checkpointing:
-    DeepSpeed checkpoints live under ``{train.checkpoint_dir}/<tag>/``.
+    DeepSpeed checkpoints live under ``{train.checkpoint_root}/{wandb_run_name}/<tag>/``.
     ``train.save_every`` triggers saves every N **optimizer** steps;
     ``train.save_every_images`` triggers after approximately that many **global** images
     (``train_micro_batch_size_per_gpu × world_size × gradient_accumulation_steps``
     per optimizer step).
     Resume with ``train.resume_from`` pointing at a tag directory, e.g.
-    ``./checkpoints/step_1000``.
+    ``./checkpoints/<run_name>/step_1000``.
 
 Validation:
     All ranks run distributed held-out velocity-loss evaluation on the val split using
@@ -44,7 +44,7 @@ Arguments:
     --config    Path to YAML (default: ``train/configs/train.yaml``).
     overrides   Dot-notation overrides, e.g. ``train.warmup_iterations=1000``,
                 ``ds_config.train_micro_batch_size_per_gpu=8``,
-                ``train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/step_1000``.
+    ``train.resume_from=/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints/<run_name>/step_1000``.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ import json
 import math
 import random
 import re
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -72,7 +73,7 @@ from .distributed import get_device, get_global_rank, get_world_size, is_main_pr
 from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
-from .utils import load_config, print_training_phase, print_vram_debug
+from .utils import load_config, log_message, print_training_phase, print_vram_debug
 from .vae import FluxVAE
 
 # True only on rank 0 after ``wandb.init``; other ranks skip WandB entirely.
@@ -384,6 +385,19 @@ def _micro_batch_size(cfg: DictConfig) -> int:
     return batch_size
 
 
+def _checkpoint_root(cfg: DictConfig) -> Path:
+    root = cfg.train.get("checkpoint_root")
+    if root in (None, ""):
+        root = cfg.train.get("checkpoint_dir")
+    if root in (None, ""):
+        raise ValueError("Config must define train.checkpoint_root")
+    return Path(str(root))
+
+
+def _checkpoint_dir_for_run(cfg: DictConfig, run_name: str) -> Path:
+    return _checkpoint_root(cfg) / run_name
+
+
 def _distributed_barrier() -> None:
     """Synchronize all ranks when distributed training is initialized."""
     if dist.is_available() and dist.is_initialized():
@@ -623,6 +637,7 @@ def maybe_save_deepspeed_checkpoint(
     cfg: DictConfig,
     client_state: dict,
     do_save: bool,
+    run_name: str,
 ) -> None:
     """Synchronously save a ZeRO-aware checkpoint on **all** ranks when ``do_save``.
 
@@ -631,13 +646,14 @@ def maybe_save_deepspeed_checkpoint(
 
     Args:
         engine:        DeepSpeed-wrapped model.
-        cfg:           Provides ``train.checkpoint_dir``.
+        cfg:           Provides ``train.checkpoint_root``.
         client_state:  Metadata forwarded to DeepSpeed (also embedded in the checkpoint).
         do_save:       When False, returns immediately without touching the filesystem.
+        run_name:      WandB run name used to scope checkpoint output directories.
     """
     if not do_save:
         return
-    out = Path(cfg.train.checkpoint_dir)
+    out = _checkpoint_dir_for_run(cfg, run_name)
     tag = f"step_{int(client_state['step'])}"
     engine.save_checkpoint(str(out), tag=tag, client_state=client_state)
     if is_main_process():
@@ -772,7 +788,7 @@ def _resolve_checkpoint_strategy(cfg: DictConfig) -> tuple[str | None, str | Non
         rp = Path(str(resume_from))
         return str(rp.parent), rp.name
 
-    ckpt_dir = Path(str(cfg.train.checkpoint_dir))
+    ckpt_dir = _checkpoint_dir_for_run(cfg, _resolve_inspect_run_name(cfg))
     tag = _latest_checkpoint_tag(ckpt_dir)
     if tag is None:
         return None, None
@@ -802,15 +818,15 @@ def main(cfg: DictConfig) -> None:
     world_size = get_world_size()
     rank = get_global_rank()
 
-    if is_main_process():
-        Path(cfg.train.checkpoint_dir).mkdir(parents=True, exist_ok=True)
-
     # Per-rank RNG offsets so each GPU sees different corruption / noise unless seeded identically.
     torch.manual_seed(int(cfg.train.seed) + rank)
     random.seed(int(cfg.train.seed) + rank)
 
     wandb_init(cfg, cfg)
-    inspect_run_name = _resolve_inspect_run_name(cfg)
+    run_name = _resolve_inspect_run_name(cfg)
+
+    if is_main_process():
+        _checkpoint_dir_for_run(cfg, run_name).mkdir(parents=True, exist_ok=True)
 
     load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
     should_try_checkpoint = load_dir is not None and load_tag is not None
@@ -843,10 +859,12 @@ def main(cfg: DictConfig) -> None:
     # --- Optimizer / scheduler / DeepSpeed engine (ZeRO partitioning lives here) ---
     optimizer = build_optimizer(flow_model, cfg, warmup_only=warmup_only)
     scheduler = build_scheduler(optimizer, cfg, total_optimizer_steps)
-
+    
     ds_cfg = OmegaConf.to_container(cfg.ds_config, resolve=True)
-    ds_cfg["train_micro_batch_size_per_gpu"] = _micro_batch_size(cfg)
+    micro_batch = _micro_batch_size(cfg)
+    ds_cfg["train_micro_batch_size_per_gpu"] = micro_batch
     ds_cfg["gradient_accumulation_steps"] = grad_accum
+    ds_cfg["train_batch_size"] = int(micro_batch) * int(world_size) * int(grad_accum)
 
     engine, optimizer, _, _ = deepspeed.initialize(
         model=flow_model,
@@ -879,12 +897,12 @@ def main(cfg: DictConfig) -> None:
                     client.get("train_loader_state"),
                 )
                 if is_main_process():
-                    print(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
+                    log_message(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
             else:
                 raise RuntimeError("DeepSpeed returned empty client_state while loading checkpoint.")
         except Exception as exc:
             if is_main_process():
-                print(
+                log_message(
                     f"[train] Checkpoint load failed ({exc}); falling back to pretrained weights."
                 )
             _unwrap_model(engine).load_pretrained_backbone(
@@ -947,7 +965,7 @@ def main(cfg: DictConfig) -> None:
             prev_step = global_step
             global_step = int(getattr(engine, "global_steps", prev_step + 1))
             images_since_save += images_per_opt_step
-            _maybe_save_inspect_batch(batch, cfg, inspect_run_name, global_step, rank)
+            _maybe_save_inspect_batch(batch, cfg, run_name, global_step, rank)
             if warmup_only and not _warmup_only_for_step(cfg, global_step):
                 warmup_only = _apply_training_phase(
                     _unwrap_model(engine),
@@ -975,7 +993,7 @@ def main(cfg: DictConfig) -> None:
                 }
                 for i, lr in enumerate(lrs):
                     metrics[f"train/lr_group_{i}"] = lr
-                print(
+                log_message(
                     f"[train] epoch={epoch} step={global_step} "
                     f"loss={loss.item():.4f} img_per_sec={img_per_sec:.2f}"
                 )
@@ -1028,7 +1046,7 @@ def main(cfg: DictConfig) -> None:
                         train_sampler,
                     ),
                 }
-                maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True)
+                maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True, run_name=run_name)
                 last_save_step = global_step
 
             should_validate = (
@@ -1040,17 +1058,17 @@ def main(cfg: DictConfig) -> None:
                 val_start_time = None
                 if is_main_process():
                     val_start_time = time.perf_counter()
-                    print("========STARTING VALIDATION========")
-                    print(f"[val] epoch={epoch} step={global_step}")
+                    log_message("========STARTING VALIDATION========")
+                    log_message(f"[val] epoch={epoch} step={global_step}")
                 metrics = validate(engine, vae, val_loader, null_emb, cfg, device)
                 if is_main_process():
-                    print(
+                    log_message(
                         f"[val] epoch={epoch} step={global_step} "
                         f"loss={metrics['velocity_loss']:.4f}"
                     )
                     elapsed = 0.0 if val_start_time is None else time.perf_counter() - val_start_time
-                    print("========ENDING VALIDATION========")
-                    print(
+                    log_message("========ENDING VALIDATION========")
+                    log_message(
                         f"[val] epoch={epoch} step={global_step} "
                         f"duration_sec={elapsed:.2f}"
                     )
@@ -1072,7 +1090,7 @@ def main(cfg: DictConfig) -> None:
             train_sampler,
         ),
     }
-    maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True)
+    maybe_save_deepspeed_checkpoint(engine, cfg, client_state, do_save=True, run_name=run_name)
     wandb_finish()
 
 
