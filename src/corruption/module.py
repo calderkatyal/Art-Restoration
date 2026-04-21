@@ -168,6 +168,12 @@ class CorruptionModule:
             )
         self.types = config['types']
         self._dropout_prob = float(config.get("dropout_prob", 0.2))
+        self._actual_mask_diff_threshold = float(
+            config.get("actual_mask_diff_threshold", 0.008)
+        )
+        self._actual_mask_merge_radius = int(
+            config.get("actual_mask_merge_radius", 3)
+        )
 
     # -- internal helpers ---------------------------------------------------
 
@@ -210,7 +216,9 @@ class CorruptionModule:
 
     def _sample_mask_for(self, name: str, H: int, W: int,
                          generator: torch.Generator,
-                         device: torch.device
+                         device: torch.device,
+                         mode: Optional[str] = None,
+                         severity: Optional[float] = None,
                          ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(soft_mask, region_binary)`` both (H, W)."""
         t = self.types[name]
@@ -220,14 +228,26 @@ class CorruptionModule:
             zero = torch.zeros(H, W, device=device)
             return zero, zero.clone()
 
-        if local_enabled and global_enabled:
+        if mode is not None:
+            if mode not in {'local', 'global'}:
+                raise ValueError(f"Unknown corruption mode: {mode!r}")
+            if mode == 'local' and not local_enabled:
+                raise ValueError(f"Corruption {name!r} does not allow local mode.")
+            if mode == 'global' and not global_enabled:
+                raise ValueError(f"Corruption {name!r} does not allow global mode.")
+            use_local = mode == 'local'
+        elif local_enabled and global_enabled:
             use_local = torch.rand(1, generator=generator).item() < 0.5
         else:
             use_local = local_enabled
 
-        min_s = float(t.get('min_severity', 0.01))
-        max_s = float(t.get('max_severity', 1.0))
-        severity = min_s + torch.rand(1, generator=generator).item() * max(0.0, max_s - min_s)
+        if severity is None:
+            min_s = float(t.get('min_severity', 0.01))
+            max_s = float(t.get('max_severity', 1.0))
+            severity = min_s + (
+                torch.rand(1, generator=generator).item() * max(0.0, max_s - min_s)
+            )
+        severity = float(severity)
 
         if use_local:
             # Number of local instances: uniform in [local_min_num, local_max_num].
@@ -244,6 +264,54 @@ class CorruptionModule:
             )
         return generate_global_mask(H, W, severity, device=device)
 
+    def _effect_kwargs(self, name: str) -> Dict[str, Any]:
+        extra: Dict[str, Any] = {}
+        if name == 'scratches':
+            # Hard cap so #scratches <= local_max_num exactly.
+            extra['max_count'] = int(self.types[name].get('local_max_num', 8))
+        return extra
+
+    def _actual_mask_from_images(self, before: torch.Tensor, after: torch.Tensor) -> torch.Tensor:
+        H, W = before.shape[-2:]
+        diff_bool = _affected_pixels(
+            before,
+            after,
+            threshold=self._actual_mask_diff_threshold,
+        )
+        return _per_component_hull_mask(
+            diff_bool,
+            H,
+            W,
+            merge_radius=self._actual_mask_merge_radius,
+        )
+
+    def _stack_mask_tensor(
+        self,
+        per_channel_masks: Dict[str, torch.Tensor],
+        H: int,
+        W: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        zero = torch.zeros(H, W, dtype=torch.float32, device=device)
+        mask_tensor = torch.stack(
+            [per_channel_masks.get(name, zero) for name in CHANNEL_NAMES],
+            dim=0,
+        )
+        union = mask_tensor.max(dim=0, keepdim=True).values
+        return torch.cat([mask_tensor, union], dim=0)
+
+    def _maybe_apply_dropout(
+        self,
+        mask_tensor: torch.Tensor,
+        training: bool,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        if training and self._dropout_prob > 0.0:
+            if float(torch.rand((), generator=generator).item()) < self._dropout_prob:
+                mask_tensor = mask_tensor.clone()
+                mask_tensor[:NUM_CHANNELS] = 0.0
+        return mask_tensor
+
     # -- main entry points --------------------------------------------------
 
     def __call__(
@@ -251,6 +319,9 @@ class CorruptionModule:
         image: torch.Tensor,
         seed: Optional[int] = None,
         training: bool = False,
+        corruption: Optional[str] = None,
+        mode: Optional[str] = None,
+        severity: Optional[float] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Apply random corruption to one clean image.
 
@@ -258,6 +329,11 @@ class CorruptionModule:
             image: (3, H, W) float32 in [0, 1].
             seed:  Optional int seed for reproducibility.
             training: If True, may apply ``dropout_prob`` mask dropout (train only).
+            corruption: Optional single-effect override. When set, only this
+                corruption is applied and the returned mask tensor still has the
+                full ``(8, H, W)`` channel layout.
+            mode: Optional ``local`` / ``global`` override for single-effect mode.
+            severity: Optional severity override for single-effect mode.
 
         Returns:
             corrupted: (3, H, W) float32 in [0, 1].
@@ -276,6 +352,33 @@ class CorruptionModule:
             generator.manual_seed(int(seed))
         else:
             generator.manual_seed(int(torch.randint(0, 2**31, (1,)).item()))
+
+        if corruption is not None:
+            if corruption not in CHANNEL_NAMES:
+                raise ValueError(
+                    f"Unknown corruption {corruption!r}. Expected one of {CHANNEL_NAMES}."
+                )
+            soft_mask, _ = self._sample_mask_for(
+                corruption,
+                H,
+                W,
+                generator,
+                device,
+                mode=mode,
+                severity=severity,
+            )
+            before = image.clone()
+            out = EFFECT_FNS[corruption](
+                image,
+                soft_mask,
+                generator=generator,
+                **self._effect_kwargs(corruption),
+            )
+            per_channel_masks = {
+                corruption: self._actual_mask_from_images(before, out),
+            }
+            mask_tensor = self._stack_mask_tensor(per_channel_masks, H, W, device)
+            return out.clamp(0, 1), self._maybe_apply_dropout(mask_tensor, training, generator)
 
         active = set(self._sample_active_channels(generator))
         soft_masks: Dict[str, torch.Tensor] = {
@@ -300,36 +403,35 @@ class CorruptionModule:
             fn = EFFECT_FNS[name]
             gen = torch.Generator(device='cpu')
             gen.manual_seed(int(torch.randint(0, 2**31, (1,), generator=generator).item()))
-            extra = {}
-            if name == 'scratches':
-                # Hard cap so #scratches <= local_max_num exactly.
-                extra['max_count'] = int(self.types[name].get('local_max_num', 8))
-            before = out
-            out = fn(out, m, generator=gen, **extra)
+            before = out.clone()
+            out = fn(out, m, generator=gen, **self._effect_kwargs(name))
             # ROI = pixels the effect ACTUALLY modified above the diff
             # threshold. Using affected pixels (rather than the input
             # soft-mask ROI) keeps the mask tight around the drawn
             # damage — a thin rip gets a thin-polygon mask instead of
             # the wider band the generator sampled for it.
-            affected[name] = _affected_pixels(before, out)
+            affected[name] = _affected_pixels(
+                before,
+                out,
+                threshold=self._actual_mask_diff_threshold,
+            )
 
         # Output mask = per-component convex hull of affected pixels.
         # Per-component (not a single global hull) so multi-blob masks
         # stay as N separate polygons instead of one huge polygon
         # spanning all the blobs.
-        mask_tensor = torch.stack(
-            [_per_component_hull_mask(affected[name], H, W) for name in CHANNEL_NAMES],
-            dim=0,
-        )
-        union = mask_tensor.max(dim=0, keepdim=True).values
-        mask_tensor = torch.cat([mask_tensor, union], dim=0)
+        per_channel_masks = {
+            name: _per_component_hull_mask(
+                affected[name],
+                H,
+                W,
+                merge_radius=self._actual_mask_merge_radius,
+            )
+            for name in CHANNEL_NAMES
+        }
+        mask_tensor = self._stack_mask_tensor(per_channel_masks, H, W, device)
 
-        if training and self._dropout_prob > 0.0:
-            if float(torch.rand(()).item()) < self._dropout_prob:
-                mask_tensor = mask_tensor.clone()
-                mask_tensor[:NUM_CHANNELS] = 0.0
-
-        return out.clamp(0, 1), mask_tensor
+        return out.clamp(0, 1), self._maybe_apply_dropout(mask_tensor, training, generator)
 
 
 def downsample_mask(mask: torch.Tensor, factor: int = 16) -> torch.Tensor:

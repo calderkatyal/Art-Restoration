@@ -29,6 +29,12 @@ active_count_probs: [0.35, 0.25, 0.15, 0.1, 0.075, 0.05, 0.025]
 # Overridden by `corruption.dropout_prob` in the training YAML when merged.
 dropout_prob: 0.2
 
+# Postprocess settings for the ACTUAL output ROI masks returned by CorruptionModule.
+# These match the visual sample generator so deterministic single-effect renders and
+# training-time masks use the same hull extraction.
+actual_mask_diff_threshold: 0.008
+actual_mask_merge_radius: 3
+
 # Per-type mask generation parameters.
 #   weight:            Relative probability of this type being selected.
 #   local_enabled:     Allow local (scattered-shape) masks.
