@@ -10,28 +10,30 @@ model:
   spatial_compression: 16      # 8x encoder downsample * 2x patchify
   in_channels: 264             # 128 (z_t) + 128 (z_y) + 8 (mask: 7 types + union)
   hidden_size: 3072
-  null_emb_path: "null_text_emb.pt"
+  null_emb_path: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/null_emb/null_text_emb.pt"
 
 train:
   train_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
   val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
   checkpoint_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
   resolution: 512
-  batch_size: 4
+  batch_size: 32
   gradient_checkpointing: true
   num_workers: 4
   sampler_seed: 42
   corruption_seed: 42
   pin_memory: true
   persistent_workers: true
+  prefetch_factor: 4
   snapshot_every_n_steps: 1
-  num_epochs: 50
+  num_epochs: 10
   seed: 42
-  warmup_iterations: 1000
-  save_every: 1000
-  val_every: 80
-  log_every: 100
-  # Weight on velocity MSE inside the (latent) damage mask vs outside; see compute_flow_loss.
+  warmup_iterations: 317
+  save_every: 50
+  val_every: 50
+  log_every: 3
+  inspect_data_every: 1 
+  inspect_data_root: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/inspect_train_data/"
   loss_weight_mask: 0.7
   resume_from: null
 
@@ -40,7 +42,7 @@ train:
     betas: [0.9, 0.999]
 
   scheduler:
-    warmup_steps: 500
+    warmup_steps: 100
     min_lr: 1e-6
 
   warmup:
@@ -66,19 +68,19 @@ wandb:
   enabled: true
   project: "V1 Training"
   entity: "katyalcalder-research"
-  run_name: null          # null = auto-generated
-  tags: []                # e.g. ["warmup", "klein-4b"]
+  run_name: "first_run"          # null = auto-generated
+  tags: []                
   log_images: true
-  log_images_every: 500
+  log_images_every: 50
 
 # DeepSpeed launcher config. Consumed by deepspeed.initialize(config=cfg.ds_config).
 # Keeping optimizer/scheduler on the Python side (see train.optimizer/scheduler
 # above); DeepSpeed handles ZeRO-2 partitioning, bf16, gradient clipping.
 ds_config:
-  train_micro_batch_size_per_gpu: 4
-  gradient_accumulation_steps: 4
+  train_micro_batch_size_per_gpu: 32
+  gradient_accumulation_steps: 1
   gradient_clipping: 1.0
-  steps_per_print: 100
+  steps_per_print: 50
   bf16:
     enabled: true
   zero_optimization:

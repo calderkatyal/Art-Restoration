@@ -16,11 +16,8 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as TF
 
 from .corruption import CorruptionModule
+from torchdata.stateful_dataloader import StatefulDataLoader
 
-try:
-    from torchdata.stateful_dataloader import StatefulDataLoader
-except ImportError:  # pragma: no cover - optional dependency
-    StatefulDataLoader = None
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 TRAIN_SPLITS = {"train", "training"}
@@ -401,6 +398,7 @@ def build_wikiart_dataloader(
     drop_last: bool = False,
     pin_memory: bool = False,
     persistent_workers: bool = False,
+    prefetch_factor: int = 4,
     snapshot_every_n_steps: int = 1,
     return_metadata: bool = False,
     distributed: bool = False,
@@ -458,14 +456,14 @@ def build_wikiart_dataloader(
         "persistent_workers": bool(persistent_workers) and int(num_workers) > 0,
         "worker_init_fn": _wikiart_worker_init_fn if int(num_workers) > 0 else None,
     }
-    if StatefulDataLoader is not None:
-        dataloader = StatefulDataLoader(
-            snapshot_every_n_steps=int(snapshot_every_n_steps),
-            **loader_kwargs,
-        )
-    else:
-        dataloader = DataLoader(**loader_kwargs)
-
+    if int(num_workers) > 0:
+        loader_kwargs["prefetch_factor"] = max(1, int(prefetch_factor))
+    
+    dataloader = StatefulDataLoader(
+        snapshot_every_n_steps=int(snapshot_every_n_steps),
+        **loader_kwargs,
+    )
+    
     return dataset, dataloader, sampler
 
 
