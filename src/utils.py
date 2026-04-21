@@ -4,14 +4,17 @@ Provides:
     * :func:`load_config` for loading the main training YAML.
     * :func:`load_corruption_config` for loading the corruption YAML referenced by
       ``cfg.corruption.config_path``.
+    * :func:`print_training_phase` for logging active trainable parameter groups.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from omegaconf import DictConfig, OmegaConf
+
+from .distributed import is_main_process
 
 # Defaults merged under user YAML so older configs still run. Values here are the
 # low-level knobs expected by ``deepspeed.initialize``.
@@ -34,6 +37,25 @@ _DEEPSPEED_DEFAULTS = OmegaConf.create(
         "wall_clock_breakdown": False,
     }
 )
+
+
+def _trainable_group_names(model: Any) -> list[str]:
+    names: list[str] = []
+    for group in model.get_trainable_params():
+        params = group.get("params", [])
+        if any(p.requires_grad for p in params):
+            names.append(str(group.get("name", "unnamed")))
+    return names
+
+
+def print_training_phase(model: Any, warmup_only: bool, step: int) -> None:
+    """Log the current training phase and active trainable parameter groups on rank 0."""
+    if not is_main_process():
+        return
+    groups = _trainable_group_names(model)
+    phase = "warmup" if warmup_only else "full training"
+    trained = ", ".join(groups) if groups else "none"
+    print(f"[train] Step {step}: {phase} active. Training layers: {trained}")
 
 def _resolve_config_path(config_path: str, config_dir: Optional[Path] = None) -> Path:
     """Resolve a config path against a few sensible roots.

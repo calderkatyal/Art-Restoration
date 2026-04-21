@@ -16,12 +16,32 @@ In distributed mode, rank 0 computes (if missing) and saves; all ranks synchroni
 """
 
 import argparse
+import gc
 from pathlib import Path
 
 import torch
 
 from .flux2.util import load_text_encoder
 from .utils import load_config
+
+
+def _cleanup_text_encoder(enc: object, device: str | torch.device) -> None:
+    """Best-effort release of the temporary text encoder used for null-emb compute."""
+    if isinstance(device, str):
+        device = torch.device(device)
+
+    try:
+        if hasattr(enc, "model") and hasattr(enc.model, "to"):
+            enc.model.to("cpu")
+        elif hasattr(enc, "to"):
+            enc.to("cpu")
+    except Exception:
+        pass
+
+    del enc
+    gc.collect()
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def compute_null_embedding(
@@ -41,10 +61,13 @@ def compute_null_embedding(
         Tensor shaped ``(1, 512, 7680)``, dtype ``bfloat16``.
     """
     enc = load_text_encoder(flux_model_name, device=device)
-    enc.eval()
-    with torch.no_grad():
-        emb = enc([""])
-    return emb.to(dtype=torch.bfloat16)
+    try:
+        enc.eval()
+        with torch.no_grad():
+            emb = enc([""])
+        return emb.to(dtype=torch.bfloat16)
+    finally:
+        _cleanup_text_encoder(enc, device)
 
 
 def load_or_compute_null_embedding(
