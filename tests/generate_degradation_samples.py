@@ -35,27 +35,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from src.corruption.effects import (
-    apply_craquelure, apply_rip_tear, apply_paint_loss,
-    apply_yellowing, apply_fading, apply_deposits, apply_scratches,
-)
-from src.corruption.presets import (
-    CHANNEL_NAMES, generate_global_mask, generate_local_mask,
-    SHAPE_KIND_BY_CHANNEL,
-)
-from src.corruption.module import _affected_pixels, _per_component_hull_mask
+from src.corruption.presets import CHANNEL_NAMES
+from src.corruption.module import CorruptionModule
 
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-
-EFFECT_FNS = {
-    "craquelure": apply_craquelure,
-    "rip_tear":   apply_rip_tear,
-    "paint_loss": apply_paint_loss,
-    "yellowing":  apply_yellowing,
-    "fading":     apply_fading,
-    "deposits":   apply_deposits,
-    "scratches":  apply_scratches,
-}
 
 
 def find_images(root: str, max_scan: int = 5000) -> List[Path]:
@@ -98,47 +81,25 @@ def try_get_font(size: int = 14):
     return ImageFont.load_default()
 
 
-def apply_corruption(
-    image: torch.Tensor,
-    corruption: str,
-    mode: str,
-    severity: float,
-    type_cfg,
-    generator: torch.Generator,
-) -> tuple:
-    """Returns (corrupted_image, soft_mask)."""
-    H, W = image.shape[-2:]
-    device = image.device
+_NO_OUTLINE = {"scratches", "rip_tear"}
 
-    if mode == "local":
-        min_n = max(1, int(type_cfg.get("local_min_num", 1)))
-        max_n = max(min_n, int(type_cfg.get("local_max_num", 4)))
-        af = type_cfg.get("local_area_frac", [0.01, 0.05])
-        shape_kind = SHAPE_KIND_BY_CHANNEL.get(corruption, "generic")
-        soft_mask, _ = generate_local_mask(
-            H, W, severity,
-            (min_n, max_n),
-            (float(af[0]), float(af[1])),
-            shape_kind=shape_kind,
-            generator=generator,
-            device=device,
-        )
-    else:
-        soft_mask, _ = generate_global_mask(H, W, severity, device=device)
 
-    fn = EFFECT_FNS[corruption]
-    extra = {}
-    if corruption == "scratches":
-        extra["max_count"] = int(type_cfg.get("local_max_num", 8))
-    before = image.clone()
-    out_img = fn(image, soft_mask, generator=generator, **extra)
-    # Show the actual affected-pixel hull mask (same as what the training
-    # pipeline produces), not the input soft mask. This way the displayed
-    # mask matches exactly where the damage was drawn.
-    diff_bool = _affected_pixels(before, out_img, threshold=0.008)
-    H2, W2 = image.shape[-2:]
-    actual_mask = _per_component_hull_mask(diff_bool, H2, W2, merge_radius=3)
-    return out_img, actual_mask
+def overlay_red_mask(image: Image.Image, mask: torch.Tensor, width: int = 2) -> Image.Image:
+    """Draw a thin red boundary around the mask region."""
+    m = (mask.detach().cpu() > 0.05)
+    if not m.any():
+        return image.copy()
+    up    = torch.zeros_like(m); up[1:]      = m[:-1]
+    down  = torch.zeros_like(m); down[:-1]   = m[1:]
+    left  = torch.zeros_like(m); left[:, 1:] = m[:, :-1]
+    right = torch.zeros_like(m); right[:, :-1] = m[:, 1:]
+    boundary = m & ~(m & up & down & left & right)
+    out = image.copy()
+    draw = ImageDraw.Draw(out)
+    r = width // 2
+    for y, x in zip(*torch.nonzero(boundary, as_tuple=True)):
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=(255, 0, 0))
+    return out
 
 
 def mask_to_pil(m: torch.Tensor, resolution: int) -> Image.Image:
@@ -208,6 +169,7 @@ def main():
 
     # Load config.
     cfg = OmegaConf.load(args.corruption_config)
+    corruptor = CorruptionModule(cfg)
 
     # Find and sample paintings.
     print(f"Scanning {args.data_dir} for images...")
@@ -239,6 +201,7 @@ def main():
     samples_per_painting = max(1, args.samples_per_type // len(paintings))
 
     for corruption in CHANNEL_NAMES:
+        corruption_idx = CHANNEL_NAMES.index(corruption)
         type_cfg = cfg.types[corruption]
         local_ok = bool(type_cfg.get("local_enabled", True))
         global_ok = bool(type_cfg.get("global_enabled", False))
@@ -257,9 +220,7 @@ def main():
 
         for stem, image in paintings:
             for i in range(samples_per_painting):
-                seed_i = args.seed * 10000 + CHANNEL_NAMES.index(corruption) * 1000 + saved
-                gen = torch.Generator(device="cpu")
-                gen.manual_seed(seed_i)
+                seed_i = args.seed * 10000 + corruption_idx * 1000 + saved
 
                 # Random mode.
                 modes = []
@@ -275,7 +236,14 @@ def main():
                 severity = min_s + random.random() * (max_s - min_s)
 
                 try:
-                    out, soft_mask = apply_corruption(image, corruption, mode, severity, type_cfg, gen)
+                    out, mask_tensor = corruptor(
+                        image,
+                        seed=seed_i,
+                        corruption=corruption,
+                        mode=mode,
+                        severity=severity,
+                    )
+                    actual_mask = mask_tensor[corruption_idx]
                 except Exception as e:
                     print(f"  ERROR on {stem} sev={severity:.2f}: {e}")
                     continue
@@ -283,10 +251,13 @@ def main():
                 sev_str = f"{severity:.2f}"
                 fname = f"{stem}_{mode}_sev{sev_str}_seed{seed_i}.jpg"
                 fpath = os.path.join(type_dir, fname)
-                tensor_to_pil(out).save(fpath, quality=90)
+                out_pil = tensor_to_pil(out)
+                if corruption not in _NO_OUTLINE:
+                    out_pil = overlay_red_mask(out_pil, actual_mask)
+                out_pil.save(fpath, quality=90)
 
-                thumbs.append(tensor_to_pil(out))
-                mask_thumbs.append(mask_to_pil(soft_mask, args.resolution))
+                thumbs.append(out_pil)
+                mask_thumbs.append(mask_to_pil(actual_mask, args.resolution))
                 labels.append(f"{stem[:10]} s={sev_str}")
                 saved += 1
 

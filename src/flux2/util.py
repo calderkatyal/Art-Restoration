@@ -100,19 +100,9 @@ def init_flow_model(model_name: str, debug_mode: bool = False) -> Flux2:
     with torch.device("meta"):
         model = Flux2(params).to(torch.bfloat16)
     return model
-        
-        
-def load_pretrained_flow_weights(
-    model: Flux2,
-    model_name: str,
-    rank: int = 0,
-    device: str | torch.device = "cuda",
-) -> Flux2:
-    config = FLUX2_MODEL_INFO[model_name.lower()]
-    
-    if isinstance(device, str):
-        device = torch.device(device)
 
+def _resolve_pretrained_flow_weight_path(model_name: str) -> str:
+    config = FLUX2_MODEL_INFO[model_name.lower()]
     if config["model_path"] in os.environ:
         weight_path = os.environ[config["model_path"]]
         assert os.path.exists(weight_path), f"Provided weight path {weight_path} does not exist"
@@ -130,10 +120,28 @@ def load_pretrained_flow_weights(
                 "Stopping."
             )
             sys.exit(1)
+    return weight_path
 
+
+def load_pretrained_flow_state_dict(
+    model_name: str,
+    rank: int = 0,
+    device: str | torch.device = "cuda",
+):
+    if isinstance(device, str):
+        device = torch.device(device)
+    weight_path = _resolve_pretrained_flow_weight_path(model_name)
     print(f"[rank {rank}] Loading {weight_path} for FLUX.2 weights")
+    return load_sft(weight_path, device=str(device))
 
-    sd = load_sft(weight_path, device=str(device))
+
+def load_pretrained_flow_weights(
+    model: Flux2,
+    model_name: str,
+    rank: int = 0,
+    device: str | torch.device = "cuda",
+) -> Flux2:
+    sd = load_pretrained_flow_state_dict(model_name, rank=rank, device=device)
     model.load_state_dict(sd, strict=True, assign=True)
     return model
 
