@@ -10,6 +10,7 @@ Provides:
 
 from __future__ import annotations
 
+import copy
 from datetime import datetime
 from pathlib import Path
 from typing import Any, List, Optional
@@ -167,6 +168,125 @@ def gather_inference_panels(
     return torch.stack(
         [panel.to(dtype=torch.float32) / 255.0 for _, panel in merged],
         dim=0,
+    )
+
+
+def checkpoint_tags_desc(checkpoint_dir: Path) -> list[str]:
+    """Return ``step_*`` checkpoint tags sorted newest-first."""
+    if not checkpoint_dir.exists():
+        return []
+    candidates = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith("step_")]
+    if not candidates:
+        return []
+
+    def key_fn(path: Path) -> tuple[int, float]:
+        try:
+            step = int(path.name.split("_", 1)[1])
+        except (IndexError, ValueError):
+            step = -1
+        return (step, path.stat().st_mtime)
+
+    return [p.name for p in sorted(candidates, key=key_fn, reverse=True)]
+
+
+def summarize_train_loader_state(state: Any) -> str:
+    """Summarize saved loader state so resume logs show where we expect to restart."""
+    if not isinstance(state, dict):
+        return "none"
+
+    parts = [f"mode={state.get('mode', 'unknown')}"]
+    sampler = state.get("sampler")
+    if isinstance(sampler, dict):
+        for key in ("epoch", "position", "length", "rank", "num_replicas", "num_samples"):
+            if key in sampler:
+                parts.append(f"sampler_{key}={sampler[key]}")
+
+    dataset = state.get("dataset")
+    if isinstance(dataset, dict):
+        for key in ("worker_id", "worker_seed", "corruption_calls"):
+            if key in dataset:
+                parts.append(f"dataset_{key}={dataset[key]}")
+
+    loader = state.get("loader")
+    if isinstance(loader, dict):
+        preview_keys = sorted(str(k) for k in loader.keys())[:6]
+        parts.append(f"loader_keys={preview_keys}")
+        for key in ("epoch", "position", "num_yielded", "_sampler_iter_yielded"):
+            if key in loader:
+                parts.append(f"loader_{key}={loader[key]}")
+
+    return ", ".join(parts)
+
+
+def summarize_runtime_loader_progress(
+    train_dataset: Any,
+    train_sampler: Any,
+) -> str:
+    """Summarize current sampler / dataset counters after a restore attempt."""
+    parts: list[str] = []
+    for attr in ("epoch", "position", "rank", "num_replicas", "num_samples"):
+        if hasattr(train_sampler, attr):
+            parts.append(f"sampler_{attr}={getattr(train_sampler, attr)}")
+    for attr in ("_worker_id", "_worker_seed", "_corruption_calls"):
+        if hasattr(train_dataset, attr):
+            parts.append(f"dataset_{attr.lstrip('_')}={getattr(train_dataset, attr)}")
+    return ", ".join(parts) if parts else "no sampler/dataset progress attributes available"
+
+
+def summarize_next_sampler_batch(
+    train_dataset: Any,
+    train_sampler: Any,
+    batch_size: int,
+    limit: int = 4,
+) -> str:
+    """Summarize the next local batch implied by the sampler cursor."""
+    parts: list[str] = []
+    epoch = getattr(train_sampler, "epoch", None)
+    position = getattr(train_sampler, "position", None)
+    if epoch is not None:
+        parts.append(f"sampler_epoch={epoch}")
+    if position is not None:
+        parts.append(f"sampler_position={position}")
+
+    if not hasattr(train_sampler, "current_order") or position is None:
+        return ", ".join(parts) if parts else "next batch cursor unavailable"
+
+    order = list(train_sampler.current_order())
+    start = int(position)
+    stop = max(start, start + int(batch_size))
+    next_indices = order[start:stop]
+    parts.append(f"next_local_batch_indices={next_indices[:limit]}")
+
+    image_paths = getattr(train_dataset, "image_paths", None)
+    if image_paths is not None:
+        next_paths = [Path(str(image_paths[idx])).name for idx in next_indices[:limit]]
+        parts.append(f"next_local_batch_paths={next_paths}")
+
+    return ", ".join(parts)
+
+
+def summarize_saved_next_sampler_batch(
+    train_dataset: Any,
+    train_sampler: Any,
+    sampler_state: Any,
+    batch_size: int,
+    limit: int = 4,
+) -> str:
+    """Summarize the next local batch implied by a saved sampler state."""
+    if not isinstance(sampler_state, dict):
+        return "saved sampler state unavailable"
+    if not hasattr(train_sampler, "load_state_dict"):
+        return "sampler restore preview unavailable"
+    try:
+        sampler_copy = copy.deepcopy(train_sampler)
+        sampler_copy.load_state_dict(sampler_state)
+    except Exception as exc:
+        return f"saved sampler preview unavailable: {type(exc).__name__}: {exc}"
+    return summarize_next_sampler_batch(
+        train_dataset,
+        sampler_copy,
+        batch_size=batch_size,
+        limit=limit,
     )
 
 
