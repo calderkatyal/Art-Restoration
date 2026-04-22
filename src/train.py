@@ -2,11 +2,12 @@
 
 Rectified flow objective per training step:
     1. Sample clean image ``x``; dataset / corruption yields ``(y, M)``.
-    2. ``z_1 = E(x)``, ``z_y = E(y)`` with frozen VAE (no gradients through ``E``).
+    2. ``z_clean = E(x)``, ``z_y = E(y)`` with frozen VAE (no gradients through ``E``).
     3. ``M' = downsample_mask(M, factor=spatial_compression)`` (e.g. 16 for FLUX VAE).
-    4. ``z_0 ~ N(0, I)``, ``t ~ U(0, 1)``.
-    5. ``z_t = (1 - t) * z_0 + t * z_1`` — note ``z_t`` interpolates **noise ↔ clean**;
-       the damaged reference ``z_y`` is **separate conditioning**, not part of this mix.
+    4. ``z_noise ~ N(0, I)``, ``t ~ U(0, 1)``.
+    5. ``z_t = (1 - t) * z_clean + t * z_noise`` so ``t=0`` is clean-like and ``t=1``
+       is noise-like, matching the official FLUX2 sampling convention. The damaged
+       reference ``z_y`` is **separate conditioning**, not part of this mix.
     6. ``vel = v_θ(z_t, t | z_y, M', null_emb)``.
     7. Mask-weighted velocity MSE (``train.loss_weight_mask``, default ``0.7``) over latent
        union-mask vs outside; see :func:`compute_flow_loss`.
@@ -279,16 +280,26 @@ def _maybe_save_inspect_batch(
     if corrupted is None or corrupted.shape[0] == 0:
         return
 
-    out_path = out_dir / f"step_{int(global_step):08d}_rank_{int(rank):02d}.png"
-    log_message(f"[inspect] rank={rank} saving training image to {out_path}")
-    image = corrupted[0]
     mask = batch.get("mask")
-    if mask is not None and mask.shape[0] > 0:
-        pil = overlay_mask_boundaries(image, mask[0])
-    else:
-        pil = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
-    pil.save(out_path)
-    log_message(f"[inspect] rank={rank} saved training image to {out_path}")
+    batch_size = int(corrupted.shape[0])
+    log_message(
+        f"[inspect] rank={rank} saving {batch_size} training image(s) for step={int(global_step)}"
+    )
+
+    for sample_idx in range(batch_size):
+        out_path = out_dir / (
+            f"step_{int(global_step):08d}_rank_{int(rank):02d}_sample_{int(sample_idx):02d}.png"
+        )
+        image = corrupted[sample_idx]
+        if mask is not None and mask.shape[0] > sample_idx:
+            pil = overlay_mask_boundaries(image, mask[sample_idx])
+        else:
+            pil = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
+        pil.save(out_path)
+
+    log_message(
+        f"[inspect] rank={rank} saved {batch_size} training image(s) to {out_dir}"
+    )
 
 
 def _unwrap_model(engine: Any) -> RestorationDiT:
@@ -582,7 +593,7 @@ def compute_flow_loss(
 
     Expects ``batch`` keys ``"clean"``, ``"corrupted"``, ``"mask"`` as emitted by
     :class:`~src.dataset.ArtRestorationDataset`. Encodings use the frozen VAE in
-    ``float32``; the velocity target ``(z_1 - z_0)`` is ``float32``; model predictions
+    ``float32``; the velocity target ``(z_noise - z_clean)`` is ``float32``; model predictions
     are cast to ``float32`` for the MSE so bf16 forward does not underflow the loss.
 
     The MSE is split by the **latent** union mask (last mask channel after pooling):
@@ -610,7 +621,7 @@ def compute_flow_loss(
     mask = batch["mask"].to(device, non_blocking=True)
 
     with torch.no_grad():
-        z_1 = vae.encode(clean.float())
+        z_clean = vae.encode(clean.float())
         z_y = vae.encode(corrupted.float())
 
     m_prime = downsample_mask(mask, factor=spatial_compression)
@@ -620,13 +631,13 @@ def compute_flow_loss(
             f"(7 per-type + union), got pixel {mask.shape[1]} latent {m_prime.shape[1]}"
         )
 
-    z_0 = torch.randn_like(z_1)
-    t = torch.rand((z_1.shape[0],), device=device, dtype=z_1.dtype)
+    z_noise = torch.randn_like(z_clean)
+    t = torch.rand((z_clean.shape[0],), device=device, dtype=z_clean.dtype)
     t_bc = t.view(-1, 1, 1, 1)
-    z_t = (1.0 - t_bc) * z_0 + t_bc * z_1
+    z_t = (1.0 - t_bc) * z_clean + t_bc * z_noise
 
     vel = model_engine(z_t, t, z_y, m_prime, null_emb)
-    target = (z_1 - z_0).float()
+    target = (z_noise - z_clean).float()
     sq = (vel.float() - target).pow(2)
     # Last mask channel is union of per-type masks at latent resolution.
     dam = (m_prime[:, -1:] >= 0.5).to(dtype=sq.dtype).expand_as(sq)
