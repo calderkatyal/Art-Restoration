@@ -162,6 +162,9 @@ def main():
                         help="Total images to generate per corruption type")
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--types", nargs="+", default=None,
+                        metavar="TYPE",
+                        help="Only generate these corruption types (e.g. --types rip_tear scratches)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -201,6 +204,8 @@ def main():
     samples_per_painting = max(1, args.samples_per_type // len(paintings))
 
     for corruption in CHANNEL_NAMES:
+        if args.types and corruption not in args.types:
+            continue
         corruption_idx = CHANNEL_NAMES.index(corruption)
         type_cfg = cfg.types[corruption]
         local_ok = bool(type_cfg.get("local_enabled", True))
