@@ -56,6 +56,7 @@ import math
 import random
 import re
 import os
+import shutil
 import time
 import traceback
 from pathlib import Path
@@ -281,25 +282,15 @@ def _maybe_save_inspect_batch(
         return
 
     mask = batch.get("mask")
-    batch_size = int(corrupted.shape[0])
-    log_message(
-        f"[inspect] rank={rank} saving {batch_size} training image(s) for step={int(global_step)}"
-    )
-
-    for sample_idx in range(batch_size):
-        out_path = out_dir / (
-            f"step_{int(global_step):08d}_rank_{int(rank):02d}_sample_{int(sample_idx):02d}.png"
-        )
-        image = corrupted[sample_idx]
-        if mask is not None and mask.shape[0] > sample_idx:
-            pil = overlay_mask_boundaries(image, mask[sample_idx])
-        else:
-            pil = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
-        pil.save(out_path)
-
-    log_message(
-        f"[inspect] rank={rank} saved {batch_size} training image(s) to {out_dir}"
-    )
+    out_path = out_dir / f"step_{int(global_step):08d}_rank_{int(rank):02d}.png"
+    log_message(f"[inspect] rank={rank} saving training image to {out_path}")
+    image = corrupted[0]
+    if mask is not None and mask.shape[0] > 0:
+        pil = overlay_mask_boundaries(image, mask[0])
+    else:
+        pil = TF.to_pil_image(image.detach().cpu().clamp(0.0, 1.0))
+    pil.save(out_path)
+    log_message(f"[inspect] rank={rank} saved training image to {out_path}")
 
 
 def _unwrap_model(engine: Any) -> RestorationDiT:
@@ -501,6 +492,72 @@ def _checkpoint_root(cfg: DictConfig) -> Path:
 
 def _checkpoint_dir_for_run(cfg: DictConfig, run_name: str) -> Path:
     return _checkpoint_root(cfg) / run_name
+
+
+def _write_deepspeed_latest_tag(checkpoint_dir: Path) -> None:
+    """Keep DeepSpeed's ``latest`` pointer aligned with the newest surviving tag."""
+    if not is_main_process():
+        return
+
+    latest_path = checkpoint_dir / "latest"
+    tags = checkpoint_tags_desc(checkpoint_dir)
+    if not tags:
+        try:
+            latest_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    latest_path.write_text(f"{tags[0]}\n", encoding="utf-8")
+
+
+def _delete_checkpoint_tag_dir(checkpoint_dir: Path, tag: str, reason: str) -> bool:
+    """Delete one checkpoint tag directory and refresh DeepSpeed's ``latest`` file."""
+    if not is_main_process():
+        return False
+
+    target = checkpoint_dir / tag
+    if not target.exists():
+        return False
+    if not target.is_dir():
+        log_message(f"[checkpoint] refusing to delete non-directory checkpoint path {target}")
+        return False
+
+    try:
+        shutil.rmtree(target)
+        log_message(f"[checkpoint] deleted {target} ({reason})")
+        _write_deepspeed_latest_tag(checkpoint_dir)
+        return True
+    except Exception as exc:
+        log_message(
+            f"[checkpoint] failed to delete {target} after {reason}: "
+            f"{type(exc).__name__}: {exc}"
+        )
+        return False
+
+
+def _prune_checkpoint_history(
+    checkpoint_dir: Path,
+    keep_latest: int = 2,
+    reason: str = "checkpoint retention",
+) -> list[str]:
+    """Retain only the newest ``keep_latest`` checkpoints in ``checkpoint_dir``."""
+    if not is_main_process():
+        return []
+
+    keep_latest = max(int(keep_latest), 0)
+    deleted: list[str] = []
+    for tag in checkpoint_tags_desc(checkpoint_dir)[keep_latest:]:
+        if _delete_checkpoint_tag_dir(checkpoint_dir, tag, reason):
+            deleted.append(tag)
+
+    if deleted:
+        survivors = checkpoint_tags_desc(checkpoint_dir)
+        log_message(
+            f"[checkpoint] retained newest {keep_latest} checkpoint(s): "
+            f"{survivors if survivors else 'none'}"
+        )
+    return deleted
 
 
 def _distributed_barrier() -> None:
@@ -783,7 +840,13 @@ def maybe_save_deepspeed_checkpoint(
     engine.save_checkpoint(str(out), tag=tag, client_state=client_state)
     if is_main_process():
         _write_checkpoint_metadata(out, tag, client_state)
+        _prune_checkpoint_history(
+            out,
+            keep_latest=2,
+            reason=f"post-save retention after {tag}",
+        )
     log_message(f"[checkpoint] finished save for {tag} in {out}")
+    _distributed_barrier()
 
 
 def train(cfg: DictConfig) -> None:
@@ -892,7 +955,16 @@ def _checkpoint_load_attempts(cfg: DictConfig, run_name: str) -> list[tuple[str,
     resume_from = cfg.train.get("resume_from")
     if resume_from and str(resume_from) != "from_scratch":
         rp = Path(str(resume_from))
-        return [(str(rp.parent), rp.name, "requested checkpoint")]
+        attempts = [(str(rp.parent), rp.name, "requested checkpoint")]
+        requested_step = _step_from_tag(rp.name)
+        for tag in checkpoint_tags_desc(rp.parent):
+            if tag == rp.name:
+                continue
+            if requested_step > 0 and _step_from_tag(tag) >= requested_step:
+                continue
+            attempts.append((str(rp.parent), tag, "previous checkpoint"))
+            break
+        return attempts
 
     ckpt_dir = _checkpoint_dir_for_run(cfg, run_name)
     tags = checkpoint_tags_desc(ckpt_dir)
@@ -1019,7 +1091,7 @@ def main(cfg: DictConfig) -> None:
                 if is_main_process():
                     log_message(
                         f"[resume] checkpoint counters from {attempt_label}: "
-                        f"epoch={start_epoch} global_step={global_step} "
+                        f"epoch={int(start_epoch) + 1} global_step={global_step} "
                         f"images_since_save={images_since_save}"
                     )
                     log_message(
@@ -1049,6 +1121,14 @@ def main(cfg: DictConfig) -> None:
                         f"[resume] next local batch after restore: "
                         f"{summarize_next_sampler_batch(train_dataset, train_sampler, _micro_batch_size(cfg))}"
                     )
+                    pruned = _prune_checkpoint_history(
+                        Path(attempt_dir),
+                        keep_latest=2,
+                        reason=f"post-resume retention after loading {attempt_tag}",
+                    )
+                    if pruned:
+                        log_message(f"[checkpoint] pruned older checkpoints after resume: {pruned}")
+                _distributed_barrier()
                 break
             except Exception as exc:
                 if is_main_process():
@@ -1058,11 +1138,23 @@ def main(cfg: DictConfig) -> None:
                     )
                     log_message(f"[train] checkpoint load traceback for {attempt_label}:\n{traceback.format_exc().rstrip()}")
                     if attempt_idx + 1 < len(checkpoint_attempts):
+                        deleted = _delete_checkpoint_tag_dir(
+                            Path(attempt_dir),
+                            attempt_tag,
+                            reason=f"failed restore from {attempt_label}",
+                        )
+                        if deleted:
+                            log_message(
+                                f"[train] Deleted broken {attempt_label} at {attempt_path} "
+                                f"before trying an older checkpoint."
+                            )
                         next_dir, next_tag, next_label = checkpoint_attempts[attempt_idx + 1]
                         next_path = str(Path(next_dir) / next_tag)
                         log_message(
                             f"[train] Will try {next_label} next: {next_path}"
                         )
+                if attempt_idx + 1 < len(checkpoint_attempts):
+                    _distributed_barrier()
         if not checkpoint_loaded:
             if is_main_process():
                 log_message("[train] All checkpoint restore attempts failed; falling back to pretrained weights.")
@@ -1099,6 +1191,7 @@ def main(cfg: DictConfig) -> None:
     images_per_opt_step = micro_batch * world_size * grad_accum
 
     for epoch in range(start_epoch, int(cfg.train.num_epochs)):
+        display_epoch = int(epoch) + 1
         resumed_epoch = restored_train_state and epoch == start_epoch
 
         if not resumed_epoch and train_sampler is not None:
@@ -1111,7 +1204,16 @@ def main(cfg: DictConfig) -> None:
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
 
-        pbar = tqdm(train_loader, disable=not is_main_process(), desc=f"epoch {epoch}")
+        batches_completed_total = int(global_step) * int(grad_accum)
+        epoch_batch_offset = max(0, batches_completed_total - epoch * steps_per_epoch)
+        epoch_batch_offset = min(epoch_batch_offset, len(train_loader))
+        pbar = tqdm(
+            train_loader,
+            disable=not is_main_process(),
+            desc=f"epoch {display_epoch}",
+            initial=epoch_batch_offset,
+            total=len(train_loader),
+        )
         t_last = time.perf_counter()
         for batch in pbar:
             loss = compute_flow_loss(
@@ -1143,7 +1245,7 @@ def main(cfg: DictConfig) -> None:
                 print_training_phase(_unwrap_model(engine), warmup_only, global_step)
 
             if is_main_process():
-                pbar.set_postfix(loss=f"{loss.item():.4f}")
+                pbar.set_postfix(loss=f"{loss.item():.4f}", step=int(global_step))
 
             if is_main_process() and global_step % log_every == 0:
                 dt = time.perf_counter() - t_last
@@ -1154,13 +1256,13 @@ def main(cfg: DictConfig) -> None:
                 metrics = {
                     "train/loss": loss.item(),
                     "train/images_per_sec": img_per_sec,
-                    "train/epoch": epoch,
+                    "train/epoch": display_epoch,
                     "train/global_step": global_step,
                 }
                 for i, lr in enumerate(lrs):
                     metrics[f"train/lr_group_{i}"] = lr
                 log_message(
-                    f"[train] epoch={epoch} step={global_step} "
+                    f"[train] epoch={display_epoch} step={global_step} "
                     f"loss={loss.item():.4f} img_per_sec={img_per_sec:.2f}"
                 )
                 wandb_log(metrics, step=global_step)
@@ -1209,17 +1311,17 @@ def main(cfg: DictConfig) -> None:
                 if is_main_process():
                     val_start_time = time.perf_counter()
                     log_message("========STARTING VALIDATION========")
-                    log_message(f"[val] epoch={epoch} step={global_step}")
+                    log_message(f"[val] epoch={display_epoch} step={global_step}")
                 metrics = validate(engine, vae, val_loader, null_emb, cfg, device)
                 if is_main_process():
                     log_message(
-                        f"[val] epoch={epoch} step={global_step} "
+                        f"[val] epoch={display_epoch} step={global_step} "
                         f"loss={metrics['velocity_loss']:.4f}"
                     )
                     elapsed = 0.0 if val_start_time is None else time.perf_counter() - val_start_time
                     log_message("========ENDING VALIDATION========")
                     log_message(
-                        f"[val] epoch={epoch} step={global_step} "
+                        f"[val] epoch={display_epoch} step={global_step} "
                         f"duration_sec={elapsed:.2f}"
                     )
                     wandb_log(
@@ -1231,7 +1333,7 @@ def main(cfg: DictConfig) -> None:
                         inference_start_time = time.perf_counter()
                         log_message("========STARTING INFERENCE========")
                         log_message(
-                            f"[inference] epoch={epoch} step={global_step} "
+                            f"[inference] epoch={display_epoch} step={global_step} "
                             f"num_images={wandb_log_images_num(cfg)}"
                         )
                     panels = run_validation_inference(
@@ -1251,7 +1353,7 @@ def main(cfg: DictConfig) -> None:
                         )
                         log_message("========ENDING INFERENCE========")
                         log_message(
-                            f"[inference] epoch={epoch} step={global_step} "
+                            f"[inference] epoch={display_epoch} step={global_step} "
                             f"duration_sec={elapsed:.2f}"
                         )
                         if panels is not None:
