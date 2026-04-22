@@ -38,7 +38,8 @@ def sample(
     Steps (latent space):
         1. ``z_y = vae.encode(corrupted_image)``
         2. ``M' = downsample_mask(mask, factor=vae.spatial_compression)``
-        3. ``z_t ~ N(0, I)`` matching ``z_y`` shape
+        3. ``z_t ~ N(0, I)`` matching ``z_y`` shape, then copy intact latent
+           cells from ``z_y`` before the first model evaluation
         4. ``timesteps = get_schedule(num_steps, H'*W')``
         5. For each adjacent pair ``(t_curr, t_next)`` in the schedule, apply Euler +
            :func:`data_consistency_step`.
@@ -72,6 +73,10 @@ def sample(
     z_y = z_y.to(dtype=dtype)
     m_lat = m_lat.to(dtype=dtype)
     null_b = null_emb.to(dtype=dtype)
+
+    # Give the model the correct intact-context latent before the first
+    # denoising step instead of starting from full-image noise.
+    z_t = data_consistency_step(z_t, z_y, m_lat)
 
     for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
         t_vec = torch.full((b,), float(t_curr), device=device, dtype=dtype)
