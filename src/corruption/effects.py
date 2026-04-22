@@ -214,112 +214,109 @@ def _sample_point_in_mask(mask: torch.Tensor,
 # Cracks
 # ---------------------------------------------------------------------------
 
-def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
-                     generator: torch.Generator = None) -> torch.Tensor:
-    """Craquelure: Voronoi tessellation cracks from age / paint-drying shrinkage.
-
-    Nearest-two-site distance difference detects tessellation edges.
-    Grid-based spatial lookup enforces minimum site spacing; edge width
-    scales with cell size.
-    """
-    C, H, W = image.shape
-    out = image.clone()
-
-    mask_sum = mask.sum().item()
-    if mask_sum < 1:
-        return out
-
-    # Cell size is a FIXED function of image area — independent of severity.
-    # Severity controls line darkness (below), not tessellation density, so
-    # "intensity 0.01" and "intensity 1.0" produce the same cell layout.
-    target = max(40, int(H * W / 200))
-    min_dist = 8
-    min_dist2 = min_dist * min_dist
-
-    grid_cell = min_dist
-    grid_w = math.ceil(W / grid_cell)
-    grid_h = math.ceil(H / grid_cell)
-    grid = [[] for _ in range(grid_w * grid_h)]
-
-    sites = []
-    mask_np = mask.cpu()
-    # Normalize placement probability by mask max so that the SAME RNG
-    # stream produces the same site pattern regardless of severity. Without
-    # this the acceptance rate scales with severity (low sev → more
-    # attempts → different generator state by the time `target` is met).
-    m_max = max(float(mask_np.max().item()), 1e-6)
-    attempts = 0
+def _sample_voronoi_sites(H: int, W: int, target: int, min_dist: int,
+                           mask: torch.Tensor,
+                           generator: torch.Generator) -> list:
+    """Mask-biased Poisson-disk sampling — sites prefer the masked region."""
+    min_dist2  = min_dist * min_dist
+    grid_w     = math.ceil(W / min_dist)
+    grid_h     = math.ceil(H / min_dist)
+    grid: list = [[] for _ in range(grid_w * grid_h)]
+    sites: list = []
+    mask_cpu   = mask.cpu()
+    m_max      = max(float(mask_cpu.max().item()), 1e-6)
+    attempts   = 0
     max_attempts = target * 50
-
     while len(sites) < target and attempts < max_attempts:
         attempts += 1
         x = int(torch.randint(0, W, (1,), generator=generator).item())
         y = int(torch.randint(0, H, (1,), generator=generator).item())
-        m = mask_np[y, x].item()
-        if torch.rand(1, generator=generator).item() < m / m_max:
-            gx = x // grid_cell
-            gy = y // grid_cell
-            too_close = False
-            for dy in range(-1, 2):
+        if torch.rand(1, generator=generator).item() >= mask_cpu[y, x].item() / m_max:
+            continue
+        gx = x // min_dist
+        gy = y // min_dist
+        too_close = False
+        for ddy in range(-1, 2):
+            if too_close:
+                break
+            for ddx in range(-1, 2):
                 if too_close:
                     break
-                for dx in range(-1, 2):
-                    if too_close:
+                nx2, ny2 = gx + ddx, gy + ddy
+                if nx2 < 0 or nx2 >= grid_w or ny2 < 0 or ny2 >= grid_h:
+                    continue
+                for sx, sy in grid[ny2 * grid_w + nx2]:
+                    if (sx - x) ** 2 + (sy - y) ** 2 < min_dist2:
+                        too_close = True
                         break
-                    nx, ny = gx + dx, gy + dy
-                    if nx < 0 or nx >= grid_w or ny < 0 or ny >= grid_h:
-                        continue
-                    for sx, sy in grid[ny * grid_w + nx]:
-                        if (sx - x) ** 2 + (sy - y) ** 2 < min_dist2:
-                            too_close = True
-                            break
-            if not too_close:
-                sites.append((x, y))
-                grid[gy * grid_w + gx].append((x, y))
+        if not too_close:
+            sites.append((x, y))
+            grid[gy * grid_w + gx].append((x, y))
+    return sites
 
-    if len(sites) < 2:
+
+def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
+                     generator: torch.Generator = None) -> torch.Tensor:
+    """Craquelure: two-layer Voronoi tessellation for heterogeneous cell sizes.
+
+    Layer 1 (coarse): large cells → wide, prominent primary cracks.
+    Layer 2 (fine):   small cells → thin secondary cracks within each region.
+
+    Sites are sampled uniformly across the full image so the crack pattern
+    reads as continuous rather than bounded at the mask edge.
+    """
+    C, H, W = image.shape
+    out = image.clone()
+
+    if mask.sum().item() < 1:
         return out
 
-    sites_t = torch.tensor(sites, dtype=torch.float32, device=image.device)
+    # Coarse layer: ~170 sites at 512×512 → cells ~20-40px diameter
+    target_c = max(20, int(H * W / 1500))
+    # Fine layer: ~900 sites at 512×512 → cells ~7-12px diameter
+    target_f = max(40, int(H * W / 290))
 
-    # Luminance-aware boost so crack lines remain visible on dark
-    # regions of the painting (Mona Lisa backgrounds, etc.). Kept mild
-    # here because cracks already cover a wide area — strong boosts
-    # cause cracks to dominate the composition on darker paintings.
+    sites_c = _sample_voronoi_sites(H, W, target_c, 20, mask, generator)
+    sites_f = _sample_voronoi_sites(H, W, target_f,  7, mask, generator)
+
+    if len(sites_c) < 2 and len(sites_f) < 2:
+        return out
+
+    # Merge both site sets into one Voronoi. Mixed density gives naturally
+    # variable cell sizes (large where only coarse sites land, small where
+    # fine sites are dense) without two visually distinct crack widths.
+    sites_all = sites_c + sites_f
+    if len(sites_all) < 2:
+        return out
+
+    dev   = image.device
+    st_all = torch.tensor(sites_all, dtype=torch.float32, device=dev)
+
     lum_boost = _local_lum_boost(image, mask, min_val=0.02, max_boost=2.2)
 
-    # Adaptive crack colour: on dark-background regions the standard near-black
-    # crack (0.06, 0.05, 0.04) is invisible against the paint. Real cracks expose
-    # the underlying paint layer or gesso primer, which is typically lighter than
-    # the surface paint. For dark regions we therefore blend toward a warm
-    # off-white so the crack reads as a lighter groove rather than a dark shadow.
     lum_field = image[0] * 0.299 + image[1] * 0.587 + image[2] * 0.114
-    active_w = (mask >= 0.02).float()
-    if active_w.sum().item() > 0:
-        mean_lum = float((lum_field * active_w).sum().item() / active_w.sum().item())
-    else:
-        mean_lum = 0.5
+    active_w  = (mask >= 0.02).float()
+    mean_lum  = float((lum_field * active_w).sum() / active_w.sum().clamp(min=1)) if active_w.sum() > 0 else 0.5
+
     if mean_lum < 0.35:
-        # Interpolate from near-black toward warm cream (aged gesso/canvas primer)
-        t = max(0.0, (0.35 - mean_lum) / 0.35)  # 0 at lum=0.35, 1 at lum=0
-        cr = 0.06 + t * 0.56   # up to 0.62
-        cg = 0.05 + t * 0.51   # up to 0.56
-        cb = 0.04 + t * 0.42   # up to 0.46
+        t = max(0.0, (0.35 - mean_lum) / 0.35)
+        cr = 0.06 + t * 0.56
+        cg = 0.05 + t * 0.51
+        cb = 0.04 + t * 0.42
     else:
         cr, cg, cb = 0.06, 0.05, 0.04
 
     chunk_size = 4096
-    out_flat = out.view(3, -1).clone()
+    out_flat  = out.view(3, -1).clone()
     mask_flat = mask.view(-1)
 
     for start in range(0, H * W, chunk_size):
-        end = min(start + chunk_size, H * W)
-        indices = torch.arange(start, end, device=image.device)
+        end     = min(start + chunk_size, H * W)
+        indices = torch.arange(start, end, device=dev)
         ys = indices // W
         xs = indices % W
 
         m_vals = mask_flat[start:end]
-        # Low threshold so that severity=0.01 (effective ~0.3) still paints.
         active = m_vals >= 0.02
         if not active.any():
             continue
@@ -328,39 +325,25 @@ def apply_craquelure(image: torch.Tensor, mask: torch.Tensor,
         ax = xs[active_idx].float()
         ay = ys[active_idx].float()
 
-        dx = ax.unsqueeze(1) - sites_t[:, 0].unsqueeze(0)
-        dy = ay.unsqueeze(1) - sites_t[:, 1].unsqueeze(0)
-        dists = dx ** 2 + dy ** 2
-
-        top2 = dists.topk(2, dim=1, largest=False)
-        sd1 = top2.values[:, 0].sqrt()
-        sd2 = top2.values[:, 1].sqrt()
+        dx   = ax.unsqueeze(1) - st_all[:, 0].unsqueeze(0)
+        dy   = ay.unsqueeze(1) - st_all[:, 1].unsqueeze(0)
+        top2 = (dx**2 + dy**2).topk(2, dim=1, largest=False)
+        sd1  = top2.values[:, 0].sqrt()
+        sd2  = top2.values[:, 1].sqrt()
         diff = sd2 - sd1
-
-        # Thicker cracks: higher coefficient (0.18 vs 0.12) and wider max
-        # (2.5px vs 1.5px) so crack lines are 3-5px total width and clearly
-        # visible even at small preview sizes.
-        edge_width = (sd1 * 0.18).clamp(max=2.5)
-        is_edge = (diff < edge_width) & (sd1 > 0.8)
+        ew   = (sd1 * 0.10).clamp(max=1.5)
+        is_edge = (diff < ew) & (sd1 > 0.8)
 
         if is_edge.any():
-            edge_idx = active_idx[is_edge]
-            global_idx = start + edge_idx
-            a = m_vals[edge_idx]
-            d = diff[is_edge]
-            ew = edge_width[is_edge]
-            # Strong alpha so cracks are unmissable. Floor 0.35 ensures even
-            # low-severity cracks are clearly visible; ceiling 0.55 gives
-            # bold lines at high severity. lum_boost adds up to 2.2x on dark.
-            alpha = ((0.35 + 0.55 * a) * (1.0 - d / ew) * lum_boost).clamp(max=1.0)
-            inv = 1.0 - alpha
+            gidx = start + active_idx[is_edge]
+            a    = m_vals[active_idx[is_edge]]
+            alph = ((0.30 + 0.45 * a) * (1.0 - diff[is_edge] / ew[is_edge]) * lum_boost).clamp(max=1.0)
+            inv  = 1.0 - alph
+            out_flat[0, gidx] = out_flat[0, gidx] * inv + cr * alph
+            out_flat[1, gidx] = out_flat[1, gidx] * inv + cg * alph
+            out_flat[2, gidx] = out_flat[2, gidx] * inv + cb * alph
 
-            out_flat[0, global_idx] = out_flat[0, global_idx] * inv + cr * alpha
-            out_flat[1, global_idx] = out_flat[1, global_idx] * inv + cg * alpha
-            out_flat[2, global_idx] = out_flat[2, global_idx] * inv + cb * alpha
-
-    out = out_flat.view(3, H, W)
-    return out
+    return out_flat.view(3, H, W)
 
 
 def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
@@ -389,27 +372,40 @@ def _walk_tear_spine(out: torch.Tensor, mask: torch.Tensor,
 
     # Random-walk width, initialized in the upper half of the allowed range.
     w_now = max_w * (0.6 + 0.4 * torch.rand(1, generator=generator).item())
-    w_min = max(0.5, max_w * 0.35)
-    w_max = max_w * 1.15
+    # Allow width to drop nearly to zero — real tears breathe in and out
+    # dramatically, sometimes almost closing before widening again.
+    w_min = 0.3
+    w_max = max_w * 1.20
 
-    # Slow random-walk edge offsets. Each step they nudge ±a small amount,
-    # producing coherent jagged boundaries instead of noisy per-step jitter.
+    # Large edge-offset random walk: asymmetric jaggedness on each side
+    # mimics torn canvas fibers protruding into the gap.
     edge_off_r = 0.0
     edge_off_l = 0.0
-    edge_walk_step = max(0.06, max_w * 0.06)
-    edge_off_clip = max(0.30, max_w * 0.30)
+    edge_walk_step = max(0.25, max_w * 0.22)
+    edge_off_clip  = max(1.0,  max_w * 0.65)
+
+    # Gentle curve state: walk in longer segments with modest angle deviations.
+    # Real tears curve gradually — they don't zigzag at sharp angles.
+    seg_remaining = int(8 + torch.rand(1, generator=generator).item() * 12)
 
     for step in range(max_steps):
-        # Parabolic taper 0..1..0 across the walk.
+        # Parabolic taper 0..1..0 across the walk — low floor so ends come
+        # to a near-point rather than cutting off flat.
         t = step / max(1, max_steps - 1)
-        taper = max(0.20, 1.0 - (2.0 * t - 1.0) ** 2)
+        taper = max(0.04, 1.0 - (2.0 * t - 1.0) ** 2)
 
-        # Tear-like angular wander — small per step so the spine reads
-        # as a coherent line / gentle curve rather than a scribble.
-        angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.10
+        # Gradual direction change: longer segments, small turns between them.
+        # Keep the tear as one connected stroke — no wild 60°+ zigzags.
+        seg_remaining -= 1
+        if seg_remaining <= 0:
+            turn_sign = 1.0 if torch.rand(1, generator=generator).item() > 0.5 else -1.0
+            angle += turn_sign * (0.15 + torch.rand(1, generator=generator).item() * 0.25)
+            seg_remaining = int(8 + torch.rand(1, generator=generator).item() * 12)
+        else:
+            angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.04
 
-        # Smooth width drift (random walk with bounds).
-        dw = (torch.rand(1, generator=generator).item() - 0.5) * max_w * 0.14
+        # Width drift — tear breathes naturally between steps.
+        dw = (torch.rand(1, generator=generator).item() - 0.5) * max_w * 0.35
         w_now = max(w_min, min(w_max, w_now + dw))
 
         # Slow-walk edge offsets (one RNG draw each side, per step).
@@ -555,25 +551,156 @@ def _paint_tear_puncture(out: torch.Tensor, mask: torch.Tensor,
                 out[2, ny, nx] = out[2, ny, nx] * inv + 0.86 * hl_a
 
 
+def _make_canvas_texture(H: int, W: int, device,
+                         generator: torch.Generator = None) -> torch.Tensor:
+    """Return (3, H, W) aged canvas / linen texture for exposed substrate."""
+    ph, pw = 7.0, 6.5  # warp / weft thread period in pixels
+    y = torch.arange(H, dtype=torch.float32, device=device)
+    x = torch.arange(W, dtype=torch.float32, device=device)
+    warp = (0.5 + 0.5 * torch.sin(2 * math.pi * y / ph)).unsqueeze(1).expand(H, W)
+    weft = (0.5 + 0.5 * torch.sin(2 * math.pi * x / pw)).unsqueeze(0).expand(H, W)
+    weave = warp * 0.55 + weft * 0.45
+
+    coarse = make_noise(H, W, 18.0, generator=generator, device=device)
+    fine   = make_noise(H, W, 1.5,  generator=generator, device=device)
+    texture = (weave * 0.50 + coarse * 0.38 + fine * 0.12).clamp(0, 1)
+
+    # Aged linen palette: warm yellowish tan
+    r = (0.62 + texture * 0.20).clamp(0, 1)
+    g = (0.55 + texture * 0.17).clamp(0, 1)
+    b = (0.40 + texture * 0.13).clamp(0, 1)
+    return torch.stack([r, g, b])
+
+
+def _apply_paint_detachment(out: torch.Tensor, mask: torch.Tensor,
+                             generator: torch.Generator) -> None:
+    """Expose canvas on one side of a zigzag fracture line through the mask.
+
+    Instead of filling a noise-blob (which mimics the oval mask silhouette),
+    we walk a zigzag path from one edge of the mask to the other — same
+    sharp-turn logic as the linear tear walker — then expose canvas on
+    whichever side of that line is smaller. The boundary between canvas and
+    intact paint is the jagged fracture line itself.
+    """
+    from scipy.ndimage import distance_transform_edt
+    _, H, W = out.shape
+    dev = out.device
+
+    active = mask >= 0.02
+    if not active.any():
+        return
+
+    canvas = _make_canvas_texture(H, W, dev, generator)
+
+    if torch.rand(1, generator=generator).item() < 0.40:
+        stain = 0.10 + torch.rand(1, generator=generator).item() * 0.25
+        canvas[0] = (canvas[0] - stain * 0.20).clamp(0, 1)
+        canvas[1] = (canvas[1] - stain * 0.35).clamp(0, 1)
+        canvas[2] = (canvas[2] - stain * 0.55).clamp(0, 1)
+
+    ys, xs = active.nonzero(as_tuple=True)
+    y_lo, y_hi = int(ys.min()), int(ys.max())
+    x_lo, x_hi = int(xs.min()), int(xs.max())
+
+    # Walk along the mask's longer axis.
+    horiz = (x_hi - x_lo) >= (y_hi - y_lo)
+    if horiz:
+        base_angle = 0.0
+        px = float(x_lo - 2)
+        py = float(ys.float().mean().item()) + (torch.rand(1, generator=generator).item() - 0.5) * (y_hi - y_lo) * 0.4
+    else:
+        base_angle = math.pi / 2
+        py = float(y_lo - 2)
+        px = float(xs.float().mean().item()) + (torch.rand(1, generator=generator).item() - 0.5) * (x_hi - x_lo) * 0.4
+
+    angle   = base_angle + (torch.rand(1, generator=generator).item() - 0.5) * 0.4
+    seg_rem = int(3 + torch.rand(1, generator=generator).item() * 6)
+    path_px, path_py = [px], [py]
+
+    max_walk = (x_hi - x_lo + y_hi - y_lo) * 4
+    for _ in range(max_walk):
+        seg_rem -= 1
+        if seg_rem <= 0:
+            turn_sign = 1.0 if torch.rand(1, generator=generator).item() > 0.5 else -1.0
+            angle += turn_sign * (0.55 + torch.rand(1, generator=generator).item() * 0.55)
+            seg_rem = int(3 + torch.rand(1, generator=generator).item() * 6)
+        else:
+            angle += (torch.rand(1, generator=generator).item() - 0.5) * 0.02
+
+        # Keep angle within ±75° of base so the walker actually traverses the mask.
+        dev_from_base = angle - base_angle
+        while dev_from_base >  math.pi: dev_from_base -= 2 * math.pi
+        while dev_from_base < -math.pi: dev_from_base += 2 * math.pi
+        angle = base_angle + max(-1.3, min(1.3, dev_from_base))
+
+        px += math.cos(angle) * 1.5
+        py += math.sin(angle) * 1.5
+        path_px.append(px)
+        path_py.append(py)
+        if horiz and px >= x_hi + 2:
+            break
+        if not horiz and py >= y_hi + 2:
+            break
+
+    # For each pixel, interpolate the fracture's perpendicular position at
+    # that pixel's main-axis coordinate, then determine which side it's on.
+    main_x, main_y =  math.cos(base_angle), math.sin(base_angle)
+    perp_x, perp_y = -math.sin(base_angle), math.cos(base_angle)
+
+    path_main = torch.tensor([x * main_x + y * main_y for x, y in zip(path_px, path_py)], device=dev)
+    path_perp = torch.tensor([x * perp_x + y * perp_y for x, y in zip(path_px, path_py)], device=dev)
+
+    sort_idx    = path_main.argsort()
+    s_main      = path_main[sort_idx]
+    s_perp      = path_perp[sort_idx]
+
+    y_grid = torch.arange(H, device=dev, dtype=torch.float32)
+    x_grid = torch.arange(W, device=dev, dtype=torch.float32)
+    Y, X   = torch.meshgrid(y_grid, x_grid, indexing='ij')
+    pix_main = (X * main_x + Y * main_y).reshape(-1)
+    pix_perp = (X * perp_x + Y * perp_y).reshape(-1)
+
+    bucket = torch.bucketize(pix_main, s_main).clamp(1, len(s_main) - 1)
+    t0 = s_main[bucket - 1];  t1 = s_main[bucket]
+    p0 = s_perp[bucket - 1];  p1 = s_perp[bucket]
+    frac      = ((pix_main - t0) / (t1 - t0 + 1e-6)).clamp(0, 1)
+    frac_perp = (p0 + frac * (p1 - p0)).reshape(H, W)
+
+    side_a = (pix_perp.reshape(H, W) >  frac_perp) & active
+    side_b = (pix_perp.reshape(H, W) <= frac_perp) & active
+    # Expose the smaller side (paint usually lifts from an edge inward).
+    exposed = side_a if side_a.sum() <= side_b.sum() else side_b
+    if not exposed.any():
+        exposed = active
+
+    dist_from_exposed = torch.from_numpy(
+        distance_transform_edt((~exposed).cpu().numpy())
+    ).to(dev).float()
+
+    rim_px = 5.0
+    rim = active & ~exposed & (dist_from_exposed <= rim_px)
+
+    for c in range(3):
+        out[c] = torch.where(exposed, canvas[c], out[c])
+
+    shadow = (0.20 + 0.80 * (dist_from_exposed / rim_px)).clamp(0, 1)
+    for c in range(3):
+        out[c] = torch.where(rim, out[c] * shadow, out[c])
+
+
 def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
                    generator: torch.Generator = None) -> torch.Tensor:
-    """Physical rip / tear — elongated dark opening with jagged edges.
+    """Physical rip / tear — elongated dark opening or large paint detachment.
 
     Approach:
-        1. Sample a start point INSIDE the mask blob.
-        2. Pick a shape mode:
-             - line (default, ~70%): bidirectional walk from the start.
-             - branched (~20%): bidirectional walk PLUS a sub-branch
-               coming off at a random perpendicular-ish angle — common
-               real-world feature when a tear forks around a weak spot.
-             - puncture (~10%): small irregular hole only, no elongation
-               — models a localized puncture / small detachment.
-        3. For each walked segment, paint a variable-width jagged opening
-           via `_walk_tear_spine` (see docstring there).
+        40%  detachment — large irregular region of paint completely removed,
+             exposing raw canvas texture (most visually distinct from a linear tear).
+        ~42% line — bidirectional walking spine from a point inside the mask.
+        ~12% branched — bidirectional walk plus a perpendicular sub-branch.
+        ~6%  puncture — small irregular hole only, no elongation.
 
-    Severity governs OPENING WIDTH, not darkness: small tears are thin
-    dark slits, large tears are wide dark gashes, and the interior color
-    is ≈ the same in both regimes.
+    Severity governs OPENING WIDTH for line/branched/puncture modes. The
+    detachment mode always fills the full mask region.
     """
     C, H, W = image.shape
     out = image.clone()
@@ -598,22 +725,10 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
     sev_scale = float(mask.max().item())
     sev_norm = max(0.0, min(1.0, (sev_scale - 0.3) / 0.7))
 
-    # Adaptive interior colour: tear exposes canvas/substrate beneath the paint.
-    # On dark backgrounds, black interior (0,0,0) is invisible; use canvas tone.
-    lum_field = image[0] * 0.299 + image[1] * 0.587 + image[2] * 0.114
-    active_w = (mask >= 0.02).float()
-    if active_w.sum().item() > 0:
-        mean_lum = float((lum_field * active_w).sum().item() / active_w.sum().item())
-    else:
-        mean_lum = 0.5
-    # Smooth blend: full canvas colour at lum=0, black at lum>=0.5.
-    # This catches mid-dark backgrounds (forest green, dark sky) that the
-    # old hard threshold at 0.30 missed.
-    c_r, c_g, c_b = _sample_canvas_color(image)
-    t_interior = max(0.0, min(1.0, (0.50 - mean_lum) / 0.50))
-    int_r = t_interior * c_r * 0.80
-    int_g = t_interior * c_g * 0.75
-    int_b = t_interior * c_b * 0.65
+    # Interior colour: near-black. A physical tear is a hole through the canvas
+    # — you're looking into darkness behind it, not at a substrate colour.
+    # The shadow/highlight bands at the edges provide visibility on dark paintings.
+    int_r, int_g, int_b = 0.03, 0.03, 0.03
 
     # Width scales with severity. Floor raised to 3.5px so a low-severity
     # tear renders as a clearly visible thin slit (the previous 2.5 was
@@ -632,8 +747,7 @@ def apply_rip_tear(image: torch.Tensor, mask: torch.Tensor,
     # one tear per component so a 2-region mask never renders with only
     # a single tear visible.
     components = _mask_component_centers(mask, min_val=0.02)
-    extra = int(torch.randint(0, 2, (1,), generator=generator).item())
-    num_tears = max(len(components), 1) + extra
+    num_tears = max(len(components), 1)
 
     # Reserve one index for a forced-line tear so at least one tear is
     # always an elongated slit — otherwise the RNG could pick puncture
@@ -956,10 +1070,10 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
     if not comp_data:
         return out
 
-    # Decide total scratch count, spread across components proportionally.
+    # Fewer scratches so each reads as a distinct swipe rather than texture.
     total_region = sum(d[0].shape[0] for d in comp_data)
-    base_count = max(len(comp_data) * 2, int(total_region / (H * W) * 200))
-    base_count += int(torch.randint(0, 3, (1,), generator=generator).item())
+    base_count = max(len(comp_data), int(total_region / (H * W) * 80))
+    base_count += int(torch.randint(0, 2, (1,), generator=generator).item())
     if max_count is not None:
         base_count = min(base_count, max(1, int(max_count)))
 
@@ -982,15 +1096,22 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             sx = int(comp_xs[idx].item())
             sy = int(comp_ys[idx].item())
 
-            angle = local_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.12
+            angle = local_angle + (torch.rand(1, generator=generator).item() - 0.5) * math.pi * 0.20
 
             comp_span = float(((comp_ys.max() - comp_ys.min()) ** 2 +
                                (comp_xs.max() - comp_xs.min()) ** 2) ** 0.5)
             scratch_len = max(30, int(comp_span * (0.4 + torch.rand(1, generator=generator).item() * 0.6)))
             scratch_len = min(scratch_len, max(H, W))
 
-            width = 2 if torch.rand(1, generator=generator).item() < 0.6 else 3
-            half_w = width // 2
+            width_r = torch.rand(1, generator=generator).item()
+            if width_r < 0.15:
+                half_w = 0   # 1px hairline
+            elif width_r < 0.50:
+                half_w = 1   # 3px
+            elif width_r < 0.80:
+                half_w = 2   # 5px
+            else:
+                half_w = 3   # 7px gouge
             alpha = 0.60 + torch.rand(1, generator=generator).item() * 0.30
 
             # Small chance of a burnished (bright) scratch for variety,
@@ -1008,11 +1129,13 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
             # stays tight around the input band.
             px, py2 = float(sx), float(sy)
             step_size = 1.5
-            max_step_curve = 0.15 / max(40.0, float(scratch_len))
+            max_step_curve = 1.2 / max(40.0, float(scratch_len))
             curvature = (torch.rand(1, generator=generator).item() - 0.5) * max_step_curve
+            curvature_drift = (torch.rand(1, generator=generator).item() - 0.5) * max_step_curve * 0.25
             outside_streak = 0
 
             for step_i in range(scratch_len):
+                curvature += curvature_drift
                 angle += curvature
                 px += math.cos(angle) * step_size
                 py2 += math.sin(angle) * step_size
@@ -1030,11 +1153,13 @@ def apply_scratches(image: torch.Tensor, mask: torch.Tensor,
                 outside_streak = 0
 
                 t = step_i / max(1, scratch_len - 1)
-                taper = max(0.35, 1.0 - (2.0 * t - 1.0) ** 2)
+                taper = max(0.75, 1.0 - (2.0 * t - 1.0) ** 4)
                 a = min(1.0, alpha * sev_opacity * taper)
 
                 for dy in range(-half_w, half_w + 1):
                     for dx in range(-half_w, half_w + 1):
+                        if half_w >= 2 and dx * dx + dy * dy > half_w * half_w:
+                            continue  # circular brush for wider marks
                         nx, ny = ix + dx, iy + dy
                         if 0 <= nx < W and 0 <= ny < H:
                             out[0, ny, nx] = out[0, ny, nx] * (1 - a) + scratch_r * a
