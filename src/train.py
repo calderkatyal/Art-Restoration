@@ -56,6 +56,7 @@ import random
 import re
 import os
 import time
+import traceback
 from pathlib import Path
 from typing import Any, Optional
 
@@ -75,6 +76,7 @@ from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
 from .utils import (
+    checkpoint_tags_desc,
     fixed_inference_indices,
     gather_inference_panels,
     load_config,
@@ -82,6 +84,10 @@ from .utils import (
     overlay_mask_boundaries,
     print_training_phase,
     print_vram_debug,
+    summarize_saved_next_sampler_batch,
+    summarize_next_sampler_batch,
+    summarize_runtime_loader_progress,
+    summarize_train_loader_state,
     wandb_log_images_num,
 )
 from .vae import FluxVAE
@@ -136,7 +142,8 @@ def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
         metrics: Dict of scalar names to floats, e.g. ``{"train/loss": 0.04}``.
         step:    Global optimizer step used as the WandB x-axis.
         images:  Optional mapping from run key to ``(B, 3, H, W)`` tensors in ``[0,1]``.
-                 Each value is turned into a ``wandb.Image`` grid via ``make_grid``.
+                 Each value is turned into a ``wandb.Image`` grid via ``make_grid`` with
+                 a caption that includes the global step.
     """
     if not _WANDB_ACTIVE:
         return
@@ -149,7 +156,10 @@ def wandb_log(metrics: dict, step: int, images: dict | None = None) -> None:
             if tensor is None:
                 continue
             grid = make_grid(tensor.detach().cpu(), nrow=min(4, tensor.shape[0]))
-            payload[name] = wandb.Image(grid.permute(1, 2, 0).numpy())
+            payload[name] = wandb.Image(
+                grid.permute(1, 2, 0).numpy(),
+                caption=f"{name} global_step={step}",
+            )
     wandb.log(payload, step=step)
 
 
@@ -778,11 +788,6 @@ def _capture_train_loader_state(
     train_dataset: ArtRestorationDataset,
     train_sampler: Any,
 ) -> dict[str, Any]:
-    if hasattr(train_loader, "state_dict"):
-        return {
-            "mode": "loader",
-            "loader": train_loader.state_dict(),
-        }
     state: dict[str, Any] = {"mode": "manual"}
     if hasattr(train_sampler, "state_dict"):
         state["sampler"] = train_sampler.state_dict()
@@ -799,14 +804,17 @@ def _restore_train_loader_state(
 ) -> bool:
     if not state:
         return False
-    if state.get("mode") == "loader" and hasattr(train_loader, "load_state_dict"):
+    if state.get("mode") == "loader" and "loader" in state and hasattr(train_loader, "load_state_dict"):
         train_loader.load_state_dict(state["loader"])
         return True
+    restored = False
     if "sampler" in state and hasattr(train_sampler, "load_state_dict"):
         train_sampler.load_state_dict(state["sampler"])
+        restored = True
     if "dataset" in state and hasattr(train_dataset, "load_state_dict"):
         train_dataset.load_state_dict(state["dataset"])
-    return True
+        restored = True
+    return restored
 
 
 def _build_train_loader(
@@ -868,36 +876,22 @@ def _build_val_loader(
     return loader, dataset, sampler
 
 
-def _latest_checkpoint_tag(checkpoint_dir: Path) -> str | None:
-    """Return most recent ``step_*`` checkpoint tag under ``checkpoint_dir``."""
-    if not checkpoint_dir.exists():
-        return None
-    candidates = [p for p in checkpoint_dir.iterdir() if p.is_dir() and p.name.startswith("step_")]
-    if not candidates:
-        return None
-
-    def key_fn(path: Path) -> tuple[int, float]:
-        try:
-            step = int(path.name.split("_", 1)[1])
-        except (IndexError, ValueError):
-            step = -1
-        return (step, path.stat().st_mtime)
-
-    return max(candidates, key=key_fn).name
-
-
-def _resolve_checkpoint_strategy(cfg: DictConfig) -> tuple[str | None, str | None]:
-    """Choose one loading source: explicit resume, latest checkpoint, or pretrained."""
+def _checkpoint_load_attempts(cfg: DictConfig, run_name: str) -> list[tuple[str, str, str]]:
+    """Return ordered checkpoint load attempts with a short human label."""
     resume_from = cfg.train.get("resume_from")
     if resume_from and str(resume_from) != "from_scratch":
         rp = Path(str(resume_from))
-        return str(rp.parent), rp.name
+        return [(str(rp.parent), rp.name, "requested checkpoint")]
 
-    ckpt_dir = _checkpoint_dir_for_run(cfg, _resolve_inspect_run_name(cfg))
-    tag = _latest_checkpoint_tag(ckpt_dir)
-    if tag is None:
-        return None, None
-    return str(ckpt_dir), tag
+    ckpt_dir = _checkpoint_dir_for_run(cfg, run_name)
+    tags = checkpoint_tags_desc(ckpt_dir)
+    if not tags:
+        return []
+
+    attempts = [(str(ckpt_dir), tags[0], "latest checkpoint")]
+    if len(tags) > 1:
+        attempts.append((str(ckpt_dir), tags[1], "second latest checkpoint"))
+    return attempts
 
 
 def main(cfg: DictConfig) -> None:
@@ -935,11 +929,12 @@ def main(cfg: DictConfig) -> None:
     if is_main_process():
         _checkpoint_dir_for_run(cfg, run_name).mkdir(parents=True, exist_ok=True)
 
-    load_dir, load_tag = _resolve_checkpoint_strategy(cfg)
-    should_try_checkpoint = load_dir is not None and load_tag is not None
+    checkpoint_attempts = _checkpoint_load_attempts(cfg, run_name)
+    should_try_checkpoint = bool(checkpoint_attempts)
+    load_dir, load_tag, load_label = checkpoint_attempts[0] if should_try_checkpoint else (None, None, None)
     checkpoint_path = str(Path(load_dir) / load_tag) if should_try_checkpoint else None
     if should_try_checkpoint and is_main_process():
-        log_message(f"[model] will restore training state from checkpoint {checkpoint_path}")
+        log_message(f"[model] will restore training state from {load_label} {checkpoint_path}")
     initial_step_hint = _step_from_tag(load_tag)
     warmup_only = _warmup_only_for_step(cfg, initial_step_hint)
 
@@ -992,33 +987,74 @@ def main(cfg: DictConfig) -> None:
     last_save_step = 0
     restored_train_state = False
     last_logged_step = 0
-    warmup_only = _apply_training_phase(flow_model, optimizer, scheduler, cfg, step=global_step)
 
     # --- Single-source load policy: checkpoint OR pretrained; fallback to pretrained on errors ---
     if should_try_checkpoint:
-        try:
-            _, client = engine.load_checkpoint(load_dir, tag=load_tag)
-            if client:
+        checkpoint_loaded = False
+        for attempt_idx, (attempt_dir, attempt_tag, attempt_label) in enumerate(checkpoint_attempts):
+            attempt_path = str(Path(attempt_dir) / attempt_tag)
+            if attempt_idx > 0 and is_main_process():
+                log_message(f"[model] retrying restore from {attempt_label} {attempt_path}")
+            try:
+                _, client = engine.load_checkpoint(attempt_dir, tag=attempt_tag)
+                if not client:
+                    raise RuntimeError("DeepSpeed returned empty client_state while loading checkpoint.")
+
                 start_epoch = int(client.get("epoch", 0))
                 global_step = int(client.get("step", 0))
                 images_since_save = int(client.get("images_since_save", 0))
                 last_save_step = global_step
+                saved_loader_state = client.get("train_loader_state")
+                if is_main_process():
+                    log_message(
+                        f"[resume] checkpoint counters from {attempt_label}: "
+                        f"epoch={start_epoch} global_step={global_step} "
+                        f"images_since_save={images_since_save}"
+                    )
+                    log_message(
+                        f"[resume] saved dataloader state from {attempt_label}: "
+                        f"{summarize_train_loader_state(saved_loader_state)}"
+                    )
+                    log_message(
+                        f"[resume] expected next local batch from checkpoint: "
+                        f"{summarize_saved_next_sampler_batch(train_dataset, train_sampler, saved_loader_state.get('sampler'), _micro_batch_size(cfg))}"
+                    )
                 restored_train_state = _restore_train_loader_state(
                     train_loader,
                     train_dataset,
                     train_sampler,
-                    client.get("train_loader_state"),
+                    saved_loader_state,
                 )
+                checkpoint_loaded = True
                 if is_main_process():
-                    log_message(f"[train] Loaded checkpoint tag '{load_tag}' from '{load_dir}'.")
-                    log_message(f"[model] restored model weights from checkpoint {checkpoint_path}")
-            else:
-                raise RuntimeError("DeepSpeed returned empty client_state while loading checkpoint.")
-        except Exception as exc:
+                    log_message(f"[train] Loaded {attempt_label} tag '{attempt_tag}' from '{attempt_dir}'.")
+                    log_message(f"[model] restored model weights from {attempt_label} {attempt_path}")
+                    log_message(
+                        f"[resume] dataloader restore "
+                        f"{'succeeded' if restored_train_state else 'was skipped'}: "
+                        f"{summarize_runtime_loader_progress(train_dataset, train_sampler)}"
+                    )
+                    log_message(
+                        f"[resume] next local batch after restore: "
+                        f"{summarize_next_sampler_batch(train_dataset, train_sampler, _micro_batch_size(cfg))}"
+                    )
+                break
+            except Exception as exc:
+                if is_main_process():
+                    log_message(
+                        f"[train] Failed to load {attempt_label} at {attempt_path}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    log_message(f"[train] checkpoint load traceback for {attempt_label}:\n{traceback.format_exc().rstrip()}")
+                    if attempt_idx + 1 < len(checkpoint_attempts):
+                        next_dir, next_tag, next_label = checkpoint_attempts[attempt_idx + 1]
+                        next_path = str(Path(next_dir) / next_tag)
+                        log_message(
+                            f"[train] Will try {next_label} next: {next_path}"
+                        )
+        if not checkpoint_loaded:
             if is_main_process():
-                log_message(
-                    f"[train] Checkpoint load failed ({exc}); falling back to pretrained weights."
-                )
+                log_message("[train] All checkpoint restore attempts failed; falling back to pretrained weights.")
             _unwrap_model(engine).load_pretrained_backbone(
                 cfg.model.flux_model_name, rank=rank
             )
@@ -1056,6 +1092,11 @@ def main(cfg: DictConfig) -> None:
 
         if not resumed_epoch and train_sampler is not None:
             train_sampler.set_epoch(epoch)
+        elif resumed_epoch and is_main_process():
+            log_message(
+                f"[resume] continuing mid-epoch with restored sampler position: "
+                f"{summarize_runtime_loader_progress(train_dataset, train_sampler)}"
+            )
         if val_sampler is not None:
             val_sampler.set_epoch(epoch)
 
@@ -1122,6 +1163,11 @@ def main(cfg: DictConfig) -> None:
                     images_since_save = 0
 
             if do_save and global_step != last_save_step:
+                if is_main_process():
+                    log_message(
+                        f"[checkpoint] next local batch after save at step={global_step}: "
+                        f"{summarize_next_sampler_batch(train_dataset, train_sampler, _micro_batch_size(cfg))}"
+                    )
                 client_state = {
                     "step": global_step,
                     "epoch": epoch,

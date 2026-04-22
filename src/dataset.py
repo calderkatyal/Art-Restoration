@@ -318,11 +318,6 @@ class DistributedStatefulEpochSampler(Sampler[int]):
                 "num_replicas changed between save and resume. "
                 f"Saved={state_dict['num_replicas']} current={self.num_replicas}."
             )
-        if int(state_dict["rank"]) != self.rank:
-            raise ValueError(
-                "rank changed between save and resume. "
-                f"Saved={state_dict['rank']} current={self.rank}."
-            )
         if bool(state_dict["drop_last"]) != self.drop_last:
             raise ValueError(
                 "drop_last changed between save and resume. "
@@ -338,6 +333,10 @@ class DistributedStatefulEpochSampler(Sampler[int]):
         self.position = int(state_dict["position"])
         self.shuffle = bool(state_dict["shuffle"])
         self.seed = int(state_dict["seed"])
+        # Treat rank as runtime-local state. DeepSpeed client_state comes from a single
+        # checkpoint payload, so all ranks may observe the same saved sampler snapshot.
+        # Epoch/position/seed should be shared across ranks, while ``self.rank`` must
+        # remain the current process rank so each worker resumes its own shard.
         self.num_samples = current_num_samples
         self.total_size = self.num_samples * self.num_replicas
         self._cached_epoch = None
