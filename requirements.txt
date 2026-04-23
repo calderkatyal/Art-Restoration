@@ -10,3 +10,4 @@ tqdm>=4.65.0
 omegaconf>=2.3.0
 wandb>=0.17.0
 deepspeed>=0.14.0
+gradio>=4.36.0
