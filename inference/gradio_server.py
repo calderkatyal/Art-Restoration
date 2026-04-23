@@ -404,15 +404,15 @@ class GradioApp:
 
     # -- UI ------------------------------------------------------------------
 
+    # theme / css are passed to launch() in Gradio 6.0+, not Blocks().
+    THEME = gr.themes.Soft(primary_hue="emerald", neutral_hue="slate")
+    CSS = (
+        ".gradio-container { max-width: 1600px !important; } "
+        "#mask-editor canvas { background: #1a1a1a; }"
+    )
+
     def build_ui(self) -> gr.Blocks:
-        with gr.Blocks(
-            title="Art Restoration",
-            theme=gr.themes.Soft(primary_hue="emerald", neutral_hue="slate"),
-            css="""
-            .gradio-container { max-width: 1600px !important; }
-            #mask-editor canvas { background: #1a1a1a; }
-            """,
-        ) as demo:
+        with gr.Blocks(title="Art Restoration") as demo:
             state = gr.State()
 
             gr.Markdown(
@@ -561,11 +561,17 @@ def main() -> None:
     device = args.device or cfg.inference.get("device", "cuda")
     app = GradioApp(cfg=cfg, checkpoint=args.checkpoint, device=device)
     demo = app.build_ui()
+    log_message(
+        f"[gradio] launching on http://{args.host}:{args.port} "
+        f"(share={args.share}); look for 'Running on ... URL' below"
+    )
     demo.launch(
         server_name=args.host,
         server_port=args.port,
         share=bool(args.share),
         show_error=True,
+        theme=GradioApp.THEME,
+        css=GradioApp.CSS,
     )
 
 
