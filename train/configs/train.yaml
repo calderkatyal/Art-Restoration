@@ -10,12 +10,12 @@ model:
   spatial_compression: 16      # 8x encoder downsample * 2x patchify
   in_channels: 264             # 128 (z_t) + 128 (z_y) + 8 (mask: 7 types + union)
   hidden_size: 3072
-  null_emb_path: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/null_emb/null_text_emb.pt"
+  null_emb_path: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/null_emb.pt"  
 
 train:
-  train_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/train"
-  val_dir: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/data/val"
-  checkpoint_root: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/checkpoints"
+  train_dir: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/data/train" 
+  val_dir: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/data/val" 
+  checkpoint_root: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/checkpoints" 
   resolution: 512
   batch_size: 32
   gradient_checkpointing: true
@@ -29,12 +29,12 @@ train:
   num_epochs: 10
   seed: 42
   debug_vram: true
-  warmup_iterations: 317
-  save_every: 50
-  val_every: 50
-  log_every: 3
-  inspect_data_every: 1 
-  inspect_data_root: "/nfs/roberts/project/cpsc4520/cpsc4520_ckk25/inspect_train_data/"
+  warmup_iterations: 633
+  save_every: 100
+  val_every: 100
+  log_every: 5
+  inspect_data_every: 100
+  inspect_data_root: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/inspect_data" 
   loss_weight_mask: 0.7
   resume_from: null
 
@@ -69,10 +69,10 @@ wandb:
   enabled: true
   project: "V1 Training"
   entity: "cpsc4520_final_project"
-  run_name: "first_run"          # null = auto-generated
+  run_name: "fixed_inference_4_21_4_22_unfixed_corruption_module"          
   tags: []                
   log_images: true
-  log_images_every: 50
+  log_images_every: 100
   log_images_num: 16
 
 # DeepSpeed launcher config. Consumed by deepspeed.initialize(config=cfg.ds_config).
@@ -82,7 +82,7 @@ ds_config:
   train_micro_batch_size_per_gpu: 32
   gradient_accumulation_steps: 1
   gradient_clipping: 1.0
-  steps_per_print: 50
+  steps_per_print: 100
   bf16:
     enabled: true
   zero_optimization:
@@ -91,3 +91,4 @@ ds_config:
     contiguous_gradients: true
     reduce_bucket_size: 500000000
     allgather_bucket_size: 500000000
+
