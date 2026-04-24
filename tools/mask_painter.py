@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, parse_qs
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 try:
     import torch
@@ -54,18 +54,45 @@ CHANNELS = [
     ("scratches",  (220, 100, 220)),
 ]
 NUM_CHANNELS = len(CHANNELS)
+# Total output channels saved to disk: NUM_CHANNELS per-type + 1 union channel.
+# Matches src.corruption.OUTPUT_MASK_CHANNELS.
+OUTPUT_MASK_CHANNELS = NUM_CHANNELS + 1
 OVERLAY_ALPHA = 0.45
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+DEFAULT_RESOLUTION = 512
+
+
+def _resize_for_painting(img: Image.Image, resolution: int) -> Image.Image:
+    """Center-crop to square and resize to ``resolution x resolution``.
+
+    Mirrors ``src.dataset._crop_resize_to_tensor`` so the image the user paints
+    over is pixel-aligned with what the model sees during training / inference.
+    The original file on disk is NOT modified.
+    """
+    img = ImageOps.exif_transpose(img).convert("RGB")
+    w, h = img.size
+    crop = min(w, h)
+    top = max((h - crop) // 2, 0)
+    left = max((w - crop) // 2, 0)
+    img = img.crop((left, top, left + crop, top + crop))
+    return img.resize((int(resolution), int(resolution)), Image.BICUBIC)
 
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 
 class ServerState:
-    def __init__(self, images: List[Path], output_dir: Path, config_path: Optional[Path]):
+    def __init__(
+        self,
+        images: List[Path],
+        output_dir: Path,
+        config_path: Optional[Path],
+        resolution: int = DEFAULT_RESOLUTION,
+    ):
         self.images = images
         self.output_dir = output_dir
         self.config_path = config_path
+        self.resolution = int(resolution)
         self.finalized: Dict[int, bool] = {i: False for i in range(len(images))}
         # masks[image_id][channel_idx] = base64 encoded PNG data (or None)
         self.masks: Dict[int, Dict[int, Optional[str]]] = {
@@ -908,14 +935,20 @@ class MaskPainterHandler(BaseHTTPRequestHandler):
                 self._send_error(404, "Image not found")
                 return
             img_path = STATE.images[img_id]
-            mime = mimetypes.guess_type(str(img_path))[0] or "image/jpeg"
+            # Serve the resized (resolution x resolution) square version so the
+            # client paints masks in the same pixel grid the model consumes.
+            # The original file on disk is NOT modified.
             try:
-                data = img_path.read_bytes()
+                with Image.open(img_path) as src:
+                    resized = _resize_for_painting(src, STATE.resolution)
+                buf = io.BytesIO()
+                resized.save(buf, format="PNG")
+                data = buf.getvalue()
             except Exception as e:
                 self._send_error(500, str(e))
                 return
             self.send_response(200)
-            self.send_header("Content-Type", mime)
+            self.send_header("Content-Type", "image/png")
             self.send_header("Content-Length", str(len(data)))
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
@@ -985,30 +1018,39 @@ class MaskPainterHandler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def save_all_masks(state: ServerState):
-    """Save all masks to disk and update config."""
+    """Save all masks to disk and update config.
+
+    Masks are stored at ``state.resolution x state.resolution`` — the same pixel
+    grid the client paints on and the model consumes. The saved tensor has
+    shape ``(OUTPUT_MASK_CHANNELS, R, R)``: NUM_CHANNELS per-type channels
+    followed by a union channel (pixel-wise max), matching
+    :data:`src.corruption.OUTPUT_MASK_CHANNELS`.
+    """
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    R = int(state.resolution)
 
     for img_id, img_path in enumerate(state.images):
         stem = img_path.stem
         img_dir = state.output_dir / stem
         img_dir.mkdir(parents=True, exist_ok=True)
 
-        # Load original image for overlay
-        orig = Image.open(img_path).convert("RGB")
-        img_w, img_h = orig.size
+        # Resized (in-memory) copy of the source; original file on disk is untouched.
+        with Image.open(img_path) as src:
+            resized = _resize_for_painting(src, R)
 
         mask_arrays = []
         for ch in range(NUM_CHANNELS):
             mask_data = state.masks[img_id].get(ch)
             if mask_data is not None and isinstance(mask_data, tuple):
                 arr, w, h = mask_data
-                # Resize if needed
-                if w != img_w or h != img_h:
-                    mask_img = Image.fromarray(arr * 255).resize((img_w, img_h), Image.NEAREST)
+                # Client painted at the resolution we served. If (somehow) the
+                # size disagrees, resample with nearest so mask pixels remain {0, 1}.
+                if w != R or h != R:
+                    mask_img = Image.fromarray(arr * 255).resize((R, R), Image.NEAREST)
                     arr = (np.array(mask_img) > 127).astype(np.uint8)
                 mask_arrays.append(arr)
             else:
-                mask_arrays.append(np.zeros((img_h, img_w), dtype=np.uint8))
+                mask_arrays.append(np.zeros((R, R), dtype=np.uint8))
 
         # Save individual PNGs
         for ch in range(NUM_CHANNELS):
@@ -1016,8 +1058,12 @@ def save_all_masks(state: ServerState):
             png_path = img_dir / f"mask_{name}.png"
             Image.fromarray(mask_arrays[ch] * 255).save(png_path)
 
-        # Save combined tensor
-        stacked = np.stack(mask_arrays, axis=0).astype(np.float32)
+        # Save combined tensor with the union channel appended.
+        per_channel = np.stack(mask_arrays, axis=0).astype(np.float32)
+        union = per_channel.max(axis=0, keepdims=True)
+        stacked = np.concatenate([per_channel, union], axis=0)  # (8, R, R)
+        # Union channel PNG for visual debugging.
+        Image.fromarray((union[0] * 255).astype(np.uint8)).save(img_dir / "mask_union.png")
         if torch is not None:
             tensor = torch.from_numpy(stacked)
             torch.save(tensor, img_dir / "masks.pt")
@@ -1025,8 +1071,8 @@ def save_all_masks(state: ServerState):
             np.save(img_dir / "masks.npy", stacked)
             print(f"  Warning: torch not available, saved {stem}/masks.npy instead of .pt")
 
-        # Save overlay
-        overlay = np.array(orig, dtype=np.float32)
+        # Save overlay against the RESIZED image so mask and image are aligned.
+        overlay = np.array(resized, dtype=np.float32)
         for ch in range(NUM_CHANNELS):
             mask = mask_arrays[ch].astype(np.float32)
             if mask.max() == 0:
@@ -1123,12 +1169,18 @@ def main():
         "--port", type=int, default=0,
         help="Port to run server on (default: auto-select).",
     )
+    parser.add_argument(
+        "--resolution", type=int, default=None,
+        help=f"Resize images to this square size before painting "
+             f"(default: inference.yaml.inference.resolution or {DEFAULT_RESOLUTION}).",
+    )
     args = parser.parse_args()
 
     # Determine images and output dir
     image_paths = []
     output_dir = Path(args.output_dir)
     config_path = None
+    resolution = DEFAULT_RESOLUTION
 
     if args.config:
         config_path = Path(args.config)
@@ -1144,6 +1196,7 @@ def main():
             config = yaml.safe_load(f)
 
         inference_cfg = config.get("inference", {})
+        resolution = int(inference_cfg.get("resolution", DEFAULT_RESOLUTION))
         input_dir = Path(inference_cfg.get("input_dir", "./data/test"))
 
         # Resolve relative paths to CWD (not config file location)
@@ -1174,11 +1227,16 @@ def main():
         print("Error: Provide --config or --images")
         sys.exit(1)
 
+    # Explicit CLI --resolution wins over whatever the config said.
+    if args.resolution is not None:
+        resolution = int(args.resolution)
+
     print(f"Found {len(image_paths)} images:")
     for p in image_paths:
         print(f"  {p.name}")
+    print(f"Serving / saving masks at resolution {resolution}x{resolution}.")
 
-    STATE = ServerState(image_paths, output_dir, config_path)
+    STATE = ServerState(image_paths, output_dir, config_path, resolution=resolution)
 
     port = args.port if args.port else find_free_port()
     server = HTTPServer(("0.0.0.0", port), MaskPainterHandler)

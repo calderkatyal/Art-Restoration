@@ -46,3 +46,4 @@ Thumbs.db
 .idea/
 *.png
 *.jpg
+inference/scripts/gradio.sh
