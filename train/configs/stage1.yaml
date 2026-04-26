@@ -1,0 +1,70 @@
+# Stage 1: damage generator G + PatchGAN discriminator D.
+#
+# Loaded by ``src.stage1.train`` via OmegaConf. CLI dot-notation overrides:
+#   torchrun --nproc_per_node=4 -m src.stage1.train \
+#       --config train/configs/stage1.yaml \
+#       train.batch_size=8 train.total_steps=200000
+
+model:
+  g_base_channels: 64
+  noise_dim: 128
+  delta_scale: 1.0       # max |delta| added to clean image (output clamped to [-1, 1])
+  d_base_channels: 64
+  d_n_layers: 3
+  d_num_scales: 2
+
+data:
+  # Paintings only — used as G inputs and as the clean target distribution
+  # the Stage 2 model must restore back to.
+  clean_dirs:
+    - "/home/ckk25/project_pi_jl2994/ckk25/data/train"
+  # Real damaged images used as positive samples for D. Mix substrates: paintings
+  # (ARTeFACT subset), murals (MuralDH), old photos (Real-Old / LoC) — physical
+  # damage modes (cracks, fading, stains, tears) transfer across substrates.
+  damaged_dirs:
+    - "/home/ckk25/project_pi_jl2994/ckk25/data/damaged/artefact"
+    - "/home/ckk25/project_pi_jl2994/ckk25/data/damaged/muraldh"
+    - "/home/ckk25/project_pi_jl2994/ckk25/data/damaged/old_photos"
+
+train:
+  resolution: 256
+  batch_size: 16
+  total_steps: 200000
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 4
+  seed: 42
+  log_every: 20
+  sample_every: 200
+  save_every: 2000
+  keep_last_checkpoints: 3
+  checkpoint_root: "/home/ckk25/project_pi_jl2994/ckk25/checkpoints/stage1"
+  resume_from: null
+
+  optimizer:
+    g_lr: 1.0e-4
+    d_lr: 4.0e-4         # TTUR: D learns faster than G (Heusel et al. 2017)
+    betas: [0.5, 0.9]
+    weight_decay: 0.0
+
+  loss:
+    adv_weight: 1.0
+    content_weight: 10.0   # shallow LPIPS — preserve composition while letting damage textures change
+    diversity_weight: 1.0  # mode-seeking term — encourages G to use noise vector
+    g_steps_per_d: 1
+
+  content:
+    lpips_net: "vgg"        # "vgg" | "alex" | "squeeze"
+    # Only the early VGG conv blocks contribute to content loss so G can change
+    # color / damage texture freely while preserving spatial composition.
+    # Set to "all" or null to use full LPIPS distance.
+    layer_indices: [0, 1]
+
+wandb:
+  enabled: true
+  project: "art-restoration-stage1"
+  entity: "cpsc4520_final_project"
+  run_name: "stage1_damage_gan_v1"
+  tags: ["stage1", "damage-gan"]
+  log_images_num: 8
