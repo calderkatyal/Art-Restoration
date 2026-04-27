@@ -1,0 +1,75 @@
+# Config for learned corruption GAN (pix2pix: clean painting → realistically damaged painting).
+#
+# Architecture:
+#   Generator:     8-level U-Net, 512×512 → 512×512, ~54M params
+#   Discriminator: 70×70 PatchGAN, ~2.8M params
+#
+# Training set: Kaggle "pes1ug22am047/damaged-and-undamaged-artworks"
+#   paired_dataset_art/  (~109 usable pairs after filename matching)
+#   Train/val split: 85% / 15% (configurable via train.val_fraction)
+#
+# Visualisation during training:
+#   - val/l1_loss: reconstruction quality on held-out pairs
+#   - inference/wikiart_panels: [clean | generated_damage | diff] on WikiArt images
+#   - inference/val_pair_panels: [clean | real_damaged | generated_damage] on val pairs
+#
+# Usage:
+#   torchrun --nproc_per_node=NUM_GPUS -m src.corruption_gan.train \
+#       --config train/configs/train_corruption_gan.yaml [overrides]
+
+model:
+  generator_base_filters: 64      # 64 → ~54M params; reduce to 32 to save VRAM
+  discriminator_base_filters: 64
+
+train:
+  # --- paths (cluster) ---
+  # Root of the extracted Kaggle dataset: AI_for_Art_Restoration_2/
+  data_root: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/data/damaged_artworks/AI_for_Art_Restoration_2"
+  # WikiArt val split (same directory used by src.train) — for corruption visualisation
+  wikiart_val_dir: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/data/val"
+  checkpoint_root: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/checkpoints"
+
+  # --- training ---
+  resolution: 512
+  batch_size: 4           # per-GPU; 4×4 GPUs = 16 global (fine for ~109 pairs)
+  num_epochs: 400         # many epochs because dataset is small; augmentation varies each epoch
+  val_fraction: 0.15      # ~16 pairs held out for validation
+  lambda_l1: 100.0        # standard pix2pix L1 weight
+  gradient_clipping: 1.0
+
+  # --- checkpointing / logging cadence ---
+  save_every: 200         # save checkpoint every N optimizer steps
+  val_every: 100          # validate every N steps
+  log_every: 10           # log scalars every N steps
+  resume_from: null       # set to e.g. "/path/to/checkpoints/<run>/step_1000" to resume
+
+  # --- data loading ---
+  num_workers: 4
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+  # --- misc ---
+  seed: 42
+  debug_vram: false
+
+  optimizer:
+    lr_generator:     2.0e-4   # standard pix2pix LR
+    lr_discriminator: 2.0e-4
+    betas: [0.5, 0.999]        # pix2pix uses 0.5 not 0.9
+    weight_decay: 0.0
+
+  scheduler:
+    warmup_steps: 50
+    min_lr: 1.0e-6
+    # max_steps: leave unset to use total_optimizer_steps (num_epochs * steps_per_epoch)
+
+wandb:
+  enabled: true
+  project: "art-corruption-gan"
+  entity: "cpsc4520_final_project"
+  run_name: "corruption_gan_v1"
+  tags: ["pix2pix", "corruption-module"]
+  log_images: true
+  log_images_every: 200   # log image panels every N steps
+  log_images_num: 8       # number of WikiArt panels to visualise
