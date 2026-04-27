@@ -59,15 +59,18 @@ def _iter_images(directory: Path) -> List[Path]:
 
 
 def _stem_to_after(stem: str) -> str:
-    """Replace the first occurrence of 'before' (any case) with the same-case 'after'."""
-    def _replace(m: re.Match) -> str:
-        s = m.group(0)
-        if s.isupper():
-            return "AFTER"
-        if s[0].isupper():
-            return "After"
-        return "after"
-    return re.sub(r"(?i)before", _replace, stem, count=1)
+    """Replace the LAST occurrence of 'before' (any case) with the same-case 'after'.
+
+    Uses last occurrence so names like 'Before-and-after-X-before' correctly
+    become 'Before-and-after-X-after' rather than 'After-and-after-X-before'.
+    """
+    matches = list(re.finditer(r"(?i)before", stem))
+    if not matches:
+        return stem
+    m = matches[-1]
+    s = m.group(0)
+    replacement = "AFTER" if s.isupper() else ("After" if s[0].isupper() else "after")
+    return stem[: m.start()] + replacement + stem[m.end() :]
 
 
 def _find_undamaged(damaged_path: Path, undamaged_dir: Path) -> Optional[Path]:
