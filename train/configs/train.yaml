@@ -29,18 +29,18 @@ train:
   num_epochs: 10
   seed: 42
   debug_vram: true
-  warmup_iterations: 633
+  warmup_iterations: 300
   save_every: 100
   val_every: 100
   log_every: 5
   inspect_data_every: 100
   inspect_data_root: "/nfs/roberts/home/ckk25/project_pi_jl2994/ckk25/inspect_data" 
-  loss_weight_mask: 0.7
+  loss_weight_mask: 0.8
   resume_from: null
 
   optimizer:
     weight_decay: 0.01
-    betas: [0.9, 0.999]
+    betas: [0.9, 0.95]
 
   scheduler:
     warmup_steps: 100
@@ -50,7 +50,7 @@ train:
     lr: 1e-4
 
   full:
-    backbone_lr: 1e-5
+    backbone_lr: 5e-5
     img_in_lr: 1e-4
 
 # Corruption pipeline — reference to a separate YAML loaded and merged
@@ -69,7 +69,7 @@ wandb:
   enabled: true
   project: "V1 Training"
   entity: "cpsc4520_final_project"
-  run_name: "fixed_inference_4_21_4_22_unfixed_corruption_module"          
+  run_name: "even_higher_lr_4_22_23"
   tags: []                
   log_images: true
   log_images_every: 100
@@ -91,4 +91,3 @@ ds_config:
     contiguous_gradients: true
     reduce_bucket_size: 500000000
     allgather_bucket_size: 500000000
-
