@@ -86,6 +86,16 @@ inference/
 pip install -r requirements.txt
 ```
 
+For Gradio inference, the quickest path is:
+
+```bash
+bash setup.sh
+python inference/gradio_server.py --config inference/configs/inference.yaml
+```
+
+If the setup script tells you Hugging Face authentication is required for your model
+repo or the FLUX VAE assets, run `hf auth login` and then rerun the setup script.
+
 Download datasets and place them at the paths set in `train/configs/train.yaml`:
 
 - **Training**: [WikiArt](https://www.kaggle.com/datasets/steubk/wikiart) → `./data/wikiart/`
@@ -123,8 +133,25 @@ Settings are split by task:
 
 ### Launch the Gradio restoration UI
 
+The setup script installs the Python dependencies into your active environment, downloads
+the checkpoint and null embedding named in `inference/configs/inference.yaml`, and
+prefetches the FLUX VAE cache when possible.
+
+```bash
+bash setup.sh
+```
+
+Then launch the server from the repo root:
+
 ```bash
 python inference/gradio_server.py --config inference/configs/inference.yaml
+```
+
+`setup.sh` defaults to downloading from `CalderKat/PaintingRestoration`. To override that,
+pass a different Hugging Face repo:
+
+```bash
+bash setup.sh <your-hf-model-repo>
 ```
 
 ---

@@ -2,10 +2,10 @@ model:
   flux_model_name: "flux.2-klein-base-4b"
   in_channels: 264
   hidden_size: 3072
-  null_emb_path: "null_text_emb.pt"
+  null_emb_path: "null_emb.pt"
 
 inference:
-  checkpoint: "checkpoints/final.pt"
-  resolution: 512   # must match train.yaml.train.resolution (divisible by 16)
+  checkpoint: "restoration_dit.pt"
+  resolution: 512
   num_steps: 50
   device: "cuda"
