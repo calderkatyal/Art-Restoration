@@ -1,27 +1,11 @@
 model:
   flux_model_name: "flux.2-klein-base-4b"
-  latent_channels: 128
-  spatial_compression: 16
-  mask_channels: 8
   in_channels: 264
   hidden_size: 3072
-  context_in_dim: 7680
-  text_encoder_variant: "4B"
   null_emb_path: "null_text_emb.pt"
 
 inference:
   checkpoint: "checkpoints/final.pt"
-  input_dir: "./data/test"
-  output_dir: "./results"
-  mask_dir: ""  # populated by mask_painter.py
   resolution: 512   # must match train.yaml.train.resolution (divisible by 16)
   num_steps: 50
   device: "cuda"
-  damage_types:
-    - craquelure
-    - rip_tear
-    - paint_loss
-    - yellowing
-    - fading
-    - deposits
-    - scratches

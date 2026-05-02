@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """Gradio web server: upload → paint damage masks → restore.
 
-One-stop inference UI combining :mod:`tools.mask_painter`-style multi-channel
-painting with the Euler ODE sampler from :mod:`src.inference`. The uploaded
+One-stop inference UI for multi-channel damage masking and restoration. The uploaded
 image is resized (center-crop + bicubic) to ``cfg.inference.resolution`` before
 the user sees it, so masks are drawn in the exact pixel grid the model
 consumes. The original file on disk is never modified.
@@ -33,16 +32,15 @@ from PIL import Image, ImageOps
 
 import gradio as gr
 
-from src.utils import log_message
+from src.utils import data_consistency_step, log_message
 from src.model import RestorationDiT
 from src.vae import FluxVAE
 from src.null_emb import load_or_compute_null_embedding
-from src.inference import data_consistency_step
 from src.corruption import CHANNEL_NAMES, NUM_CHANNELS, downsample_mask
 from src.flux2.sampling import get_schedule
 
 
-# Per-channel overlay colors (RGB). Mirrors tools/mask_painter.py CHANNELS.
+# Per-channel overlay colors (RGB) for mask visualization in the editor.
 CHANNEL_COLORS: Dict[str, Tuple[int, int, int]] = {
     "craquelure": (255, 80, 80),
     "rip_tear":   (230, 50, 50),
@@ -373,7 +371,7 @@ class GradioApp:
         num_steps: int,
         progress: gr.Progress,
     ) -> torch.Tensor:
-        """Inlined equivalent of :func:`src.inference.sample` with progress."""
+        """Inlined equivalent of :func:`src.utils.sample` with progress."""
         device = self.device
         progress(0.02, desc="Encoding with VAE...")
         z_y = self.vae.encode(corrupted_image.to(device))

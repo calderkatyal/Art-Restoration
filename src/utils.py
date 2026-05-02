@@ -1,9 +1,10 @@
-"""Shared helpers for training entrypoints.
+"""Shared helpers for training and inference entrypoints.
 
 Provides:
     * :func:`load_config` for loading the main training YAML.
     * :func:`load_corruption_config` for loading the corruption YAML referenced by
       ``cfg.corruption.config_path``.
+    * :func:`sample` and :func:`data_consistency_step` for latent-space restoration.
     * :func:`print_training_phase` for logging active trainable parameter groups.
     * :func:`print_vram_debug` for optional rank-0 CUDA memory diagnostics.
 """
@@ -13,7 +14,7 @@ from __future__ import annotations
 import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import TYPE_CHECKING, Any, List, Optional
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -21,8 +22,13 @@ from PIL import ImageDraw
 import torch.distributed as dist
 from torchvision.transforms import functional as TF
 
-from .corruption import CHANNEL_NAMES
+from .corruption import CHANNEL_NAMES, downsample_mask
 from .distributed import get_world_size, is_main_process
+from .flux2.sampling import get_schedule
+
+if TYPE_CHECKING:
+    from .model import RestorationDiT
+    from .vae import FluxVAE
 
 # Defaults merged under user YAML so older configs still run. Values here are the
 # low-level knobs expected by ``deepspeed.initialize``.
@@ -169,6 +175,60 @@ def gather_inference_panels(
         [panel.to(dtype=torch.float32) / 255.0 for _, panel in merged],
         dim=0,
     )
+
+
+@torch.no_grad()
+def sample(
+    model: "RestorationDiT",
+    vae: "FluxVAE",
+    corrupted_image: torch.Tensor,
+    mask: torch.Tensor,
+    null_emb: torch.Tensor,
+    num_steps: int = 50,
+    device: str = "cuda",
+) -> torch.Tensor:
+    """Restore a corrupted RGB batch by integrating the learned velocity field."""
+    corrupted_image = corrupted_image.to(device)
+    mask = mask.to(device)
+    null_emb = null_emb.to(device)
+
+    z_y = vae.encode(corrupted_image)
+    m_lat = downsample_mask(mask, factor=vae.spatial_compression)
+    b, _, h, w = z_y.shape
+    z_t = torch.randn_like(z_y)
+    seq_len = h * w
+    timesteps = get_schedule(num_steps, seq_len)
+
+    dtype = torch.bfloat16 if z_t.device.type == "cuda" else torch.float32
+    z_t = z_t.to(dtype=dtype)
+    z_y = z_y.to(dtype=dtype)
+    m_lat = m_lat.to(dtype=dtype)
+    null_b = null_emb.to(dtype=dtype)
+
+    # Give the model the correct intact-context latent before the first
+    # denoising step instead of starting from full-image noise.
+    z_t = data_consistency_step(z_t, z_y, m_lat)
+
+    for t_curr, t_next in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((b,), float(t_curr), device=device, dtype=dtype)
+        vel = model(z_t, t_vec, z_y, m_lat, null_b)
+        z_t = z_t + (float(t_next) - float(t_curr)) * vel
+        z_t = data_consistency_step(z_t, z_y, m_lat)
+
+    restored = vae.decode(z_t.float())
+    return restored.clamp(0.0, 1.0)
+
+
+def data_consistency_step(
+    z_t: torch.Tensor,
+    z_y: torch.Tensor,
+    mask_latent: torch.Tensor,
+) -> torch.Tensor:
+    """Copy intact latent regions from ``z_y`` while preserving damaged regions in ``z_t``."""
+    m_dam = mask_latent.max(dim=1, keepdim=True).values
+    m_dam = (m_dam >= 0.5).to(dtype=z_t.dtype)
+    m_intact = 1.0 - m_dam
+    return m_intact * z_y + m_dam * z_t
 
 
 def checkpoint_tags_desc(checkpoint_dir: Path) -> list[str]:

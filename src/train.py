@@ -74,11 +74,11 @@ from tqdm import tqdm
 from .corruption import OUTPUT_MASK_CHANNELS, downsample_mask
 from .dataset import ArtRestorationDataset, build_wikiart_dataloader
 from .distributed import get_device, get_global_rank, get_world_size, is_main_process
-from .inference import sample
 from .model import RestorationDiT
 from .null_emb import load_or_compute_null_embedding
 from .utils import (
     checkpoint_tags_desc,
+    sample,
     fixed_inference_indices,
     gather_inference_panels,
     load_config,
